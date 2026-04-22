@@ -1,0 +1,15 @@
+`s9pk.mk` is the shared Start9 build logic. It's a boilerplate file that
+the Start9 team maintains — every 0.4.0.x package ships a copy of it that
+hardly changes between services.
+
+To add it to this project:
+
+    curl -o s9pk.mk https://raw.githubusercontent.com/Start9Labs/hello-world-startos/master/s9pk.mk
+
+Or clone the `hello-world-startos` repo and copy the file over. The canonical
+source is whatever the Start9 team maintains in that template.
+
+Reason we don't commit a copy here by default: the file is updated by the
+Start9 team as the SDK evolves, and pinning a copy means we'd fall behind.
+The Makefile `include s9pk.mk` line will fail loudly if it's missing,
+reminding you to fetch it.

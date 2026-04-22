@@ -1,0 +1,12 @@
+# Build artifacts
+*.s9pk
+javascript/
+
+# Node
+node_modules/
+
+# macOS / editor cruft
+.DS_Store
+*.swp
+.vscode/
+.idea/

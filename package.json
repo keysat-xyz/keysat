@@ -1,0 +1,18 @@
+{
+  "name": "keysat-startos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "StartOS 0.4.0.x package wrapping the Keysat daemon",
+  "license": "SEE LICENSE IN ../licensing-service/LICENSE",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@start9labs/start-sdk": "^0.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  }
+}
