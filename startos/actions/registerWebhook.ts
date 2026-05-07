@@ -7,19 +7,20 @@
 // `sha256=<hex>` — same shape as BTCPay's outbound hooks.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  url: {
-    type: 'text',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  url: Value.text({
     name: 'Webhook URL',
     description: 'HTTPS endpoint that will receive POSTed event bodies.',
     required: true,
     default: null,
     patterns: [{ regex: '^https?://', description: 'must be an HTTP(S) URL' }],
-  },
-  event_types: {
-    type: 'text',
+  }),
+  event_types: Value.text({
     name: 'Event types',
     description:
       'Comma-separated list of events to subscribe to, or "*" for all. ' +
@@ -28,19 +29,18 @@ const input = sdk.InputSpec.of({
       'machine.activated, machine.deactivated, invoice.settled.',
     required: true,
     default: '*',
-  },
-  description: {
-    type: 'text',
+  }),
+  description: Value.text({
     name: 'Description',
     description: 'Free-form label, shown in the admin list.',
     required: false,
     default: null,
-  },
+  }),
 })
 
 export const registerWebhook = sdk.Action.withInput(
-  'registerWebhook',
-  async ({ effects }) => ({
+  'register-webhook',
+  async () => ({
     name: 'Register webhook endpoint',
     description:
       'Tell Keysat to POST signed event notifications to an HTTPS URL you ' +
@@ -53,8 +53,10 @@ export const registerWebhook = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
     const eventTypes = formInput.event_types
       .split(',')
       .map((s) => s.trim())
@@ -64,7 +66,7 @@ export const registerWebhook = sdk.Action.withInput(
     }
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       '/v1/admin/webhook-endpoints',
       {
         method: 'POST',
@@ -85,13 +87,22 @@ export const registerWebhook = sdk.Action.withInput(
       event_types: string[]
     }
     return {
+      version: '1',
+      title: 'Webhook registered',
       message:
         `Registered webhook endpoint (id ${ep.id}).\n` +
         `URL: ${ep.url}\n` +
         `Events: ${ep.event_types.join(', ')}\n\n` +
-        `HMAC secret (save this now — will not be shown again):\n${ep.secret}\n\n` +
+        `Save the HMAC secret shown below — it will not be displayed again.\n\n` +
         `Verify incoming requests with header X-Keysat-Signature: sha256=<hex> ` +
         `(HMAC-SHA256 of the raw request body using this secret).`,
+      result: {
+        type: 'single',
+        value: ep.secret,
+        copyable: true,
+        qr: false,
+        masked: true,
+      },
     }
   },
 )

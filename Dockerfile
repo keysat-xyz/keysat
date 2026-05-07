@@ -11,7 +11,13 @@
 
 # syntax=docker/dockerfile:1.6
 
-ARG RUST_VERSION=1.75
+# Build toolchain pinned at a recent stable. We bumped past 1.85 because
+# transitive deps in the ICU family (icu_collections, icu_normalizer,
+# icu_properties, icu_provider, idna_adapter) require rustc >= 1.86.
+# 1.88 gives a couple of minor versions of headroom against newer deps.
+# The Keysat crate itself still declares MSRV 1.75 in its Cargo.toml;
+# we just need a newer toolchain to compile the dep tree.
+ARG RUST_VERSION=1.88
 
 # -------- builder --------
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
@@ -44,6 +50,11 @@ RUN mkdir -p licensing-service/src && \
 # Copy the actual source.
 COPY licensing-service/src ./licensing-service/src
 
+# Copy the embedded admin web UI assets. rust-embed reads this directory
+# at compile time and bundles every file into the binary, so this layer
+# must exist before the cargo build step.
+COPY licensing-service/web ./licensing-service/web
+
 # Build.
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
@@ -62,10 +73,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 
-# Non-root user to avoid running as root even though we're in a container.
-RUN useradd --system --create-home --uid 10001 keysat
-USER keysat
-WORKDIR /home/keysat
+# Run as root inside the container. StartOS containers are isolated by
+# the platform's namespacing, so root-in-container is not root-on-host.
+# Dropping privileges to a non-root user here causes two real problems:
+#   1. The persistent volume mounted at /data is owned by root by default;
+#      a non-root user gets "unable to open database file" (SQLite 14).
+#   2. Tini (which we use as the entrypoint init for proper signal
+#      handling) emits a warning when not running as PID 1, which it
+#      can't be after a USER switch in this layout.
+WORKDIR /data
 
 COPY --from=builder /keysat /usr/local/bin/keysat
 

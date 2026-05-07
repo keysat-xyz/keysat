@@ -5,35 +5,35 @@
 // matching licenses with IDs, product slugs, and current status.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  buyer_email: {
-    type: 'text',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  buyer_email: Value.text({
     name: 'Buyer email',
     description: 'Exact-match email address (leave blank if searching by another field).',
     required: false,
     default: null,
-  },
-  nostr_npub: {
-    type: 'text',
+  }),
+  nostr_npub: Value.text({
     name: 'Nostr npub',
     description: 'Nostr public key (npub…). Optional.',
     required: false,
     default: null,
-  },
-  invoice_id: {
-    type: 'text',
+  }),
+  invoice_id: Value.text({
     name: 'BTCPay invoice ID',
     description: 'The BTCPay invoice ID associated with a purchase. Optional.',
     required: false,
     default: null,
-  },
+  }),
 })
 
 export const searchLicenses = sdk.Action.withInput(
-  'searchLicenses',
-  async ({ effects }) => ({
+  'search-licenses',
+  async () => ({
     name: 'Search licenses',
     description:
       "Look up a buyer's licenses by email, Nostr npub, or BTCPay " +
@@ -44,8 +44,10 @@ export const searchLicenses = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
 
     const params = new URLSearchParams()
     if (formInput.buyer_email) params.set('buyer_email', formInput.buyer_email)
@@ -57,7 +59,7 @@ export const searchLicenses = sdk.Action.withInput(
 
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       `/v1/admin/licenses/search?${params.toString()}`,
       { method: 'GET' },
     )
@@ -75,7 +77,12 @@ export const searchLicenses = sdk.Action.withInput(
       }>
     }
     if (body.licenses.length === 0) {
-      return { message: 'No licenses matched.' }
+      return {
+        version: '1',
+        title: 'No matches',
+        message: 'No licenses matched.',
+        result: null,
+      }
     }
     const lines = body.licenses.map(
       (l) =>
@@ -85,11 +92,14 @@ export const searchLicenses = sdk.Action.withInput(
         (l.expires_at ? `  expires=${l.expires_at}` : ''),
     )
     return {
+      version: '1',
+      title: `Found ${body.licenses.length} license(s)`,
       message:
         `Found ${body.licenses.length} license(s):\n\n` +
         lines.join('\n') +
         '\n\nTo reissue the key to the buyer, look up the license details ' +
         'via /v1/admin/licenses with the admin API key.',
+      result: null,
     }
   },
 )

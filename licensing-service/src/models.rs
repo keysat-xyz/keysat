@@ -1,0 +1,244 @@
+//! Domain models — shared types used by DB, API, and BTCPay layers.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Product {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub price_sats: i64,
+    pub active: bool,
+    /// Arbitrary JSON metadata the developer can attach.
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InvoiceStatus {
+    Pending,
+    Settled,
+    Expired,
+    Invalid,
+}
+
+impl InvoiceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvoiceStatus::Pending => "pending",
+            InvoiceStatus::Settled => "settled",
+            InvoiceStatus::Expired => "expired",
+            InvoiceStatus::Invalid => "invalid",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "settled" => InvoiceStatus::Settled,
+            "expired" => InvoiceStatus::Expired,
+            "invalid" => InvoiceStatus::Invalid,
+            _ => InvoiceStatus::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Invoice {
+    pub id: String,
+    pub btcpay_invoice_id: String,
+    pub product_id: String,
+    pub status: String,
+    pub buyer_email: Option<String>,
+    pub buyer_note: Option<String>,
+    pub amount_sats: i64,
+    pub checkout_url: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LicenseStatus {
+    Active,
+    Revoked,
+    /// Temporarily disabled but recoverable — distinct from revocation, which
+    /// is terminal. Suspended licenses fail `/v1/validate` with reason
+    /// `suspended` until an admin un-suspends them.
+    Suspended,
+}
+
+impl LicenseStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LicenseStatus::Active => "active",
+            LicenseStatus::Revoked => "revoked",
+            LicenseStatus::Suspended => "suspended",
+        }
+    }
+}
+
+/// Full license row. Older fields are unchanged; v2 columns live behind
+/// `Option`s since they were introduced in migration 0003.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct License {
+    pub id: String,
+    pub product_id: String,
+    pub invoice_id: Option<String>,
+    pub status: String,
+    pub fingerprint: Option<String>,
+    pub bound_identity: Option<String>,
+    pub issued_at: String,
+    pub revoked_at: Option<String>,
+    pub revocation_reason: Option<String>,
+    pub metadata: serde_json::Value,
+
+    // v2 / migration 0003 fields
+    pub policy_id: Option<String>,
+    pub expires_at: Option<String>,
+    pub grace_seconds: i64,
+    pub max_machines: i64,
+    pub suspended_at: Option<String>,
+    pub suspension_reason: Option<String>,
+    pub entitlements: Vec<String>,
+    pub is_trial: bool,
+    pub nostr_npub: Option<String>,
+    pub buyer_email: Option<String>,
+}
+
+/// Reusable license template. A policy says "when we issue a license under
+/// this slug, set these defaults" (duration, grace, entitlements, machine
+/// cap, trial flag, price override, optional tip recipient).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Policy {
+    pub id: String,
+    pub product_id: String,
+    pub name: String,
+    pub slug: String,
+    pub duration_seconds: i64,
+    pub grace_seconds: i64,
+    pub max_machines: i64,
+    pub is_trial: bool,
+    pub price_sats_override: Option<i64>,
+    pub entitlements: Vec<String>,
+    pub metadata: serde_json::Value,
+    pub active: bool,
+    /// Lightning Address (user@domain) the daemon tips a percentage of
+    /// each successful issuance to. None = no tipping. The amount is
+    /// `license_price_sats * tip_pct_bps / 10000`. Tip failures never
+    /// block license issuance.
+    pub tip_recipient: Option<String>,
+    /// Percentage in basis points (1bps = 0.01%; 100bps = 1%; 10000bps = 100%).
+    /// 0 = no tipping. Capped at 10000 server-side.
+    pub tip_pct_bps: i64,
+    /// Free-form label for the tip recipient — surfaced in the audit log.
+    pub tip_label: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A machine activated under a license. One row per active install.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Machine {
+    pub id: String,
+    pub license_id: String,
+    pub fingerprint: String,
+    pub fingerprint_hash: String,
+    pub hostname: Option<String>,
+    pub platform: Option<String>,
+    pub ip_last_seen: Option<String>,
+    pub activated_at: String,
+    pub last_heartbeat_at: Option<String>,
+    pub deactivated_at: Option<String>,
+    pub deactivation_reason: Option<String>,
+}
+
+impl Machine {
+    pub fn is_active(&self) -> bool {
+        self.deactivated_at.is_none()
+    }
+}
+
+/// Outbound webhook subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookEndpoint {
+    pub id: String,
+    pub url: String,
+    /// HMAC-SHA256 secret — never returned on list endpoints after creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    pub event_types: Vec<String>,
+    pub active: bool,
+    pub description: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDelivery {
+    pub id: String,
+    pub endpoint_id: String,
+    pub event_type: String,
+    pub payload_json: String,
+    pub attempt_count: i64,
+    pub next_attempt_at: Option<String>,
+    pub last_status_code: Option<i64>,
+    pub last_error: Option<String>,
+    pub delivered_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub actor_kind: String,
+    pub actor_hash: Option<String>,
+    pub action: String,
+    pub target_kind: Option<String>,
+    pub target_id: Option<String>,
+    pub request_ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub details: serde_json::Value,
+    pub occurred_at: String,
+}
+
+/// Discount / referral code. See `migrations/0004_discount_codes.sql`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscountCode {
+    pub id: String,
+    pub code: String,
+    /// 'percent' | 'fixed_sats'.
+    pub kind: String,
+    /// Basis points if `kind == 'percent'` (0..=10000); sats if `kind == 'fixed_sats'`.
+    pub amount: i64,
+    pub max_uses: Option<i64>,
+    pub used_count: i64,
+    pub expires_at: Option<String>,
+    pub applies_to_product_id: Option<String>,
+    pub applies_to_policy_id: Option<String>,
+    pub referrer_label: Option<String>,
+    pub description: String,
+    pub active: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One row per (code, invoice) pair. Status transitions:
+///   pending → redeemed   (invoice settled, license issued)
+///   pending → cancelled  (invoice expired or invalidated)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscountRedemption {
+    pub id: String,
+    pub code_id: String,
+    pub invoice_id: String,
+    pub license_id: Option<String>,
+    /// 'pending' | 'redeemed' | 'cancelled'.
+    pub status: String,
+    pub discount_applied_sats: i64,
+    pub base_price_sats: i64,
+    pub final_price_sats: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}

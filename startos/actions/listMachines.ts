@@ -4,27 +4,28 @@
 // troubleshooting a multi-seat cap ("can't activate, too many machines").
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  license_id: {
-    type: 'text',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  license_id: Value.text({
     name: 'License ID',
     description: 'UUID of the license to inspect.',
     required: true,
     default: null,
-  },
-  include_inactive: {
-    type: 'toggle',
+  }),
+  include_inactive: Value.toggle({
     name: 'Include deactivated machines',
     description: 'Show rows for machines that were previously deactivated.',
     default: false,
-  },
+  }),
 })
 
 export const listMachines = sdk.Action.withInput(
-  'listMachines',
-  async ({ effects }) => ({
+  'list-machines',
+  async () => ({
     name: 'List machines',
     description: 'Show installs currently bound to a license.',
     warning: null,
@@ -33,15 +34,17 @@ export const listMachines = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
     const params = new URLSearchParams()
     params.set('license_id', formInput.license_id)
     if (formInput.include_inactive) params.set('include_inactive', 'true')
 
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       `/v1/admin/machines?${params.toString()}`,
       { method: 'GET' },
     )
@@ -60,7 +63,12 @@ export const listMachines = sdk.Action.withInput(
       }>
     }
     if (body.machines.length === 0) {
-      return { message: 'No machines bound to this license.' }
+      return {
+        version: '1',
+        title: 'No machines',
+        message: 'No machines bound to this license.',
+        result: null,
+      }
     }
     const lines = body.machines.map((m) => {
       const activeStr =
@@ -76,10 +84,13 @@ export const listMachines = sdk.Action.withInput(
       return '• ' + bits.filter(Boolean).join('  ')
     })
     return {
+      version: '1',
+      title: `${body.machines.length} machine(s)`,
       message:
         `${body.machines.length} machine(s) on license ${formInput.license_id}:\n\n` +
         lines.join('\n') +
         '\n\nTo free a seat, use the "Deactivate machine" action with the machine id.',
+      result: null,
     }
   },
 )

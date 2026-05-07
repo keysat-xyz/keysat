@@ -6,11 +6,13 @@
 // operator can skim without curl.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  limit: {
-    type: 'number',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  limit: Value.number({
     name: 'Limit',
     description: 'Number of most recent entries to return (1–1000).',
     required: true,
@@ -18,21 +20,20 @@ const input = sdk.InputSpec.of({
     min: 1,
     max: 1000,
     integer: true,
-  },
-  action: {
-    type: 'text',
+  }),
+  action: Value.text({
     name: 'Filter action',
     description:
       'Optional action slug to filter on. E.g., "license.revoke", ' +
       '"license.suspend", "policy.create", "webhook_endpoint.create".',
     required: false,
     default: null,
-  },
+  }),
 })
 
 export const viewAuditLog = sdk.Action.withInput(
-  'viewAuditLog',
-  async ({ effects }) => ({
+  'view-audit-log',
+  async () => ({
     name: 'View audit log',
     description:
       'Show the most recent admin mutations recorded by the service — ' +
@@ -44,15 +45,17 @@ export const viewAuditLog = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
     const params = new URLSearchParams()
     params.set('limit', String(formInput.limit))
     if (formInput.action) params.set('action', formInput.action)
 
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       `/v1/admin/audit?${params.toString()}`,
       { method: 'GET' },
     )
@@ -72,7 +75,12 @@ export const viewAuditLog = sdk.Action.withInput(
       }>
     }
     if (body.entries.length === 0) {
-      return { message: 'No audit entries match the filter.' }
+      return {
+        version: '1',
+        title: 'No entries',
+        message: 'No audit entries match the filter.',
+        result: null,
+      }
     }
     const lines = body.entries.map((e) => {
       const target = e.target_type && e.target_id ? `${e.target_type}:${e.target_id}` : '(no target)'
@@ -81,8 +89,11 @@ export const viewAuditLog = sdk.Action.withInput(
       return `• ${e.created_at}  ${e.action}  ${target}  ${actor}  ${ip}`
     })
     return {
+      version: '1',
+      title: `${body.entries.length} entry(ies)`,
       message:
         `${body.entries.length} entry(ies):\n\n` + lines.join('\n'),
+      result: null,
     }
   },
 )

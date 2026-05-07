@@ -5,8 +5,30 @@ javascript/
 # Node
 node_modules/
 
+# Rust / Cargo
+licensing-service/target/
+licensing-service/Cargo.lock.bak
+
 # macOS / editor cruft
 .DS_Store
 *.swp
 .vscode/
 .idea/
+
+# Local backup / temp files
+*.bak
+*.tmp
+*.ts.tmp
+*.old-backup
+
+# Env / secrets — never commit a real .env
+.env
+.env.local
+.env.*.local
+
+# Local SQLite DB if anyone runs the daemon out-of-tree
+licensing-service/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

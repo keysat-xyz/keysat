@@ -7,12 +7,16 @@
 // The BTCPay webhook secret used to live in the StartOS store; it now lives
 // inside the daemon's own SQLite database, generated automatically during
 // the "Connect BTCPay" authorize flow. Operators don't need to know it.
+//
+// SDK 0.4.0 shape: `Action.withoutInput(id, metadata, run)` — the run fn is
+// the third positional arg, not a chained `.withoutRunner(...)` method.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 
 export const showCredentials = sdk.Action.withoutInput(
-  'showCredentials',
-  async ({ effects }) => ({
+  'show-credentials',
+  async () => ({
     name: 'Show admin API key',
     description:
       'Display the auto-generated admin API key. Treat it like a password — ' +
@@ -24,13 +28,23 @@ export const showCredentials = sdk.Action.withoutInput(
     group: 'Credentials',
     visibility: 'enabled',
   }),
-).withoutRunner(async ({ effects }) => {
-  const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
-  return {
-    message:
-      `Admin API key:\n${store.admin_api_key}\n\n` +
-      `Used as 'Authorization: Bearer <key>' against /v1/admin/*. All ` +
-      `StartOS actions already supply this for you — only export it if ` +
-      `you intend to script against the admin API from outside the box.`,
-  }
-})
+  async () => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
+    return {
+      version: '1',
+      title: 'Admin API key',
+      message:
+        `Used as 'Authorization: Bearer <key>' against /v1/admin/*. All ` +
+        `StartOS actions already supply this for you — only export it if ` +
+        `you intend to script against the admin API from outside the box.`,
+      result: {
+        type: 'single',
+        value: storeData.admin_api_key,
+        copyable: true,
+        qr: true,
+        masked: true,
+      },
+    }
+  },
+)

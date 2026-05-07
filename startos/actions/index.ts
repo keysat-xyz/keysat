@@ -1,44 +1,38 @@
-// Register every action with StartOS.
+// Register actions with StartOS.
+//
+// As of v0.1.0:11 the StartOS Actions tab is intentionally minimal —
+// only setup-time operations live here:
+//
+//   - General        → Set operator name
+//   - BTCPay         → Connect / Check / Disconnect
+//   - License        → Activate Keysat license / Show license status
+//   - Credentials    → Show admin API key
+//
+// Everything else (products, policies, discount codes, licenses,
+// machines, webhooks, audit log) lives in the embedded admin web UI
+// at /admin/. The action source files remain in this directory for
+// reference — and the underlying admin HTTP API is unchanged — but
+// they're no longer registered as StartOS UI buttons. This keeps the
+// dashboard from feeling like an undifferentiated wall of buttons.
+//
+// The web UI uses the same /v1/admin/* endpoints those actions used to
+// call, so functionality is identical; only the UI surface changed.
 
 import { sdk } from '../sdk'
-import { btcpayStatus, configureBtcpay } from './configureBtcpay'
-import { createPolicy } from './createPolicy'
-import { createProduct } from './createProduct'
-import { deactivateMachine } from './deactivateMachine'
-import { issueLicense } from './issueLicense'
-import { listMachines } from './listMachines'
-import { listWebhooks } from './listWebhooks'
-import { registerWebhook } from './registerWebhook'
-import { revokeLicense } from './revokeLicense'
-import { searchLicenses } from './searchLicenses'
+import { activateLicense, showLicenseStatus } from './activateLicense'
+import { btcpayStatus, configureBtcpay, disconnectBtcpay } from './configureBtcpay'
 import { setOperatorName } from './setOperatorName'
 import { showCredentials } from './showCredentials'
-import { suspendLicense } from './suspendLicense'
-import { unsuspendLicense } from './unsuspendLicense'
-import { viewAuditLog } from './viewAuditLog'
 
 export const actions = sdk.Actions.of()
   // General
   .addAction(setOperatorName)
-  // BTCPay
+  // BTCPay setup
   .addAction(configureBtcpay)
   .addAction(btcpayStatus)
+  .addAction(disconnectBtcpay)
+  // Keysat self-license (Keysat-licenses-Keysat)
+  .addAction(activateLicense)
+  .addAction(showLicenseStatus)
   // Credentials
   .addAction(showCredentials)
-  // Products + Policies
-  .addAction(createProduct)
-  .addAction(createPolicy)
-  // Licenses
-  .addAction(issueLicense)
-  .addAction(searchLicenses)
-  .addAction(suspendLicense)
-  .addAction(unsuspendLicense)
-  .addAction(revokeLicense)
-  // Machines
-  .addAction(listMachines)
-  .addAction(deactivateMachine)
-  // Webhooks
-  .addAction(registerWebhook)
-  .addAction(listWebhooks)
-  // Diagnostics
-  .addAction(viewAuditLog)

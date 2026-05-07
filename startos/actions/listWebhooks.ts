@@ -4,11 +4,12 @@
 // masked — rotate by deleting and recreating an endpoint.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
 export const listWebhooks = sdk.Action.withoutInput(
-  'listWebhooks',
-  async ({ effects }) => ({
+  'list-webhooks',
+  async () => ({
     name: 'List webhook endpoints',
     description: 'Show all currently-registered outbound webhook subscribers.',
     warning: null,
@@ -16,11 +17,12 @@ export const listWebhooks = sdk.Action.withoutInput(
     group: 'Webhooks',
     visibility: 'enabled',
   }),
-  async ({ effects }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async ({ effects: _effects }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       '/v1/admin/webhook-endpoints',
       { method: 'GET' },
     )
@@ -38,9 +40,12 @@ export const listWebhooks = sdk.Action.withoutInput(
     }
     if (body.endpoints.length === 0) {
       return {
+        version: '1',
+        title: 'No webhooks',
         message:
           'No webhook endpoints registered. Use "Register webhook endpoint" ' +
           'to add one.',
+        result: null,
       }
     }
     const lines = body.endpoints.map((ep) => {
@@ -49,8 +54,11 @@ export const listWebhooks = sdk.Action.withoutInput(
         (ep.description ? `  ("${ep.description}")` : '')
     })
     return {
+      version: '1',
+      title: `${body.endpoints.length} endpoint(s)`,
       message:
         `${body.endpoints.length} endpoint(s):\n\n` + lines.join('\n'),
+      result: null,
     }
   },
 )

@@ -1,21 +1,23 @@
 // Action: clear a previously-applied suspension.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  license_id: {
-    type: 'text',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  license_id: Value.text({
     name: 'License ID',
     description: 'UUID of the suspended license to re-enable.',
     required: true,
     default: null,
-  },
+  }),
 })
 
 export const unsuspendLicense = sdk.Action.withInput(
-  'unsuspendLicense',
-  async ({ effects }) => ({
+  'unsuspend-license',
+  async () => ({
     name: 'Unsuspend license',
     description:
       'Lift a previous suspension. Validation will succeed again on the ' +
@@ -27,17 +29,24 @@ export const unsuspendLicense = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       `/v1/admin/licenses/${encodeURIComponent(formInput.license_id)}/unsuspend`,
       { method: 'POST', body: JSON.stringify({}) },
     )
     if (!resp.ok) {
       throw new Error(`Unsuspend failed: HTTP ${resp.status} — ${await resp.text()}`)
     }
-    return { message: `Unsuspended license ${formInput.license_id}.` }
+    return {
+      version: '1',
+      title: 'License unsuspended',
+      message: `Unsuspended license ${formInput.license_id}.`,
+      result: null,
+    }
   },
 )

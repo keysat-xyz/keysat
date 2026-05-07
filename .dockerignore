@@ -1,0 +1,32 @@
+# Build context is now this wrapper directory itself. Exclude things
+# that bloat the context and aren't needed by the Dockerfile.
+#
+# The Dockerfile only consumes `licensing-service/` (a symlink to the
+# sibling Rust crate) plus its own multi-stage build inputs.
+
+# Wrapper's own Node deps and bundle output — irrelevant to Rust build.
+node_modules/
+javascript/
+
+# Local backup / temp files
+*.bak
+*.tmp
+*.ts.tmp
+
+# Build artifacts
+*.s9pk
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Don't ship the symlinked Rust target/ output that may exist in the
+# upstream working tree.
+licensing-service/target/
+licensing-service/docs/
+
+# Git internals (we keep .git/HEAD + .git/index for the gitHash field via
+# start-cli's own scan; Docker doesn't need them).
+.git/

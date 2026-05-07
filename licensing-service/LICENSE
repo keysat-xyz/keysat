@@ -1,0 +1,40 @@
+Source-Available License
+Copyright (c) 2026 Keysat
+
+This source code is made available so that users and operators may audit,
+study, and self-host this software. It is NOT open source. The following
+terms apply:
+
+1. GRANT. Subject to the restrictions below, you are permitted to:
+   (a) view, study, and audit the source code;
+   (b) compile and run the software for your own internal use on a server
+       you own or control, including operating it to sell licenses to your
+       own software products;
+   (c) modify the source code for the purposes of (a) and (b), provided
+       modified copies remain subject to this license.
+
+2. RESTRICTIONS. You may NOT:
+   (a) redistribute the source code, compiled binaries, or derivative works
+       to third parties, whether free of charge or for a fee;
+   (b) sell, sublicense, lease, rent, or otherwise commercialize the
+       software itself (as distinguished from selling licenses to your own
+       software products via an instance of the software);
+   (c) remove or obscure copyright notices or this license text;
+   (d) publicly host a copy of this software that is accessible to or
+       operable by parties other than yourself, your employees, or your
+       contractors acting on your behalf.
+
+3. CONTRIBUTIONS. Any contributions you submit to the upstream project are
+   licensed back to the copyright holder under the same terms and may be
+   incorporated, relicensed, or redistributed by the copyright holder at
+   its discretion.
+
+4. NO WARRANTY. The software is provided "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, express or implied. In no event shall the copyright holder be
+   liable for any claim, damages, or other liability arising from the
+   software or its use.
+
+5. TERMINATION. Any violation of these terms terminates your rights under
+   this license automatically.
+
+For commercial redistribution or resale rights, contact licensing@keysat.xyz.

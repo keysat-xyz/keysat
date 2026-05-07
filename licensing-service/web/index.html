@@ -1,0 +1,1349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Keysat Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --navy-950:#0E1F33; --navy-900:#142A47; --navy-800:#1E3A5F; --navy-700:#2A4A75;
+  --navy-100:#E4EAF1;
+  --cream-50:#FBF9F2; --cream-100:#F5F1E8; --cream-200:#EDE7D7;
+  --gold-700:#8A6F3D; --gold-500:#BFA068; --gold-400:#D4B985;
+  --ink-900:#0E1F33; --ink-700:#2C3E54; --ink-500:#5A6B7F; --ink-400:#7E8C9D;
+  --success:#2D7A5F; --success-bg:#E3F0EA;
+  --warning:#B8861F; --warning-bg:#F7EFD7;
+  --danger:#B23A3A; --danger-bg:#F4E0E0;
+  --border-1:rgba(14,31,51,0.12);
+  --border-2:rgba(14,31,51,0.20);
+  --font-display:'Manrope','Helvetica Neue',Arial,sans-serif;
+  --font-body:'Inter','Helvetica Neue',Arial,sans-serif;
+  --font-mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;
+  --shadow-xs:0 1px 1px rgba(14,31,51,0.04);
+  --shadow-sm:0 1px 2px rgba(14,31,51,0.06),0 1px 1px rgba(14,31,51,0.03);
+}
+* { box-sizing:border-box; }
+html, body { margin:0; padding:0; }
+body {
+  font-family:var(--font-body); font-size:14px;
+  color:var(--ink-900); background:var(--cream-100);
+  background-image:
+    radial-gradient(rgba(14,31,51,0.022) 1px, transparent 1px),
+    radial-gradient(rgba(138,111,61,0.020) 1px, transparent 1px);
+  background-size:3px 3px, 7px 7px;
+  -webkit-font-smoothing:antialiased;
+}
+a { color:var(--navy-800); text-decoration:none; }
+
+/* ---------- Layout ---------- */
+.app { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
+
+/* ---------- Sidebar ---------- */
+.sidebar {
+  background:var(--navy-950); color:#F5F1E8;
+  padding:24px 14px;
+  display:flex; flex-direction:column;
+  border-right:1px solid var(--navy-900);
+  position:sticky; top:0; max-height:100vh; height:100vh; overflow-y:auto;
+}
+.sidebar .brand {
+  display:flex; align-items:center; gap:10px;
+  font-family:var(--font-display); font-weight:500; font-size:14px;
+  letter-spacing:0.28em; text-transform:uppercase;
+  color:var(--cream-50);
+  padding:0 8px 22px;
+  border-bottom:1px solid rgba(245,241,232,0.10);
+  margin-bottom:14px;
+}
+.sidebar .brand img { width:26px; height:26px; }
+.sidebar .group-label {
+  font-size:10px; font-weight:700; letter-spacing:0.18em;
+  text-transform:uppercase; color:var(--gold-400);
+  padding:16px 10px 8px;
+}
+.sidebar a.nav {
+  display:flex; align-items:center; gap:10px;
+  padding:9px 10px; border-radius:6px;
+  font-size:13.5px; color:rgba(245,241,232,0.72);
+  cursor:pointer; transition:all 120ms;
+}
+.sidebar a.nav:hover { background:rgba(245,241,232,0.06); color:var(--cream-50); }
+.sidebar a.nav.active { background:var(--navy-800); color:var(--cream-50); }
+.sidebar a.nav [data-lucide] { width:16px; height:16px; }
+.sidebar .footer {
+  margin-top:auto; padding:14px 10px;
+  border-top:1px solid rgba(245,241,232,0.10);
+  font-size:12px; color:rgba(245,241,232,0.55);
+  display:flex; gap:10px; align-items:center;
+}
+.sidebar .footer .dot {
+  width:7px; height:7px; border-radius:50%; background:#2D7A5F;
+  box-shadow:0 0 0 3px rgba(45,122,95,0.25);
+}
+.sidebar .footer .dot.warn { background:var(--warning); box-shadow:0 0 0 3px rgba(184,134,31,0.25); }
+
+/* ---------- Main ---------- */
+.main { display:flex; flex-direction:column; min-width:0; }
+.topbar {
+  display:flex; align-items:center; gap:16px;
+  padding:18px 32px; border-bottom:1px solid var(--border-1);
+  background:rgba(251,249,242,0.92); backdrop-filter:blur(8px);
+  position:sticky; top:0; z-index:5;
+}
+.topbar .crumb { font-size:12.5px; color:var(--ink-500); }
+.topbar h1 {
+  font-family:var(--font-display); font-weight:700; font-size:22px;
+  letter-spacing:-0.015em; margin:2px 0 0; color:var(--navy-950);
+}
+.topbar .topbar-actions {
+  margin-left:auto;
+  display:flex; gap:8px; align-items:center;
+}
+.topbar .who {
+  font-family:var(--font-mono); font-size:11.5px; color:var(--ink-500);
+  padding:5px 9px; border:1px solid var(--border-1); border-radius:6px;
+  background:var(--cream-50);
+}
+.content { padding:28px 32px 64px; max-width:1280px; }
+
+/* ---------- Buttons ---------- */
+.btn {
+  display:inline-flex; align-items:center; gap:7px;
+  font-family:var(--font-body); font-weight:600; font-size:13px;
+  padding:8px 14px; border-radius:7px; border:1px solid transparent;
+  cursor:pointer; transition:all 120ms; line-height:1; white-space:nowrap;
+}
+.btn [data-lucide] { width:14px; height:14px; }
+.btn.lg { font-size:14px; padding:11px 18px; }
+.btn.sm { font-size:12px; padding:6px 10px; }
+.btn.primary { background:var(--navy-800); color:var(--cream-50); border-color:var(--navy-800); }
+.btn.primary:hover { background:var(--navy-900); border-color:var(--navy-900); }
+.btn.secondary { background:var(--cream-50); color:var(--navy-900); border-color:var(--border-2); }
+.btn.secondary:hover { background:var(--cream-200); }
+.btn.ghost { background:transparent; color:var(--navy-900); }
+.btn.ghost:hover { background:rgba(14,31,51,0.06); }
+.btn.danger { color:var(--danger); border-color:rgba(178,58,58,0.3); background:transparent; }
+.btn.danger:hover { background:var(--danger-bg); }
+.btn:disabled { opacity:0.5; cursor:wait; }
+
+/* ---------- Cards ---------- */
+.card {
+  background:var(--cream-50); border:1px solid var(--border-1);
+  border-radius:10px; box-shadow:var(--shadow-xs);
+  margin-bottom:18px;
+}
+.card .card-head {
+  padding:14px 18px; border-bottom:1px solid var(--border-1);
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+}
+.card .card-head h3 {
+  font-family:var(--font-display); font-weight:700; font-size:15px;
+  margin:0; letter-spacing:-0.01em; color:var(--navy-950);
+}
+.card .card-head .sub {
+  font-size:12.5px; color:var(--ink-500); margin-left:auto;
+}
+.card .card-body { padding:18px; }
+.card .card-body > p:first-child { margin-top:0; }
+
+/* ---------- Stats ---------- */
+.stats { display:grid; grid-template-columns:repeat(4, 1fr); gap:14px; margin-bottom:20px; }
+.stat {
+  background:var(--cream-50); border:1px solid var(--border-1);
+  border-radius:10px; padding:18px 18px 16px;
+  position:relative; overflow:hidden;
+}
+.stat::before {
+  content:''; position:absolute; left:0; top:0; bottom:0; width:2px;
+  background:var(--gold-500); opacity:0;
+}
+.stat.featured::before { opacity:1; }
+.stat .label {
+  font-size:11px; font-weight:700; letter-spacing:0.14em;
+  text-transform:uppercase; color:var(--ink-500); margin-bottom:8px;
+}
+.stat .value {
+  font-family:var(--font-display); font-weight:500; font-size:30px;
+  color:var(--navy-950); letter-spacing:-0.022em; line-height:1;
+}
+.stat .value .unit {
+  font-family:var(--font-body); font-size:13px; font-weight:600;
+  color:var(--ink-500); margin-left:6px;
+}
+.stat .sub { font-size:12px; color:var(--ink-500); margin-top:8px; }
+
+/* ---------- Table ---------- */
+table.t {
+  width:100%; border-collapse:separate; border-spacing:0;
+  background:var(--cream-50); border:1px solid var(--border-1);
+  border-radius:10px; overflow:hidden;
+}
+.card > table.t { border:0; border-radius:0 0 10px 10px; }
+table.t thead th {
+  text-align:left; font-size:11px; font-weight:700;
+  letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-500);
+  padding:12px 16px; background:var(--cream-100);
+  border-bottom:1px solid var(--border-1);
+}
+table.t tbody td {
+  padding:14px 16px; border-bottom:1px solid var(--border-1);
+  font-size:13.5px; color:var(--ink-700); vertical-align:middle;
+}
+table.t tbody tr:last-child td { border-bottom:0; }
+table.t .key, table.t code {
+  font-family:var(--font-mono); font-size:12.5px;
+  color:var(--navy-900); font-weight:500;
+  background:transparent; padding:0;
+}
+table.t td.muted { color:var(--ink-500); font-size:12.5px; }
+
+/* ---------- Badges ---------- */
+.badge {
+  display:inline-flex; align-items:center; gap:5px;
+  font-size:11.5px; font-weight:600;
+  padding:2px 9px; border-radius:999px; line-height:1.5;
+  border:1px solid transparent;
+}
+.b-success { background:var(--success-bg); color:#205c47; border-color:rgba(45,122,95,0.25); }
+.b-warning { background:var(--warning-bg); color:#7a5814; border-color:rgba(184,134,31,0.3); }
+.b-danger  { background:var(--danger-bg); color:#8a2828; border-color:rgba(178,58,58,0.25); }
+.b-info    { background:var(--navy-100); color:var(--navy-800); border-color:rgba(30,58,95,0.20); }
+.b-neutral { background:var(--cream-200); color:var(--ink-700); border-color:var(--border-1); }
+.b-gold    { background:transparent; color:var(--gold-700); border-color:var(--gold-500); }
+.dot { width:6px; height:6px; border-radius:50%; display:inline-block; }
+.dot.ok { background:var(--success); }
+.dot.warn { background:var(--warning); }
+.dot.err { background:var(--danger); }
+.dot.muted { background:var(--ink-400); }
+
+/* ---------- Forms ---------- */
+.field { margin-bottom:14px; }
+.field .lbl {
+  display:block; font-size:12.5px; font-weight:600;
+  color:var(--ink-700); margin-bottom:6px;
+}
+.field .lbl .req { color:var(--danger); margin-left:0.15rem; }
+.field .hint { font-size:12px; color:var(--ink-500); margin-top:5px; line-height:1.4; }
+.input, .select, textarea.input {
+  width:100%; padding:9px 12px;
+  font-family:var(--font-body); font-size:13.5px;
+  border:1px solid var(--border-2); border-radius:7px;
+  background:#FFFFFF; color:var(--ink-900); transition:all 120ms;
+}
+.input:focus, .select:focus, textarea.input:focus {
+  outline:none; border-color:var(--navy-700);
+  box-shadow:0 0 0 3px rgba(30,58,95,0.18);
+}
+.input.mono { font-family:var(--font-mono); font-size:13px; }
+textarea.input { font-family:var(--font-body); min-height:5rem; resize:vertical; }
+.row-2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+
+.toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+.toolbar .input, .toolbar .select { width:auto; min-width:14rem; }
+
+/* ---------- Eyebrow / details ---------- */
+.eyebrow {
+  font-size:10.5px; font-weight:700; letter-spacing:0.18em;
+  text-transform:uppercase; color:var(--gold-700);
+}
+details.disclosure {
+  border:1px solid var(--border-1); border-radius:8px;
+  padding:0; background:var(--cream-50);
+  margin-bottom:14px;
+}
+details.disclosure summary {
+  cursor:pointer; padding:14px 18px;
+  font-family:var(--font-body); font-weight:600; font-size:13.5px;
+  color:var(--navy-900); list-style:none;
+  display:flex; align-items:center; gap:8px;
+}
+details.disclosure summary::-webkit-details-marker { display:none; }
+details.disclosure summary::before {
+  content:'+'; color:var(--gold-700); font-family:var(--font-mono); font-weight:700;
+  width:14px; display:inline-block;
+}
+details.disclosure[open] summary::before { content:'−'; }
+details.disclosure[open] summary { border-bottom:1px solid var(--border-1); }
+details.disclosure .body { padding:18px; }
+
+.empty { padding:32px; text-align:center; color:var(--ink-500); font-size:13px; }
+.muted { color:var(--ink-500); }
+.err { color:var(--danger); font-size:13px; padding:10px 14px; background:var(--danger-bg); border:1px solid rgba(178,58,58,0.25); border-radius:7px; margin-top:10px; }
+.ok { color:var(--success); font-size:13px; padding:10px 14px; background:var(--success-bg); border:1px solid rgba(45,122,95,0.25); border-radius:7px; margin-top:10px; }
+.hide { display:none !important; }
+.actions-row { display:flex; gap:6px; align-items:center; }
+hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
+
+/* ---------- Login ---------- */
+.login-screen {
+  min-height:100vh; display:flex; align-items:center; justify-content:center;
+  padding:40px 20px;
+}
+.login-card {
+  width:420px; max-width:100%; background:var(--cream-50);
+  border:1px solid var(--border-1); border-radius:14px;
+  box-shadow:0 0 0 1px var(--gold-500) inset, 0 2px 4px rgba(14,31,51,0.06), 0 4px 12px rgba(14,31,51,0.06);
+  padding:36px; position:relative;
+}
+.login-card::before, .login-card::after {
+  content:''; position:absolute; left:14px; right:14px;
+  height:1px; background:var(--gold-500); opacity:0.4;
+}
+.login-card::before { top:14px; } .login-card::after { bottom:14px; }
+.login-card .brand {
+  display:flex; justify-content:center; margin-bottom:6px;
+}
+.login-card .brand-mark {
+  width:56px; height:56px;
+}
+.login-card h1 {
+  font-family:var(--font-display); font-weight:500; font-size:26px;
+  letter-spacing:-0.02em; color:var(--navy-950);
+  margin:14px 0 4px; text-align:center;
+}
+.login-card .sub {
+  text-align:center; font-size:13.5px; color:var(--ink-500);
+  margin-bottom:24px;
+}
+.login-card .btn {
+  width:100%; justify-content:center; padding:12px;
+  margin-top:14px;
+}
+.login-card .footnote {
+  text-align:center; font-size:12px; color:var(--ink-500);
+  margin-top:22px;
+}
+
+@media (max-width: 980px) {
+  .app { grid-template-columns:1fr; }
+  .sidebar { position:static; max-height:none; height:auto; }
+  .stats { grid-template-columns:repeat(2, 1fr); }
+  .row-2 { grid-template-columns:1fr; }
+  .content { padding:20px; }
+  .topbar { padding:14px 20px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Login screen (shown until admin API key is validated) -->
+<section id="login-view" class="hide login-screen">
+  <div class="login-card">
+    <div class="brand">
+      <!-- Inline keysat-mark, identical to design system asset -->
+      <svg class="brand-mark" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+        <ellipse cx="50" cy="22" rx="28" ry="5" fill="#1E3A5F"></ellipse>
+        <rect x="22" y="22" width="56" height="56" fill="#FBF9F2" stroke="#1E3A5F" stroke-width="3"></rect>
+        <ellipse cx="50" cy="78" rx="28" ry="5" fill="#1E3A5F"></ellipse>
+        <line x1="32" y1="36" x2="68" y2="36" stroke="#1E3A5F" stroke-width="1.5" stroke-linecap="round"></line>
+        <line x1="32" y1="44" x2="62" y2="44" stroke="#1E3A5F" stroke-width="1.5" stroke-linecap="round"></line>
+        <circle cx="42" cy="60" r="6" fill="none" stroke="#BFA068" stroke-width="2.5"></circle>
+        <rect x="48" y="58.5" width="14" height="3" fill="#BFA068"></rect>
+        <rect x="58" y="61.5" width="2" height="4" fill="#BFA068"></rect>
+        <rect x="62" y="61.5" width="2" height="3" fill="#BFA068"></rect>
+      </svg>
+    </div>
+    <h1>Keysat admin</h1>
+    <div class="sub">Paste the admin API key from your StartOS service page.</div>
+    <div class="field">
+      <label class="lbl" for="api-key">Admin API key</label>
+      <input class="input mono" type="password" id="api-key" placeholder="64 hex chars" autocomplete="off">
+      <div class="hint">Find this in StartOS &rarr; Keysat &rarr; Actions &rarr; <em>Show admin API key</em>. The key is kept in your browser&rsquo;s localStorage and is sent only to this Keysat instance.</div>
+    </div>
+    <button id="login-btn" class="btn primary">Sign in</button>
+    <div id="login-err" class="err hide"></div>
+  </div>
+</section>
+
+<!-- Main app shell (shown after login) -->
+<section id="app-view" class="hide">
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <svg viewBox="0 0 100 100" fill="none" aria-hidden="true" style="width:26px; height:26px">
+          <ellipse cx="50" cy="22" rx="28" ry="5" fill="#1E3A5F"></ellipse>
+          <rect x="22" y="22" width="56" height="56" fill="#FBF9F2" stroke="#1E3A5F" stroke-width="3"></rect>
+          <ellipse cx="50" cy="78" rx="28" ry="5" fill="#1E3A5F"></ellipse>
+          <line x1="32" y1="36" x2="68" y2="36" stroke="#1E3A5F" stroke-width="1.5" stroke-linecap="round"></line>
+          <line x1="32" y1="44" x2="62" y2="44" stroke="#1E3A5F" stroke-width="1.5" stroke-linecap="round"></line>
+          <circle cx="42" cy="60" r="6" fill="none" stroke="#BFA068" stroke-width="2.5"></circle>
+          <rect x="48" y="58.5" width="14" height="3" fill="#BFA068"></rect>
+          <rect x="58" y="61.5" width="2" height="4" fill="#BFA068"></rect>
+          <rect x="62" y="61.5" width="2" height="3" fill="#BFA068"></rect>
+        </svg>
+        <span>Keysat</span>
+      </div>
+      <a class="nav active" data-route="overview"><i data-lucide="layout-dashboard"></i>Overview</a>
+      <a class="nav" data-route="products"><i data-lucide="package"></i>Products</a>
+      <a class="nav" data-route="policies"><i data-lucide="file-badge"></i>Policies</a>
+      <a class="nav" data-route="codes"><i data-lucide="tag"></i>Discount codes</a>
+      <a class="nav" data-route="licenses"><i data-lucide="key-round"></i>Licenses</a>
+      <a class="nav" data-route="machines"><i data-lucide="cpu"></i>Machines</a>
+      <div class="group-label">System</div>
+      <a class="nav" data-route="webhooks"><i data-lucide="webhook"></i>Webhooks</a>
+      <a class="nav" data-route="audit"><i data-lucide="scroll-text"></i>Audit log</a>
+      <div class="footer" id="sidebar-footer">
+        <span class="dot warn"></span>
+        <div>
+          <div style="color:var(--cream-50); font-weight:600">Loading&hellip;</div>
+          <div>checking BTCPay</div>
+        </div>
+      </div>
+      <a href="https://keysat.xyz/support" target="_blank" rel="noopener" style="
+        display:flex; align-items:center; gap:8px;
+        padding:10px 12px; margin-top:6px;
+        font-size:11.5px; color:rgba(245,241,232,0.55);
+        border:1px dashed rgba(245,241,232,0.15); border-radius:6px;
+        text-decoration:none; transition:all 120ms;
+      " onmouseover="this.style.color='var(--cream-50)'; this.style.borderColor='var(--gold-500)';"
+         onmouseout="this.style.color='rgba(245,241,232,0.55)'; this.style.borderColor='rgba(245,241,232,0.15)';">
+        <i data-lucide="heart" style="width:14px; height:14px; color:var(--gold-400)"></i>
+        <span>Support development</span>
+      </a>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="crumb" id="crumb">Workspace</div>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="who" id="who">&middot;&middot;&middot;</span>
+          <button class="btn secondary sm" id="logout"><i data-lucide="log-out"></i>Sign out</button>
+        </div>
+      </header>
+      <div class="content" id="route-target"></div>
+    </main>
+  </div>
+</section>
+
+<script src="https://unpkg.com/lucide@latest"></script>
+<script>
+(function () {
+  'use strict'
+
+  const LS_KEY = 'keysat-admin-api-key'
+
+  // ---------- network helpers ----------
+  let apiKey = ''
+  let serviceInfo = null
+
+  async function api(path, opts) {
+    opts = opts || {}
+    const init = {
+      method: opts.method || 'GET',
+      headers: Object.assign(
+        { 'Authorization': 'Bearer ' + apiKey },
+        opts.body ? { 'Content-Type': 'application/json' } : {},
+      ),
+    }
+    if (opts.body) init.body = JSON.stringify(opts.body)
+    const resp = await fetch(path, init)
+    if (!resp.ok) {
+      let msg = resp.statusText
+      try { const j = await resp.json(); msg = j.message || j.error || msg } catch (_) {}
+      throw new Error('HTTP ' + resp.status + ': ' + msg)
+    }
+    if (resp.status === 204) return null
+    return resp.json()
+  }
+
+  function el(tag, attrs, children) {
+    const e = document.createElement(tag)
+    if (attrs) for (const k in attrs) {
+      if (k === 'class') e.className = attrs[k]
+      else if (k === 'html') e.innerHTML = attrs[k]
+      else if (k.startsWith('on')) e.addEventListener(k.slice(2).toLowerCase(), attrs[k])
+      else if (k === 'value') e.value = attrs[k]
+      else e.setAttribute(k, attrs[k])
+    }
+    if (children) for (const c of [].concat(children)) {
+      if (c == null) continue
+      e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c)
+    }
+    return e
+  }
+
+  function err(msg) { return el('div', { class: 'err' }, msg) }
+  function ok(msg) { return el('div', { class: 'ok' }, msg) }
+
+  function fmtDate(s) {
+    if (!s) return ''
+    try { return new Date(s).toLocaleString() } catch (_) { return s }
+  }
+  function shortId(s) {
+    return s ? (s.length > 8 ? s.slice(0, 8) + '…' : s) : ''
+  }
+
+  // ---------- card helpers ----------
+  function card(title, sub, body) {
+    const head = el('div', { class: 'card-head' }, [
+      el('h3', null, title),
+      sub ? el('span', { class: 'sub' }, sub) : null,
+    ])
+    const c = el('div', { class: 'card' }, [head])
+    if (body) c.appendChild(el('div', { class: 'card-body' }, body))
+    return c
+  }
+  function plainCard(body) {
+    return el('div', { class: 'card' }, el('div', { class: 'card-body' }, body))
+  }
+  function tableCard(title, sub, headers, rows, emptyMsg) {
+    const head = el('div', { class: 'card-head' }, [
+      el('h3', null, title),
+      sub ? el('span', { class: 'sub' }, sub) : null,
+    ])
+    if (rows.length === 0) {
+      return el('div', { class: 'card' }, [head, el('div', { class: 'empty' }, emptyMsg || 'Nothing yet.')])
+    }
+    const t = el('table', { class: 't' })
+    t.appendChild(el('thead', null, el('tr', null, headers.map((h) => el('th', null, h)))))
+    const tb = el('tbody')
+    for (const r of rows) tb.appendChild(r)
+    t.appendChild(tb)
+    return el('div', { class: 'card' }, [head, t])
+  }
+  function statusBadge(status) {
+    const map = {
+      active:    { cls: 'b-success', dot: 'ok' },
+      suspended: { cls: 'b-warning', dot: 'warn' },
+      revoked:   { cls: 'b-danger',  dot: 'err' },
+      expired:   { cls: 'b-neutral', dot: 'muted' },
+    }
+    const m = map[status] || { cls: 'b-neutral', dot: 'muted' }
+    return el('span', { class: 'badge ' + m.cls }, [el('span', { class: 'dot ' + m.dot }), status])
+  }
+  function activePill(active) {
+    return active
+      ? el('span', { class: 'badge b-success' }, [el('span', { class: 'dot ok' }), 'active'])
+      : el('span', { class: 'badge b-neutral' }, 'inactive')
+  }
+
+  // ---------- routes ----------
+  const routes = {}
+  const ROUTE_META = {
+    overview:  { title: 'Overview',         crumb: 'Workspace' },
+    products:  { title: 'Products',         crumb: 'Workspace · Products' },
+    policies:  { title: 'Policies',         crumb: 'Workspace · Policies' },
+    codes:     { title: 'Discount codes',   crumb: 'Workspace · Discount codes' },
+    licenses:  { title: 'Licenses',         crumb: 'Workspace · Licenses' },
+    machines:  { title: 'Machines',         crumb: 'Workspace · Machines' },
+    webhooks:  { title: 'Webhooks',         crumb: 'System · Webhooks' },
+    audit:     { title: 'Audit log',        crumb: 'System · Audit log' },
+  }
+
+  // -------- Overview --------
+  routes.overview = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    // Stats grid (skeleton first; fill in as data arrives)
+    const stats = el('div', { class: 'stats' })
+    const sLicenses = stat('Active licenses', '–', null, true)
+    const sCodes = stat('Discount codes', '–')
+    const sWebhooks = stat('Webhooks', '–')
+    const sBtc = stat('BTCPay', el('span', { style: 'font-size:18px; font-family:var(--font-body); font-weight:600' }, '–'))
+    stats.appendChild(sLicenses)
+    stats.appendChild(sCodes)
+    stats.appendChild(sWebhooks)
+    stats.appendChild(sBtc)
+    target.appendChild(stats)
+
+    // Welcome / instructions card
+    target.appendChild(card('Welcome', null, [
+      el('p', { class: 'muted' }, [
+        'This is your Keysat admin dashboard. Use the sidebar to manage products, policies, discount codes, and the licenses you have issued. ',
+        'Setup actions — setting your operator name, connecting BTCPay, and viewing your admin credentials — live in your StartOS service ',
+        el('strong', null, 'Actions'), ' tab.',
+      ]),
+      el('p', { class: 'muted', style: 'margin-bottom:0' }, [
+        'Service: ',
+        el('code', { class: 'mono', style: 'font-family:var(--font-mono); font-size:12.5px; color:var(--navy-900)' }, [
+          serviceInfo ? (serviceInfo.service + ' v' + serviceInfo.version) : '–',
+        ]),
+        ' · Operator: ',
+        el('code', { class: 'mono', style: 'font-family:var(--font-mono); font-size:12.5px; color:var(--navy-900)' },
+          (serviceInfo && serviceInfo.operator) || '(unset)'),
+      ]),
+    ]))
+
+    // Public key tip card (matches the design system 'Embed your public key' tip)
+    const pubkeyTip = el('div', {
+      class: 'card',
+      style: 'background:var(--cream-100); border-style:dashed;'
+    }, [
+      el('div', { class: 'card-body' }, [
+        el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'Tip'),
+        el('div', {
+          style: 'font-family:var(--font-display); font-weight:700; font-size:15px; color:var(--navy-950); margin-bottom:4px; letter-spacing:-0.01em;',
+        }, 'Embed your public key'),
+        el('p', { style: 'font-size:13px; color:var(--ink-700); margin:0 0 12px; line-height:1.5' },
+          'Paste this into your app’s source so it verifies signatures offline. The key is also available at /v1/issuer/public-key.'),
+        el('div', {
+          style: 'background:var(--navy-950); color:var(--cream-50); padding:10px 12px; border-radius:7px; font-family:var(--font-mono); font-size:12px; display:flex; gap:10px; align-items:center; justify-content:space-between;',
+        }, [
+          el('span', { id: 'pubkey-preview' }, 'loading…'),
+          el('button', {
+            class: 'btn sm',
+            style: 'background:rgba(245,241,232,0.10); color:var(--cream-50); border:0;',
+            onclick: copyPubkey,
+          }, 'Copy'),
+        ]),
+      ]),
+    ])
+    target.appendChild(pubkeyTip)
+
+    // Fill in stat values
+    try {
+      const j = await api('/v1/admin/licenses/summary').catch(() => null)
+      if (j && typeof j.active === 'number') {
+        sLicenses.querySelector('.value').textContent = j.active.toString()
+      } else {
+        sLicenses.querySelector('.value').textContent = '–'
+      }
+    } catch {}
+    try {
+      const j = await api('/v1/admin/discount-codes')
+      const codes = j.codes || []
+      sCodes.querySelector('.value').textContent = codes.length.toString()
+    } catch {}
+    try {
+      const j = await api('/v1/admin/webhook-endpoints')
+      const eps = j.endpoints || j.webhooks || []
+      sWebhooks.querySelector('.value').textContent = eps.length.toString()
+    } catch {}
+    try {
+      const s = await api('/v1/admin/btcpay/status')
+      const v = sBtc.querySelector('.value')
+      v.innerHTML = ''
+      if (s.connected) {
+        v.appendChild(el('span', { class: 'badge b-success', style: 'font-size:13px; padding:5px 12px' },
+          [el('span', { class: 'dot ok' }), 'Connected']))
+        v.appendChild(el('div', { class: 'sub', style: 'font-family:var(--font-mono); font-size:11px; margin-top:8px' },
+          'store ' + (s.store_id || '?').slice(0, 14) + '…'))
+      } else {
+        v.appendChild(el('span', { class: 'badge b-warning', style: 'font-size:13px; padding:5px 12px' },
+          [el('span', { class: 'dot warn' }), 'Not connected']))
+        v.appendChild(el('div', { class: 'sub', style: 'margin-top:8px' },
+          'Connect via StartOS Actions'))
+      }
+    } catch (e) {
+      sBtc.querySelector('.value').textContent = '?'
+    }
+
+    // Public key fetch
+    try {
+      const j = await fetch('/v1/issuer/public-key').then((r) => r.json()).catch(() => null)
+      if (j && j.public_key_b64) {
+        const k = j.public_key_b64
+        document.getElementById('pubkey-preview').textContent = k.slice(0, 12) + '…' + k.slice(-12)
+        document.getElementById('pubkey-preview').dataset.full = k
+      } else {
+        document.getElementById('pubkey-preview').textContent = 'unavailable'
+      }
+    } catch {
+      document.getElementById('pubkey-preview').textContent = 'unavailable'
+    }
+  }
+
+  function stat(label, value, sub, featured) {
+    return el('div', { class: 'stat' + (featured ? ' featured' : '') }, [
+      el('div', { class: 'label' }, label),
+      el('div', { class: 'value' }, value),
+      sub ? el('div', { class: 'sub' }, sub) : null,
+    ])
+  }
+
+  async function copyPubkey() {
+    const span = document.getElementById('pubkey-preview')
+    const k = span.dataset.full
+    if (!k) return
+    try {
+      await navigator.clipboard.writeText(k)
+      const orig = span.textContent
+      span.textContent = 'Copied'
+      setTimeout(() => { span.textContent = orig }, 1200)
+    } catch {}
+  }
+
+  // -------- Products --------
+  routes.products = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    // Create form
+    const create = el('details', { class: 'disclosure' }, [
+      el('summary', null, 'Create a new product'),
+      el('div', { class: 'body' }, [
+        formInput('slug', 'Slug', { required: true, hint: 'lowercase, hyphens, e.g. "bitcoin-ticker-pro"' }),
+        formInput('name', 'Display name', { required: true }),
+        formInput('description', 'Description', { textarea: true }),
+        formInput('price_sats', 'Price (sats)', { type: 'number', required: true, value: '50000' }),
+        el('button', { class: 'btn primary', onclick: async function () {
+          const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
+          create.querySelector('.body').appendChild(status)
+          try {
+            await api('/v1/admin/products', { method: 'POST', body: {
+              slug: create.querySelector('[name=slug]').value.trim(),
+              name: create.querySelector('[name=name]').value.trim(),
+              description: create.querySelector('[name=description]').value || '',
+              price_sats: parseInt(create.querySelector('[name=price_sats]').value, 10),
+              metadata: {},
+            }})
+            status.replaceWith(ok('Created. Reloading…'))
+            setTimeout(routes.products, 600)
+          } catch (e) { status.replaceWith(err(e.message)) }
+        }}, 'Create product'),
+      ]),
+    ])
+    target.appendChild(plainCard([
+      el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'About'),
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'A product is anything you sell. Each product has a public purchase URL at /buy/<slug> and zero or more policies that determine what kind of license is issued.'),
+      create,
+    ]))
+
+    try {
+      const j = await api('/v1/products')
+      const products = j.products || j || []
+      const rows = products.map((p) => el('tr', null, [
+        el('td', null, el('code', null, p.slug)),
+        el('td', { style: 'font-weight:600; color:var(--navy-950)' }, p.name),
+        el('td', null, (p.price_sats || 0).toLocaleString() + ' sats'),
+        el('td', null, activePill(p.active)),
+        el('td', { class: 'muted' }, fmtDate(p.created_at)),
+      ]))
+      target.appendChild(tableCard(
+        'All products',
+        products.length + ' total',
+        ['Slug', 'Name', 'Price', 'Status', 'Created'],
+        rows,
+        'No products yet. Create one above to start selling.'
+      ))
+    } catch (e) {
+      target.appendChild(plainCard([err(e.message)]))
+    }
+  }
+
+  // -------- Policies --------
+  routes.policies = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    const products = (await api('/v1/products').catch(() => ({ products: [] }))).products || []
+    if (products.length === 0) {
+      target.appendChild(plainCard([
+        el('p', { class: 'muted', style: 'margin:0' },
+          'Create a product first — a policy is always attached to a product.'),
+      ]))
+      return
+    }
+
+    const create = el('details', { class: 'disclosure' }, [
+      el('summary', null, 'Create a new policy'),
+      el('div', { class: 'body' }, [
+        formSelect('product_slug', 'Product', products.map((p) => ({ value: p.slug, label: p.name + ' (' + p.slug + ')' })), { required: true }),
+        el('div', { class: 'row-2' }, [
+          formInput('slug', 'Policy slug', { required: true, value: 'default', hint: 'use "default" for the public purchase flow' }),
+          formInput('name', 'Display name', { required: true, value: 'Standard' }),
+        ]),
+        el('div', { class: 'row-2' }, [
+          formInput('duration_seconds', 'Duration (sec, 0 = perpetual)', { type: 'number', required: true, value: '0' }),
+          formInput('grace_seconds', 'Grace period (sec)', { type: 'number', required: true, value: '0' }),
+        ]),
+        el('div', { class: 'row-2' }, [
+          formInput('max_machines', 'Max machines (0 = unlimited)', { type: 'number', required: true, value: '1' }),
+          formCheckbox('is_trial', 'Trial flag (sets TRIAL bit)'),
+        ]),
+        formInput('entitlements', 'Entitlements (comma-separated, optional)', { hint: 'e.g. core, sync, export. Embedded in the signed key.' }),
+
+        // ---------- Tip recipient (optional) ----------
+        el('div', {
+          style: 'margin:18px 0 12px; padding-top:14px; border-top:1px dashed var(--border-1)',
+        }, [
+          el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'Tip recipient (optional)'),
+          el('p', { class: 'hint', style: 'margin:0 0 10px' },
+            'On every successful license issuance under this policy, send a Lightning tip to the recipient as a percentage of what the buyer paid. Operator-controlled — fully optional. Suggestions: tip@keysat.xyz to support Keysat, opensats@nostrplebs.com for OpenSats, your co-founder, a charity, anyone with a Lightning Address.'),
+          el('div', { class: 'row-2' }, [
+            formInput('tip_recipient', 'Lightning Address', {
+              hint: 'e.g. tip@keysat.xyz. Leave blank to disable.',
+            }),
+            formInput('tip_pct', 'Tip percentage', {
+              type: 'number', value: '0',
+              hint: '0 = disabled. Examples: 1 = 1%, 5 = 5%. Capped at 100.',
+            }),
+          ]),
+          formInput('tip_label', 'Label (optional)', {
+            hint: 'Free-form note. Shown in the audit log next to each tip attempt.',
+          }),
+        ]),
+
+        el('button', { class: 'btn primary', onclick: async function () {
+          const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
+          create.querySelector('.body').appendChild(status)
+          try {
+            const ents = (create.querySelector('[name=entitlements]').value || '').split(',').map((s) => s.trim()).filter(Boolean)
+            const tipRecipient = (create.querySelector('[name=tip_recipient]').value || '').trim()
+            const tipPctRaw = parseFloat(create.querySelector('[name=tip_pct]').value) || 0
+            // UI percent → basis points. Cap at 10000 (= 100%).
+            const tipPctBps = Math.max(0, Math.min(10000, Math.round(tipPctRaw * 100)))
+            const tipLabel = (create.querySelector('[name=tip_label]').value || '').trim()
+            const body = {
+              product_slug: create.querySelector('[name=product_slug]').value,
+              slug: create.querySelector('[name=slug]').value,
+              name: create.querySelector('[name=name]').value,
+              duration_seconds: parseInt(create.querySelector('[name=duration_seconds]').value, 10),
+              grace_seconds: parseInt(create.querySelector('[name=grace_seconds]').value, 10),
+              max_machines: parseInt(create.querySelector('[name=max_machines]').value, 10),
+              is_trial: create.querySelector('[name=is_trial]').checked,
+              entitlements: ents,
+            }
+            if (tipRecipient) {
+              body.tip_recipient = tipRecipient
+              body.tip_pct_bps = tipPctBps
+              if (tipLabel) body.tip_label = tipLabel
+            }
+            await api('/v1/admin/policies', { method: 'POST', body })
+            status.replaceWith(ok('Created. Reloading…'))
+            setTimeout(routes.policies, 600)
+          } catch (e) { status.replaceWith(err(e.message)) }
+        }}, 'Create policy'),
+      ]),
+    ])
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance.'),
+      create,
+    ]))
+
+    for (const p of products) {
+      try {
+        const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(p.slug))
+        const policies = j.policies || []
+        const rows = policies.map((pol) => el('tr', null, [
+          el('td', null, el('code', null, pol.slug)),
+          el('td', { style: 'font-weight:600; color:var(--navy-950)' }, pol.name),
+          el('td', null, pol.duration_seconds === 0 ? 'perpetual' : pol.duration_seconds + 's'),
+          el('td', null, pol.grace_seconds + 's'),
+          el('td', null, pol.max_machines === 0 ? '∞' : String(pol.max_machines)),
+          el('td', null, pol.is_trial
+            ? el('span', { class: 'badge b-warning' }, 'trial')
+            : el('span', { class: 'muted' }, '–')),
+          el('td', { class: 'muted' }, (pol.entitlements || []).join(', ') || '–'),
+          el('td', null, activePill(pol.active)),
+        ]))
+        target.appendChild(tableCard(
+          p.name + ' — ' + p.slug,
+          policies.length + ' polic' + (policies.length === 1 ? 'y' : 'ies'),
+          ['Slug', 'Name', 'Duration', 'Grace', 'Seats', 'Trial', 'Entitlements', 'Status'],
+          rows,
+          '(no policies yet)'
+        ))
+      } catch (e) {
+        target.appendChild(plainCard([err('Failed to load policies for ' + p.slug + ': ' + e.message)]))
+      }
+    }
+  }
+
+  // -------- Discount codes --------
+  routes.codes = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    const create = el('details', { class: 'disclosure' }, [
+      el('summary', null, 'Create a new code'),
+      el('div', { class: 'body' }, [
+        el('div', { class: 'row-2' }, [
+          formInput('code', 'Code', { required: true, hint: 'will be uppercased, e.g. FOUNDERS50' }),
+          formSelect('kind', 'Kind', [
+            { value: 'percent', label: 'Percent off' },
+            { value: 'fixed_sats', label: 'Fixed sats off' },
+            { value: 'free_license', label: 'Free license (no payment)' },
+          ], { required: true, value: 'percent' }),
+        ]),
+        el('div', { class: 'row-2' }, [
+          formInput('amount', 'Amount', { type: 'number', value: '50', hint: 'percent: 1–100. fixed_sats: positive integer. free_license: ignored.' }),
+          formInput('max_uses', 'Max uses (0 = unlimited)', { type: 'number', value: '0' }),
+        ]),
+        el('div', { class: 'row-2' }, [
+          formInput('expires_at', 'Expires at (RFC3339, optional)', { hint: 'e.g. 2026-12-31T23:59:59Z' }),
+          formInput('product_slug', 'Restrict to product slug (optional)'),
+        ]),
+        formInput('referrer_label', 'Referrer / campaign label (optional)'),
+        formInput('description', 'Description (internal note)', { textarea: true }),
+        el('button', { class: 'btn primary', onclick: async function () {
+          const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
+          create.querySelector('.body').appendChild(status)
+          try {
+            const kind = create.querySelector('[name=kind]').value
+            let amount = parseInt(create.querySelector('[name=amount]').value, 10) || 0
+            if (kind === 'percent') amount = amount * 100
+            const body = {
+              code: create.querySelector('[name=code]').value.trim(),
+              kind, amount,
+              description: create.querySelector('[name=description]').value || '',
+            }
+            const mu = parseInt(create.querySelector('[name=max_uses]').value, 10) || 0
+            if (mu > 0) body.max_uses = mu
+            const exp = create.querySelector('[name=expires_at]').value.trim()
+            if (exp) body.expires_at = exp
+            const ps = create.querySelector('[name=product_slug]').value.trim()
+            if (ps) body.product_slug = ps
+            const rl = create.querySelector('[name=referrer_label]').value.trim()
+            if (rl) body.referrer_label = rl
+            await api('/v1/admin/discount-codes', { method: 'POST', body })
+            status.replaceWith(ok('Created. Reloading…'))
+            setTimeout(routes.codes, 600)
+          } catch (e) { status.replaceWith(err(e.message)) }
+        }}, 'Create code'),
+      ]),
+    ])
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'Codes can be percent-off, fixed-sats-off, or free-license (no payment required). Buyers append ?code=YOUR_CODE to your purchase URL, or for free-license codes use the /v1/redeem endpoint.'),
+      create,
+    ]))
+
+    try {
+      const j = await api('/v1/admin/discount-codes?include_inactive=true')
+      const codes = j.codes || []
+      const rows = codes.map((c) => {
+        let amountStr = ''
+        if (c.kind === 'percent') amountStr = (c.amount / 100) + '%'
+        else if (c.kind === 'fixed_sats') amountStr = c.amount.toLocaleString() + ' sats'
+        else amountStr = el('span', { class: 'badge b-gold' }, 'free')
+        const usage = c.used_count + ' / ' + (c.max_uses == null ? '∞' : c.max_uses)
+        return el('tr', null, [
+          el('td', null, el('code', null, c.code)),
+          el('td', null, c.kind),
+          el('td', null, amountStr),
+          el('td', null, usage),
+          el('td', { class: 'muted' }, c.expires_at ? fmtDate(c.expires_at) : '–'),
+          el('td', null, activePill(c.active)),
+          el('td', null, el('div', { class: 'actions-row' }, [
+            el('button', {
+              class: 'btn sm ' + (c.active ? 'danger' : 'secondary'),
+              onclick: async function () {
+                try {
+                  await api('/v1/admin/discount-codes/' + c.id + '/active', { method: 'PATCH', body: { active: !c.active } })
+                  routes.codes()
+                } catch (e) { alert(e.message) }
+              },
+            }, c.active ? 'Disable' : 'Enable'),
+            el('button', {
+              class: 'btn sm danger',
+              onclick: async function () {
+                const usedNote = c.used_count > 0
+                  ? '\n\nThis code has been redeemed ' + c.used_count + ' time(s). Delete will be refused (audit trail). Use Disable instead.'
+                  : ''
+                if (!confirm('Permanently delete code "' + c.code + '"? This cannot be undone.' + usedNote)) return
+                try {
+                  await api('/v1/admin/discount-codes/' + c.id, { method: 'DELETE' })
+                  routes.codes()
+                } catch (e) { alert(e.message) }
+              },
+            }, 'Delete'),
+          ])),
+        ])
+      })
+      target.appendChild(tableCard(
+        'All codes',
+        codes.length + ' total',
+        ['Code', 'Kind', 'Amount', 'Used', 'Expires', 'Status', ''],
+        rows,
+        'No codes yet.'
+      ))
+    } catch (e) {
+      target.appendChild(plainCard([err(e.message)]))
+    }
+  }
+
+  // -------- Licenses --------
+  routes.licenses = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    const queryInput = el('input', { class: 'input', type: 'text', placeholder: 'email, npub, or invoice id' })
+    const fieldSel = el('select', { class: 'select' }, [
+      el('option', { value: 'email' }, 'Email'),
+      el('option', { value: 'npub' }, 'Nostr npub'),
+      el('option', { value: 'invoice' }, 'BTCPay invoice id'),
+    ])
+    const tableHolder = el('div')
+
+    async function doSearch() {
+      const q = queryInput.value.trim()
+      if (!q) return
+      tableHolder.innerHTML = ''
+      tableHolder.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Searching…')))
+      try {
+        const params = new URLSearchParams()
+        params.set(fieldSel.value, q)
+        const j = await api('/v1/admin/licenses/search?' + params.toString())
+        const lic = j.licenses || []
+        const rows = lic.map((l) => el('tr', null, [
+          el('td', null, el('code', null, shortId(l.id))),
+          el('td', null, shortId(l.product_id)),
+          el('td', null, statusBadge(l.status)),
+          el('td', { class: 'muted' }, fmtDate(l.issued_at)),
+          el('td', { class: 'muted' }, l.expires_at ? fmtDate(l.expires_at) : el('span', { class: 'badge b-gold' }, 'perpetual')),
+          el('td', { class: 'muted' }, l.buyer_email || '–'),
+          el('td', null, el('div', { class: 'actions-row' }, [
+            l.status !== 'revoked' && l.status !== 'suspended'
+              ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'suspend') }, 'Suspend')
+              : null,
+            l.status === 'suspended'
+              ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'unsuspend') }, 'Unsuspend')
+              : null,
+            l.status !== 'revoked'
+              ? el('button', { class: 'btn sm danger', onclick: () => actLicense(l, 'revoke') }, 'Revoke')
+              : null,
+          ])),
+        ]))
+        tableHolder.innerHTML = ''
+        tableHolder.appendChild(tableCard(
+          'Results',
+          lic.length + ' license' + (lic.length === 1 ? '' : 's'),
+          ['ID', 'Product', 'Status', 'Issued', 'Expires', 'Buyer', ''],
+          rows,
+          'No matches.'
+        ))
+      } catch (e) {
+        tableHolder.innerHTML = ''
+        tableHolder.appendChild(plainCard([err(e.message)]))
+      }
+    }
+
+    async function actLicense(l, op) {
+      if (op === 'revoke' && !confirm('Revoke this license? This is irreversible.')) return
+      const reason = prompt('Reason (optional):') || ''
+      try {
+        await api('/v1/admin/licenses/' + l.id + '/' + op, { method: 'POST', body: { reason } })
+        doSearch()
+      } catch (e) { alert(e.message) }
+    }
+
+    queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') doSearch() })
+
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'Search by buyer email, Nostr npub, or BTCPay invoice id. Results show all matching licenses with their current state.'),
+      el('div', { class: 'toolbar' }, [
+        fieldSel,
+        queryInput,
+        el('button', { class: 'btn primary', onclick: doSearch }, [
+          el('i', { 'data-lucide': 'search' }),
+          'Search',
+        ]),
+      ]),
+    ]))
+    target.appendChild(tableHolder)
+    if (window.lucide) lucide.createIcons()
+  }
+
+  // -------- Machines --------
+  routes.machines = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    const idIn = el('input', { class: 'input mono', type: 'text', placeholder: 'license id (UUID)' })
+    const out = el('div')
+
+    async function load() {
+      out.innerHTML = ''
+      out.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Loading…')))
+      try {
+        const j = await api('/v1/admin/machines?license_id=' + encodeURIComponent(idIn.value.trim()))
+        const ms = j.machines || []
+        const rows = ms.map((m) => el('tr', null, [
+          el('td', null, el('code', null, shortId(m.id))),
+          el('td', null, m.hostname || '–'),
+          el('td', null, m.platform || '–'),
+          el('td', { class: 'muted' }, fmtDate(m.last_heartbeat_at)),
+          el('td', null, (m.active === true || m.active === 1)
+            ? el('span', { class: 'badge b-success' }, [el('span', { class: 'dot ok' }), 'active'])
+            : el('span', { class: 'badge b-neutral' }, 'inactive')),
+          el('td', null, (m.active === true || m.active === 1)
+            ? el('button', { class: 'btn sm danger', onclick: async () => {
+                if (!confirm('Force-deactivate this machine? It will free the seat.')) return
+                try {
+                  await api('/v1/admin/machines/' + m.id + '/deactivate', { method: 'POST', body: { reason: 'admin' } })
+                  load()
+                } catch (e) { alert(e.message) }
+              }}, 'Deactivate')
+            : null),
+        ]))
+        out.innerHTML = ''
+        out.appendChild(tableCard(
+          'Machines',
+          ms.length + ' bound',
+          ['ID', 'Hostname', 'Platform', 'Last heartbeat', 'Status', ''],
+          rows,
+          'No machines bound to that license.'
+        ))
+      } catch (e) {
+        out.innerHTML = ''
+        out.appendChild(plainCard([err(e.message)]))
+      }
+    }
+
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'Show or deactivate machines bound to a specific license. Provide the license id (find it via Licenses → search).'),
+      el('div', { class: 'toolbar' }, [
+        idIn,
+        el('button', { class: 'btn primary', onclick: load }, 'Load'),
+      ]),
+    ]))
+    target.appendChild(out)
+  }
+
+  // -------- Webhooks --------
+  routes.webhooks = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    const create = el('details', { class: 'disclosure' }, [
+      el('summary', null, 'Register a new webhook endpoint'),
+      el('div', { class: 'body' }, [
+        formInput('url', 'URL', { required: true, hint: 'where Keysat will POST event payloads' }),
+        formInput('description', 'Description (internal)'),
+        formInput('event_types', 'Event types (comma-separated; * for all)', { value: '*' }),
+        el('button', { class: 'btn primary', onclick: async function () {
+          try {
+            const evts = (create.querySelector('[name=event_types]').value || '*').split(',').map((s) => s.trim()).filter(Boolean)
+            await api('/v1/admin/webhook-endpoints', { method: 'POST', body: {
+              url: create.querySelector('[name=url]').value.trim(),
+              description: create.querySelector('[name=description]').value || '',
+              event_types: evts,
+            }})
+            routes.webhooks()
+          } catch (e) { alert(e.message) }
+        }}, 'Register endpoint'),
+      ]),
+    ])
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'Subscribe an external URL to Keysat events: license.issued, license.revoked, code.redeemed, etc. Each delivery carries an HMAC-SHA256 signature in the X-Keysat-Signature header.'),
+      create,
+    ]))
+
+    try {
+      const j = await api('/v1/admin/webhook-endpoints')
+      const eps = j.endpoints || j.webhooks || []
+      const rows = eps.map((e) => el('tr', null, [
+        el('td', null, el('code', { style: 'word-break:break-all' }, e.url)),
+        el('td', { class: 'muted' }, (e.event_types || []).join(', ')),
+        el('td', null, activePill(e.active)),
+        el('td', { class: 'muted' }, fmtDate(e.created_at)),
+        el('td', null, el('div', { class: 'actions-row' }, [
+          el('button', { class: 'btn sm secondary', onclick: async () => {
+            try { await api('/v1/admin/webhook-endpoints/' + e.id + '/active', { method: 'PATCH', body: { active: !e.active } }); routes.webhooks() } catch (er) { alert(er.message) }
+          }}, e.active ? 'Disable' : 'Enable'),
+          el('button', { class: 'btn sm danger', onclick: async () => {
+            if (!confirm('Delete this webhook subscription?')) return
+            try { await api('/v1/admin/webhook-endpoints/' + e.id, { method: 'DELETE' }); routes.webhooks() } catch (er) { alert(er.message) }
+          }}, 'Delete'),
+        ])),
+      ]))
+      target.appendChild(tableCard(
+        'Registered endpoints',
+        eps.length + ' total',
+        ['URL', 'Events', 'Status', 'Created', ''],
+        rows,
+        'No webhooks registered.'
+      ))
+    } catch (e) {
+      target.appendChild(plainCard([err(e.message)]))
+    }
+  }
+
+  // -------- Audit log --------
+  routes.audit = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    const filter = el('input', { class: 'input', type: 'text', placeholder: 'filter by action (optional)' })
+    const limit = el('input', { class: 'input', type: 'number', value: '50', style: 'min-width:6rem; max-width:8rem' })
+    const out = el('div')
+
+    async function load() {
+      out.innerHTML = ''
+      out.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Loading…')))
+      try {
+        const params = new URLSearchParams()
+        params.set('limit', limit.value || '50')
+        if (filter.value.trim()) params.set('action', filter.value.trim())
+        const j = await api('/v1/admin/audit?' + params.toString())
+        const entries = j.entries || []
+        const rows = entries.map((e) => el('tr', null, [
+          el('td', { class: 'muted' }, fmtDate(e.occurred_at)),
+          el('td', null, el('code', null, e.action)),
+          el('td', { class: 'muted' }, e.target_kind ? e.target_kind + ' ' + shortId(e.target_id || '') : '–'),
+          el('td', { class: 'muted' }, e.actor_kind),
+        ]))
+        out.innerHTML = ''
+        out.appendChild(tableCard(
+          'Recent entries',
+          entries.length + ' shown',
+          ['When', 'Action', 'Target', 'Actor'],
+          rows,
+          'No entries.'
+        ))
+      } catch (e) {
+        out.innerHTML = ''
+        out.appendChild(plainCard([err(e.message)]))
+      }
+    }
+
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 16px' },
+        'Most recent admin mutations. Filter by action slug if you know what you’re looking for.'),
+      el('div', { class: 'toolbar' }, [
+        filter, limit,
+        el('button', { class: 'btn primary', onclick: load }, 'Load'),
+      ]),
+    ]))
+    target.appendChild(out)
+    load()
+  }
+
+  // ---------- form helpers ----------
+  function formInput(name, label, opts) {
+    opts = opts || {}
+    const id = 'f_' + name + '_' + Math.random().toString(36).slice(2, 6)
+    const lbl = el('label', { class: 'lbl', for: id }, [label, opts.required ? el('span', { class: 'req' }, '*') : null])
+    const inp = opts.textarea
+      ? el('textarea', { class: 'input', id, name, rows: '3' })
+      : el('input', { class: 'input' + (opts.mono ? ' mono' : ''), id, name, type: opts.type || 'text' })
+    if (opts.value != null) inp.value = opts.value
+    const wrap = el('div', { class: 'field' }, [lbl, inp])
+    if (opts.hint) wrap.appendChild(el('div', { class: 'hint' }, opts.hint))
+    return wrap
+  }
+  function formSelect(name, label, options, opts) {
+    opts = opts || {}
+    const id = 'f_' + name + '_' + Math.random().toString(36).slice(2, 6)
+    const lbl = el('label', { class: 'lbl', for: id }, [label, opts.required ? el('span', { class: 'req' }, '*') : null])
+    const sel = el('select', { class: 'select', id, name })
+    for (const o of options) sel.appendChild(el('option', { value: o.value }, o.label))
+    if (opts.value) sel.value = opts.value
+    return el('div', { class: 'field' }, [lbl, sel])
+  }
+  function formCheckbox(name, label) {
+    const id = 'f_' + name + '_' + Math.random().toString(36).slice(2, 6)
+    const cb = el('input', { id, name, type: 'checkbox' })
+    return el('div', { class: 'field', style: 'display:flex; align-items:center; gap:8px; margin-top:24px' }, [
+      cb,
+      el('label', { class: 'lbl', for: id, style: 'margin:0' }, label),
+    ])
+  }
+
+  // ---------- nav + auth ----------
+  function setRoute(name) {
+    const links = document.querySelectorAll('.sidebar a.nav')
+    for (const a of links) a.classList.toggle('active', a.getAttribute('data-route') === name)
+    const meta = ROUTE_META[name] || ROUTE_META.overview
+    document.getElementById('page-title').textContent = meta.title
+    document.getElementById('crumb').textContent = meta.crumb
+    const fn = routes[name] || routes.overview
+    fn().catch((e) => {
+      const t = document.getElementById('route-target')
+      t.innerHTML = ''
+      t.appendChild(plainCard([err(e.message || String(e))]))
+    }).finally(() => {
+      if (window.lucide) lucide.createIcons()
+    })
+    history.replaceState(null, '', '#' + name)
+  }
+  document.querySelectorAll('.sidebar a.nav').forEach((a) => {
+    a.addEventListener('click', (e) => { e.preventDefault(); setRoute(a.getAttribute('data-route')) })
+  })
+
+  async function refreshSidebarFooter() {
+    const f = document.getElementById('sidebar-footer')
+    try {
+      const s = await api('/v1/admin/btcpay/status')
+      f.innerHTML = ''
+      if (s.connected) {
+        f.appendChild(el('span', { class: 'dot' }))
+        f.appendChild(el('div', null, [
+          el('div', { style: 'color:var(--cream-50); font-weight:600' }, 'BTCPay connected'),
+          el('div', null, 'store ' + (s.store_id || '?').slice(0, 12) + '…'),
+        ]))
+      } else {
+        f.appendChild(el('span', { class: 'dot warn' }))
+        f.appendChild(el('div', null, [
+          el('div', { style: 'color:var(--cream-50); font-weight:600' }, 'BTCPay not connected'),
+          el('div', null, 'use StartOS Actions tab'),
+        ]))
+      }
+    } catch {
+      f.innerHTML = ''
+      f.appendChild(el('span', { class: 'dot warn' }))
+      f.appendChild(el('div', null, [
+        el('div', { style: 'color:var(--cream-50); font-weight:600' }, 'BTCPay status'),
+        el('div', null, 'unavailable'),
+      ]))
+    }
+  }
+
+  function showApp() {
+    document.getElementById('login-view').classList.add('hide')
+    document.getElementById('app-view').classList.remove('hide')
+    document.getElementById('who').textContent = apiKey.slice(0, 6) + '…' + apiKey.slice(-4)
+    fetch('/').then((r) => r.json()).then((j) => {
+      serviceInfo = j
+    }).catch(() => {}).finally(() => {
+      const route = (location.hash || '#overview').slice(1)
+      setRoute(route in routes ? route : 'overview')
+      if (window.lucide) lucide.createIcons()
+    })
+    refreshSidebarFooter()
+  }
+
+  function showLogin() {
+    document.getElementById('login-view').classList.remove('hide')
+    document.getElementById('app-view').classList.add('hide')
+  }
+
+  document.getElementById('login-btn').addEventListener('click', async () => {
+    const errEl = document.getElementById('login-err')
+    errEl.classList.add('hide')
+    const k = document.getElementById('api-key').value.trim()
+    if (!k) { errEl.textContent = 'Enter your admin API key.'; errEl.classList.remove('hide'); return }
+    apiKey = k
+    try {
+      await api('/v1/admin/audit?limit=1')
+      localStorage.setItem(LS_KEY, k)
+      showApp()
+    } catch (e) {
+      apiKey = ''
+      errEl.textContent = 'Key rejected: ' + e.message
+      errEl.classList.remove('hide')
+    }
+  })
+  document.getElementById('api-key').addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') document.getElementById('login-btn').click()
+  })
+  document.getElementById('logout').addEventListener('click', () => {
+    localStorage.removeItem(LS_KEY)
+    apiKey = ''
+    document.getElementById('api-key').value = ''
+    showLogin()
+  })
+
+  const saved = localStorage.getItem(LS_KEY)
+  if (saved) {
+    apiKey = saved
+    api('/v1/admin/audit?limit=1').then(showApp).catch(() => { apiKey = ''; localStorage.removeItem(LS_KEY); showLogin() })
+  } else {
+    showLogin()
+  }
+
+  if (window.lucide) lucide.createIcons()
+})()
+</script>
+</body>
+</html>

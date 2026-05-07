@@ -6,35 +6,36 @@
 // normal purchase flow.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  product_slug: {
-    type: 'text',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  product_slug: Value.text({
     name: 'Product slug',
     description: 'The product this policy applies to.',
     required: true,
     default: null,
-  },
-  slug: {
-    type: 'text',
+  }),
+  slug: Value.text({
     name: 'Policy slug',
     description:
       'URL-safe name, e.g., "default", "annual", "trial". ' +
       'Use "default" for the one consumed by the public purchase flow.',
     required: true,
     default: null,
-    patterns: [{ regex: '^[a-z0-9-]{2,40}$', description: 'lowercase letters, digits, and dashes' }],
-  },
-  name: {
-    type: 'text',
+    patterns: [
+      { regex: '^[a-z0-9-]{2,40}$', description: 'lowercase letters, digits, and dashes' },
+    ],
+  }),
+  name: Value.text({
     name: 'Display name',
     description: 'Shown in admin listings. E.g., "Annual subscription".',
     required: true,
     default: null,
-  },
-  duration_seconds: {
-    type: 'number',
+  }),
+  duration_seconds: Value.number({
     name: 'Duration (seconds)',
     description: '0 = perpetual. 31536000 = one year. 7776000 = 90 days.',
     required: true,
@@ -42,9 +43,8 @@ const input = sdk.InputSpec.of({
     min: 0,
     max: null,
     integer: true,
-  },
-  grace_seconds: {
-    type: 'number',
+  }),
+  grace_seconds: Value.number({
     name: 'Grace period (seconds)',
     description:
       'After expiry, how long a cached validation remains honoured ' +
@@ -54,9 +54,8 @@ const input = sdk.InputSpec.of({
     min: 0,
     max: null,
     integer: true,
-  },
-  max_machines: {
-    type: 'number',
+  }),
+  max_machines: Value.number({
     name: 'Max machines',
     description: '0 = unlimited, 1 = single-seat, n>1 = multi-seat cap.',
     required: true,
@@ -64,24 +63,21 @@ const input = sdk.InputSpec.of({
     min: 0,
     max: null,
     integer: true,
-  },
-  is_trial: {
-    type: 'toggle',
+  }),
+  is_trial: Value.toggle({
     name: 'Trial policy',
     description: 'Mark issued keys as trial (sets the TRIAL flag in the payload).',
     default: false,
-  },
-  entitlements: {
-    type: 'text',
+  }),
+  entitlements: Value.text({
     name: 'Entitlements',
     description:
       'Comma-separated list of feature slugs embedded in the license key. ' +
       'E.g., "pro,multi-device". Leave blank for none.',
     required: false,
     default: null,
-  },
-  price_sats_override: {
-    type: 'number',
+  }),
+  price_sats_override: Value.number({
     name: 'Price override (sats, optional)',
     description:
       "Override the product's default price for licenses issued under this " +
@@ -91,12 +87,12 @@ const input = sdk.InputSpec.of({
     min: -1,
     max: null,
     integer: true,
-  },
+  }),
 })
 
 export const createPolicy = sdk.Action.withInput(
-  'createPolicy',
-  async ({ effects }) => ({
+  'create-policy',
+  async () => ({
     name: 'Create policy',
     description:
       'Add a reusable license template to a product. The public purchase ' +
@@ -108,8 +104,11 @@ export const createPolicy = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
+
     const entitlements = (formInput.entitlements ?? '')
       .split(',')
       .map((s) => s.trim())
@@ -129,7 +128,7 @@ export const createPolicy = sdk.Action.withInput(
       body.price_sats_override = formInput.price_sats_override
     }
 
-    const resp = await adminCall(LICENSING_URL, store.admin_api_key, '/v1/admin/policies', {
+    const resp = await adminCall(LICENSING_URL, storeData.admin_api_key, '/v1/admin/policies', {
       method: 'POST',
       body: JSON.stringify(body),
     })
@@ -138,11 +137,14 @@ export const createPolicy = sdk.Action.withInput(
     }
     const policy = (await resp.json()) as { id: string; slug: string; name: string }
     return {
+      version: '1',
+      title: 'Policy created',
       message:
         `Created policy '${policy.slug}' (id ${policy.id}).\n` +
         (formInput.slug === 'default'
           ? 'Because the slug is "default", this policy will be used by the public purchase flow.'
           : 'Use this slug when calling "Issue license manually".'),
+      result: null,
     }
   },
 )

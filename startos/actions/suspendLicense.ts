@@ -5,28 +5,29 @@
 // disputes where the outcome isn't yet known.
 
 import { sdk } from '../sdk'
+import { store } from '../fileModels/store'
 import { adminCall, LICENSING_URL } from '../utils'
 
-const input = sdk.InputSpec.of({
-  license_id: {
-    type: 'text',
+const { InputSpec, Value } = sdk
+
+const input = InputSpec.of({
+  license_id: Value.text({
     name: 'License ID',
     description: 'UUID of the license to suspend. Find via search-licenses action.',
     required: true,
     default: null,
-  },
-  reason: {
-    type: 'text',
+  }),
+  reason: Value.text({
     name: 'Reason',
     description: 'Stored for audit. E.g., "payment dispute pending".',
     required: false,
     default: null,
-  },
+  }),
 })
 
 export const suspendLicense = sdk.Action.withInput(
-  'suspendLicense',
-  async ({ effects }) => ({
+  'suspend-license',
+  async () => ({
     name: 'Suspend license',
     description:
       'Temporarily disable a license. Validation calls will fail with a ' +
@@ -40,11 +41,13 @@ export const suspendLicense = sdk.Action.withInput(
     visibility: 'enabled',
   }),
   input,
-  async ({ effects, input: formInput }) => {
-    const store = await sdk.store.getOwn(effects, sdk.StorePath).const()
+  async () => null,
+  async ({ effects: _effects, input: formInput }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
     const resp = await adminCall(
       LICENSING_URL,
-      store.admin_api_key,
+      storeData.admin_api_key,
       `/v1/admin/licenses/${encodeURIComponent(formInput.license_id)}/suspend`,
       {
         method: 'POST',
@@ -54,6 +57,11 @@ export const suspendLicense = sdk.Action.withInput(
     if (!resp.ok) {
       throw new Error(`Suspend failed: HTTP ${resp.status} — ${await resp.text()}`)
     }
-    return { message: `Suspended license ${formInput.license_id}.` }
+    return {
+      version: '1',
+      title: 'License suspended',
+      message: `Suspended license ${formInput.license_id}.`,
+      result: null,
+    }
   },
 )

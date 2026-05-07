@@ -3,27 +3,31 @@
 // between service starts (e.g., the generated admin API key so we don't
 // regenerate it on every restart).
 //
-// StartOS persists this JSON through upgrades and backs it up automatically.
+// StartOS persists this JSON through upgrades and backs it up automatically
+// (the file lives alongside the package data dir).
+//
+// In 0.4.0.x we model this with `FileHelper.json` + a Zod schema. Consumers
+// read via `store.read().once()` (fire-and-forget) or `store.read().const(effects)`
+// (re-runs the calling context if the file changes), and write with
+// `store.write(effects, data)` or `store.merge(effects, partial)`.
 
-import { matches } from '@start9labs/start-sdk'
+import { FileHelper } from '@start9labs/start-sdk'
+import { z } from 'zod'
 
-const { arr, num, obj, oneOf, literal, string } = matches
-
-export const storeShape = obj({
+export const storeShape = z.object({
   // Admin API key for /v1/admin/* endpoints. Auto-generated on first init.
-  admin_api_key: string,
-  // Shared webhook secret configured on both sides (BTCPay + our service).
-  btcpay_webhook_secret: string,
+  admin_api_key: z.string(),
+  // Shared webhook secret historically configured on both sides (BTCPay +
+  // our service). Kept in the shape for backwards compatibility with
+  // installs made before the one-click "Connect BTCPay" authorize flow; the
+  // daemon now generates and persists its own webhook secret.
+  btcpay_webhook_secret: z.string(),
   // Operator display name shown on the service homepage.
-  operator_name: string,
+  operator_name: z.string(),
   // Tracks which version's init has already been applied.
-  schema_version: num,
+  schema_version: z.number(),
 })
 
-export type Store = typeof storeShape._TYPE
+export type Store = z.infer<typeof storeShape>
 
-export const store = {
-  shape: storeShape,
-  // Defaults. Populated for real during init.
-  path: 'store.json' as const,
-}
+export const store = FileHelper.json('store.json', storeShape)
