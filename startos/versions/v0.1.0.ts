@@ -9,8 +9,22 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const v0_1_0 = VersionInfo.of({
-  version: '0.1.0:49',
+  version: '0.1.0:50',
   releaseNotes: [
+    `Alpha-iteration revision 50 of v0.1.0 — **Hotfix.** Auto-recovers from the "migration 9 was previously applied but has been modified" crash-loop that hit operators upgrading through v0.1.0:48 → :49. If you're stuck on that crash-loop right now, upgrading to v0.1.0:50 fixes it automatically — no SSH or sqlite3 dance needed.`,
+    ``,
+    `**The bug.** sqlx records a SHA-384 of each migration's bytes when it's first applied, then verifies the on-disk bytes still match on every subsequent boot. Builds across versions can produce subtly different bytes for the same semantic SQL (trailing newlines, line endings, build-host normalization). sqlx then refuses to start with "migration N was previously applied but has been modified", crash-looping. Recovery required SSHing in + running \`DELETE FROM _sqlx_migrations WHERE version = 9\` by hand. Two operators in a row hit this on the v0.1.0:48 → :49 upgrade.`,
+    ``,
+    `**The fix.** \`db::init\` now wraps the migration runner with detection for sqlx's \`VersionMismatch\` error on a constant allowlist of migrations certified safe to re-run (currently just migration 9, which was deliberately designed as a stash-drop-rebuild-restore that produces identical state regardless of starting point). When triggered, the daemon clears the stale row, retries the migration, logs a WARN explaining what happened, and continues. No data loss — the migration is idempotent by design and the rebuild yields the same schema.`,
+    ``,
+    `Allowlist gate matters: auto-clearing checksums on additive \`ALTER TABLE\` migrations like 0010 would error on retry (SQLite has no \`ADD COLUMN IF NOT EXISTS\`). Only migrations explicitly designed as drop-and-rebuild and tested via the \`migration_NNNN_is_idempotent\` pattern in \`tests/migrations.rs\` qualify. Future idempotent migrations get added to the allowlist alongside their idempotency test.`,
+    ``,
+    `**Regression test.** \`db_init_self_heals_checksum_mismatch_on_idempotent_migrations\` simulates the exact production incident: apply all migrations cleanly, poison v9's recorded checksum with bogus bytes, confirm raw sqlx::migrate! bails (proves the poisoning works), then call db::init — must succeed by clearing + re-applying v9. Test count: 38 (was 37).`,
+    ``,
+    `**For currently-affected operators.** Just upgrade to v0.1.0:50 from the StartOS marketplace. Even with the daemon in a crash-loop on :49, the StartOS supervisor can still install :50 (the upgrade machinery is supervisor-level, not daemon-level). The :50 daemon will see the checksum mismatch on first boot, auto-clear v9's row, re-apply (0009 produces the same schema), continue to 0010 (multi-currency, fresh), and bind 8080 cleanly. Look for a WARN line like "migration 9 checksum mismatch on a known-idempotent migration; clearing _sqlx_migrations row and retrying" in the logs to confirm the self-heal fired.`,
+    ``,
+    `**No multi-currency or other behaviour changes** — :50 is purely the migration self-heal on top of :49.`,
+    ``,
     `Alpha-iteration revision 49 of v0.1.0 — Multi-currency pricing is now functional end-to-end. Operators can list products in USD or EUR and accept BTC; the daemon converts at invoice creation and pins the rate on the invoice row for audit. SAT-priced products are unchanged.`,
     ``,
     `**Phase 2: admin UI write path.** The Create Product form on the admin Products page now has a currency picker (sats / USD / EUR). Picking USD/EUR swaps the input units in place — decimal entry like \`$49.00\` is converted to cents (4900) on the way out. The Products table now renders prices via a currency-aware formatter: SAT products show "50,000 sats", USD products show "$49.00" with an optional "≈ 75k sats" hint once the first invoice has pinned a sat amount. Backend accepts both the legacy \`price_sats: N\` form (for older clients) and the new \`price_currency + price_value\` form; mismatched mixes return 400.`,
