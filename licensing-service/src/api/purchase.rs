@@ -31,17 +31,34 @@ pub struct StartPurchaseReq {
     pub redirect_url: Option<String>,
     /// Optional discount / referral code (case-insensitive).
     pub code: Option<String>,
+    /// Optional tier (policy slug). When set, the policy's
+    /// `price_sats_override` becomes the base price (if defined), and the
+    /// chosen policy is remembered on the invoice so it's used at license
+    /// issuance time. When omitted, the daemon falls back to the product's
+    /// default policy at issuance — same as pre-:27 behaviour.
+    pub policy_slug: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct StartPurchaseResp {
     pub invoice_id: String,           // our internal id
-    pub btcpay_invoice_id: String,    // BTCPay's id (for debugging)
-    pub checkout_url: String,         // URL the user opens to pay
+    /// Empty for the free-tier shortcut path (price = 0 after override/discount):
+    /// we synthesize a settled invoice locally and skip BTCPay entirely.
+    pub btcpay_invoice_id: String,
+    /// Non-empty on the paid path. On the free path, empty — the buyer should
+    /// be shown the license card directly using `license_key` below.
+    pub checkout_url: String,
     pub amount_sats: i64,             // what BTCPay was charged (post-discount)
     pub base_price_sats: i64,         // product list price (pre-discount)
     pub discount_applied_sats: i64,   // base - amount_sats; 0 if no code
     pub poll_url: String,             // where to check status
+    /// Set when the daemon issued the license inline (free tier or 100%-off).
+    /// When present, the client should display the license card directly
+    /// instead of redirecting to a BTCPay checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_id: Option<String>,
 }
 
 /// Floor for invoiced amount after a discount is applied. Set to 1 sat so
@@ -64,7 +81,38 @@ pub async fn start(
         )));
     }
 
-    let base_price = product.price_sats;
+    // Resolve the optional tier (policy_slug). The chosen policy must be
+    // active and public for it to be selectable from the public buy page.
+    // (The admin can still issue under non-public policies via /v1/admin/licenses.)
+    let chosen_policy = if let Some(ps) = req.policy_slug.as_deref().filter(|s| !s.is_empty()) {
+        let pol = repo::get_policy_by_slug(&state.db, &product.id, ps)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "policy '{ps}' for product '{}'",
+                    req.product
+                ))
+            })?;
+        if !pol.active {
+            return Err(AppError::BadRequest(format!(
+                "policy '{ps}' is not active"
+            )));
+        }
+        if !pol.public {
+            return Err(AppError::BadRequest(format!(
+                "policy '{ps}' is not available on the public buy page"
+            )));
+        }
+        Some(pol)
+    } else {
+        None
+    };
+
+    // Effective base price: policy override if set, else product price.
+    let base_price = chosen_policy
+        .as_ref()
+        .and_then(|p| p.price_sats_override)
+        .unwrap_or(product.price_sats);
 
     // Resolve and validate the discount code if one was supplied. The
     // ordering here matters: we must atomically reserve a counter slot
@@ -103,8 +151,19 @@ pub async fn start(
                 ));
             }
         }
-        // Note: applies_to_policy_id is informational in v0.1 — the
-        // policy used at license-issuance time is the product's default.
+        // If the code is restricted to a specific policy and a tier was
+        // selected, they must match. If no tier was selected, the code is
+        // implicitly applied to the product's default policy at issuance
+        // time, which we accept here (v0.1.0:27+).
+        if let Some(restricted_pid) = &code.applies_to_policy_id {
+            if let Some(chosen) = &chosen_policy {
+                if restricted_pid != &chosen.id {
+                    return Err(AppError::BadRequest(
+                        "discount code does not apply to the selected tier".into(),
+                    ));
+                }
+            }
+        }
 
         // Step B: atomic reserve.
         repo::try_reserve_code_slot(&state.db, &code.id).await?;
@@ -115,6 +174,101 @@ pub async fn start(
     } else {
         (base_price, None, 0)
     };
+
+    // ----- Free-tier shortcut -----
+    // If the post-discount, post-policy-override price came out at 0 sats
+    // (price_sats_override = 0 on a "free" tier, OR a 100%-off discount on
+    // a paid tier), skip BTCPay entirely. BTCPay refuses 0-sat invoices and
+    // would also waste a UI step that prompts the buyer to "pay" zero. We
+    // synthesize a settled invoice locally, issue the license inline, and
+    // return the signed key in the response. The buy page renders the
+    // license card directly.
+    if final_price <= 0 {
+        let free_invoice = repo::create_free_invoice(
+            &state.db,
+            &product.id,
+            req.buyer_email.as_deref(),
+            req.buyer_note.as_deref(),
+            chosen_policy.as_ref().map(|p| p.id.as_str()),
+        )
+        .await
+        .map_err(|e| {
+            // If we got a code reservation earlier, release it.
+            let pool = state.db.clone();
+            let code = reservation.clone();
+            tokio::spawn(async move {
+                if let Some(c) = code {
+                    let _ = repo::release_code_slot(&pool, &c.id).await;
+                }
+            });
+            e
+        })?;
+
+        // If a discount code was applied, record the redemption.
+        if let Some(code) = &reservation {
+            let _ = repo::record_pending_redemption(
+                &state.db,
+                &code.id,
+                &free_invoice.id,
+                discount_applied,
+                base_price,
+                0,
+            )
+            .await;
+        }
+
+        // Issue the license. This finalizes the redemption row and fires
+        // license.issued + (if applicable) code.redeemed webhooks.
+        let license_id =
+            crate::api::webhook::issue_license_for_invoice(&state, &free_invoice).await?;
+
+        // Re-derive the signed key (same pattern as redeem.rs / status()).
+        let lic = repo::get_license_by_invoice(&state.db, &free_invoice.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(anyhow::anyhow!("license vanished after issue"))
+            })?;
+        let flags = if lic.is_trial { FLAG_TRIAL } else { 0 };
+        let expires_at_unix = lic
+            .expires_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.timestamp())
+            .unwrap_or(0);
+        let payload = LicensePayload {
+            version: KEY_VERSION_V2,
+            flags,
+            product_id: uuid::Uuid::parse_str(&lic.product_id)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("bad product_id: {e}")))?,
+            license_id: uuid::Uuid::parse_str(&lic.id)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("bad license_id: {e}")))?,
+            issued_at: chrono::DateTime::parse_from_rfc3339(&lic.issued_at)
+                .map(|t| t.timestamp())
+                .unwrap_or(0),
+            expires_at: expires_at_unix,
+            fingerprint_hash: [0u8; 32],
+            entitlements: lic.entitlements.clone(),
+        };
+        let sig = sign_payload(&state.keypair.signing, &payload);
+        let license_key = encode_key(&payload, &sig);
+
+        let poll_url = format!(
+            "{}/v1/purchase/{}",
+            state.config.public_base_url, free_invoice.id
+        );
+
+        return Ok(Json(StartPurchaseResp {
+            invoice_id: free_invoice.id.clone(),
+            btcpay_invoice_id: free_invoice.btcpay_invoice_id.clone(), // "free-<uuid>"
+            checkout_url: String::new(),                                // signal: no BTCPay
+            amount_sats: 0,
+            base_price_sats: base_price,
+            discount_applied_sats: discount_applied,
+            poll_url,
+            license_key: Some(license_key),
+            license_id: Some(license_id),
+        }));
+    }
 
     // Pre-allocate an internal invoice id so we can pass it to BTCPay as
     // metadata, letting us correlate webhook events back to our row even
@@ -204,6 +358,7 @@ pub async fn start(
         &checkout_url,
         req.buyer_email.as_deref(),
         req.buyer_note.as_deref(),
+        chosen_policy.as_ref().map(|p| p.id.as_str()),
     )
     .await
     {
@@ -254,6 +409,8 @@ pub async fn start(
         base_price_sats: base_price,
         discount_applied_sats: discount_applied,
         poll_url,
+        license_key: None,
+        license_id: None,
     }))
 }
 
@@ -269,6 +426,18 @@ fn compute_discount(kind: &str, amount: i64, base_price_sats: i64) -> i64 {
             ((base * bps) / 10_000).max(0).min(base) as i64
         }
         "fixed_sats" => amount.max(0).min(base_price_sats),
+        // 'set_price' = the buyer pays exactly `amount` sats regardless of
+        // base price. Compute it as a discount: subtract enough to land at
+        // `amount`. If `amount >= base_price_sats`, the code provides no
+        // benefit (discount = 0).
+        "set_price" => {
+            let target = amount.max(0);
+            if target >= base_price_sats {
+                0
+            } else {
+                base_price_sats - target
+            }
+        }
         _ => 0,
     }
 }

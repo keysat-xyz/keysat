@@ -51,6 +51,9 @@ rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
+# Web-UI password hashing. Argon2id is the modern PHC-recommended default;
+# this is the reference implementation in pure Rust (no FFI).
+argon2 = "0.5"
 
 # Encoding
 data-encoding = "2" # Crockford base32 for license keys

@@ -18,14 +18,24 @@
 use crate::api::AppState;
 use crate::db::repo;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Html,
 };
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct BuyPageQuery {
+    /// Optional tier slug (deep-link support). Pre-selects a tier when
+    /// the buyer arrives from a tier-specific marketing CTA.
+    #[serde(default)]
+    pub policy: Option<String>,
+}
 
 pub async fn render(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    Query(q): Query<BuyPageQuery>,
 ) -> Result<Html<String>, (StatusCode, Html<String>)> {
     // Look up the product. Inactive or missing → 404 with a friendly page.
     let product = match repo::get_product_by_slug(&state.db, &slug).await {
@@ -47,7 +57,54 @@ pub async fn render(
     let product_name = html_escape(&product.name);
     let product_slug = html_escape(&product.slug);
     let product_description = html_escape(&product.description);
-    let price_sats_fmt = format_thousands(product.price_sats);
+
+    // Tiered pricing: fetch active+public policies for this product. Sorted
+    // by price ascending. Used to (a) decide whether to render the tier
+    // picker (≥ 2 tiers), and (b) compute the displayed price for the
+    // initially-selected tier.
+    let public_policies = repo::list_public_policies_by_product(&state.db, &product.id)
+        .await
+        .unwrap_or_default();
+
+    // Determine the initial selection: ?policy=<slug> deep-link wins, then
+    // any policy marked metadata.highlight=true, then the first (cheapest)
+    // policy, then None (single-price view).
+    let initial_policy = if let Some(want) = q.policy.as_deref() {
+        public_policies.iter().find(|p| p.slug == want).cloned()
+    } else {
+        None
+    }
+    .or_else(|| {
+        public_policies
+            .iter()
+            .find(|p| {
+                p.metadata
+                    .get("highlight")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .cloned()
+    })
+    .or_else(|| public_policies.first().cloned());
+
+    // The price displayed in the cert card on initial render.
+    let displayed_price = initial_policy
+        .as_ref()
+        .and_then(|p| p.price_sats_override)
+        .unwrap_or(product.price_sats);
+    let price_sats_fmt = format_thousands(displayed_price);
+    let initial_policy_slug = initial_policy
+        .as_ref()
+        .map(|p| p.slug.clone())
+        .unwrap_or_default();
+
+    // Server-render the tier picker HTML so the page is functional even
+    // before JS runs. The picker only appears when the product has 2+
+    // public policies; otherwise the existing single-price view is used.
+    let tiers_html = render_tier_picker(&public_policies, &initial_policy, &product);
+    // Compact JSON map of {policy_slug: {price, name}} so the JS can update
+    // the price card when the buyer clicks a different tier.
+    let tiers_json = build_tiers_json(&public_policies, &product);
 
     let body = format!(
         r#"<!doctype html>
@@ -160,6 +217,90 @@ h1 {{
   box-shadow:0 0 0 3px rgba(30,58,95,0.18);
 }}
 .field .hint {{ font-size:12px; color:var(--ink-500); margin-top:5px; }}
+
+/* Tier picker — shown when product has 2+ public policies. */
+.tiers {{
+  display:grid; gap:14px; margin:0 0 28px;
+}}
+.tiers-2 {{ grid-template-columns:repeat(2, 1fr); }}
+.tiers-3 {{ grid-template-columns:repeat(3, 1fr); }}
+.tiers-4 {{ grid-template-columns:repeat(2, 1fr); }}
+@media (max-width:560px) {{
+  .tiers-2, .tiers-3, .tiers-4 {{ grid-template-columns:1fr; }}
+}}
+.tier {{
+  position:relative;
+  background:var(--cream-50); border:1px solid var(--border-1);
+  border-radius:12px; padding:22px 20px 20px;
+  display:flex; flex-direction:column; gap:10px;
+  cursor:pointer; transition:all 150ms ease;
+}}
+.tier:hover {{
+  border-color:var(--gold-500);
+  box-shadow:0 4px 12px rgba(14,31,51,0.08);
+  transform:translateY(-1px);
+}}
+.tier.selected {{
+  border-color:var(--gold-500); border-width:2px;
+  padding:21px 19px 19px; /* compensate for thicker border */
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(191,160,104,0.12), 0 8px 16px rgba(14,31,51,0.10);
+}}
+.tier.highlighted {{ border-color:var(--gold-500); }}
+.tier-popular {{
+  position:absolute; top:-10px; left:50%; transform:translateX(-50%);
+  background:var(--gold-500); color:var(--navy-950);
+  font-family:var(--font-body); font-size:10.5px; font-weight:700;
+  letter-spacing:0.16em; text-transform:uppercase;
+  padding:4px 10px; border-radius:999px;
+  white-space:nowrap;
+}}
+.tier-name {{
+  font-family:var(--font-display); font-weight:600; font-size:18px;
+  color:var(--navy-950); letter-spacing:-0.01em;
+}}
+.tier-price {{
+  font-family:var(--font-display); font-weight:700; font-size:26px;
+  color:var(--navy-950); letter-spacing:-0.02em;
+  line-height:1.1;
+}}
+.tier-price-unit {{
+  font-family:var(--font-body); font-size:13px; font-weight:500;
+  color:var(--ink-500); margin-left:6px;
+}}
+.tier-meta {{
+  font-size:12px; color:var(--ink-500);
+  font-family:var(--font-body); font-weight:500;
+}}
+.tier-description {{
+  font-size:13.5px; line-height:1.45; color:var(--ink-700); margin:0;
+}}
+.tier-entitlements {{
+  list-style:none; padding:0; margin:6px 0 0;
+  font-size:13px; color:var(--ink-700);
+}}
+.tier-entitlements li {{
+  padding:3px 0 3px 18px; position:relative;
+}}
+.tier-entitlements li::before {{
+  content:'✓'; position:absolute; left:0; top:3px;
+  color:var(--gold-700); font-weight:700;
+}}
+.tier-select-btn {{
+  margin-top:auto;
+  padding:8px 12px;
+  background:transparent; color:var(--navy-800);
+  border:1px solid var(--border-2); border-radius:8px;
+  font-family:var(--font-body); font-weight:600; font-size:13px;
+  cursor:pointer; transition:all 120ms;
+}}
+.tier.selected .tier-select-btn {{
+  background:var(--navy-800); color:var(--cream-50);
+  border-color:var(--navy-800);
+}}
+.tier:hover .tier-select-btn {{
+  border-color:var(--navy-800);
+}}
 
 /* Apply-discount cluster: input + button on one row */
 .code-row {{ display:flex; gap:8px; align-items:stretch; }}
@@ -293,8 +434,10 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   <div class="product-slug">{product_slug}</div>
   <p class="description">{product_description}</p>
 
+  {tiers_html}
+
   <div class="cert">
-    <div class="price-label">Price</div>
+    <div class="price-label" id="price-label">Price</div>
     <div class="price" id="price-display">
       <span id="price-strike-line" class="price-strike" style="display:none"></span>
       <span id="price-current">{price_sats_fmt}</span><span class="unit">sats</span>
@@ -304,9 +447,9 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 
   <form id="buy-form">
     <div class="field">
-      <label for="email">Email (for receipt &amp; license)</label>
-      <input type="email" id="email" name="email" placeholder="you@example.com" required>
-      <div class="hint">We&rsquo;ll send your license key here after payment confirms.</div>
+      <label for="email">Email <span style="color:var(--ink-500); font-weight:400">(optional)</span></label>
+      <input type="email" id="email" name="email" placeholder="you@example.com">
+      <div class="hint">Useful only if you want a buyer reference for lost-key recovery. Skip it to pay anonymously — your license key is shown directly on this site either way.</div>
     </div>
     <div class="field">
       <label for="code">Discount code (optional)</label>
@@ -336,7 +479,10 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       <button id="license-key-copy">Copy</button>
     </div>
     <div class="save-note">
-      <strong>Save this somewhere safe.</strong> The license key is signed at issue time and verifies offline. We&rsquo;ll also send a copy to <span id="license-email-display"></span> for your records.
+      <strong>Save this somewhere safe.</strong> The license key is signed at issue time and verifies offline.
+      <div id="invoice-ref-line" style="margin-top:10px; font-family:var(--font-mono); font-size:12px; color:var(--ink-500); display:none">
+        Reference for support: <code id="invoice-ref-id" style="background:var(--cream-200); padding:1px 6px; border-radius:5px; color:var(--ink-700);"></code>
+      </div>
     </div>
   </div>
 </div>
@@ -362,21 +508,89 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   const priceStrike = document.getElementById('price-strike-line');
   const priceTag = document.getElementById('price-discount-tag');
   const PRODUCT_SLUG = {slug_json};
+  // TIERS: {{ slug: {{name, price_sats}} }} — server-rendered. Empty if the
+  // product has no public policies (single-price view).
+  const TIERS = {tiers_json};
+  // Initial tier slug (server-determined: ?policy=, then highlighted, then cheapest).
+  let selectedPolicy = {initial_policy_json} || null;
+  const priceLabel = document.getElementById('price-label');
   const BASE_PRICE_FMT = priceCurrent.textContent;
-
-  // State of the most recent successful Apply. When set with kind=free_license
-  // and the same code is still in the input, the submit handler skips the
-  // "try /v1/redeem then fall through" dance and goes straight to redeem.
+  // Recompute on tier change so the strike-through baseline tracks the
+  // currently-selected tier rather than freezing to the initial render.
+  let currentBaseFmt = BASE_PRICE_FMT;
+  // Hoisted up here (was previously declared further down) because the
+  // on-load `selectTier(selectedPolicy)` call below reads it. Leaving the
+  // declaration below the call hits the temporal-dead-zone error and kills
+  // every event handler on the page (including the form submit).
   let appliedCode = null; // {{ code, kind, is_free, final_price_sats }}
+
+  function fmtSats(n) {{ return Number(n).toLocaleString('en-US'); }}
+
+  // Wire up tier-card clicks.
+  document.querySelectorAll('.tier').forEach(function(card) {{
+    card.addEventListener('click', function(e) {{
+      e.preventDefault();
+      const slug = card.getAttribute('data-policy-slug');
+      if (slug) selectTier(slug);
+    }});
+  }});
+
+  // On load, sync the price card + CTA to whatever tier was server-pre-selected.
+  // Without this, a free tier would render with "0" price and "Pay with Bitcoin"
+  // before the buyer interacts, which is wrong.
+  if (selectedPolicy && TIERS[selectedPolicy]) {{
+    selectTier(selectedPolicy);
+  }}
+
+  function selectTier(slug) {{
+    if (!TIERS[slug]) return;
+    selectedPolicy = slug;
+    // Visual update.
+    document.querySelectorAll('.tier').forEach(function(c) {{
+      if (c.getAttribute('data-policy-slug') === slug) c.classList.add('selected');
+      else c.classList.remove('selected');
+    }});
+    // Reset any active discount apply state — a different tier may not
+    // honor the same code (server validates again on the next Apply).
+    if (appliedCode) {{
+      appliedCode = null;
+      setStatus(null);
+      setPaidButton();
+    }}
+    // Reflect new base price in the cert card.
+    const t = TIERS[slug];
+    currentBaseFmt = fmtSats(t.price_sats);
+    priceStrike.style.display = 'none';
+    priceTag.style.display = 'none';
+    if (priceLabel) priceLabel.textContent = 'Price · ' + t.name;
+    // Free tier: render "FREE", swap CTA to "Redeem license" so the
+    // buyer never sees "Pay with Bitcoin" for a 0-sat product.
+    if (t.price_sats === 0) {{
+      priceCurrent.textContent = 'FREE';
+      setRedeemButton();
+    }} else {{
+      priceCurrent.textContent = currentBaseFmt;
+      setPaidButton();
+    }}
+  }}
+
+  // (appliedCode hoisted above — see comment near `let currentBaseFmt`.)
 
   function showError(msg) {{
     errEl.textContent = msg;
     errEl.classList.add('show');
   }}
   function clearError() {{ errEl.classList.remove('show'); }}
-  function showLicense(licenseKey, email) {{
+  function showLicense(licenseKey, invoiceId) {{
     keyTextEl.textContent = licenseKey;
-    emailDisplayEl.textContent = email || '(no email provided)';
+    if (invoiceId) {{
+      const refLine = document.getElementById('invoice-ref-line');
+      const refId = document.getElementById('invoice-ref-id');
+      if (refLine && refId) {{
+        refId.textContent = invoiceId;
+        refLine.style.display = 'block';
+      }}
+    }}
     form.style.display = 'none';
     successEl.classList.add('show');
     successEl.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
@@ -394,7 +608,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   }}
 
   function resetPrice() {{
-    priceCurrent.textContent = BASE_PRICE_FMT;
+    priceCurrent.textContent = currentBaseFmt;
     priceStrike.style.display = 'none';
     priceStrike.textContent = '';
     priceTag.style.display = 'none';
@@ -430,8 +644,9 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     const orig = applyBtn.textContent;
     applyBtn.textContent = 'Checking…';
     try {{
-      const url = '/v1/discount-codes/preview?code='
+      let url = '/v1/discount-codes/preview?code='
         + encodeURIComponent(code) + '&product=' + encodeURIComponent(PRODUCT_SLUG);
+      if (selectedPolicy) url += '&policy_slug=' + encodeURIComponent(selectedPolicy);
       const resp = await fetch(url);
       if (!resp.ok) {{
         let msg = 'HTTP ' + resp.status;
@@ -495,11 +710,12 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
         product: PRODUCT_SLUG,
         code,
         buyer_email: email || undefined,
+        policy_slug: selectedPolicy || undefined,
       }}),
     }});
     if (resp.ok) {{
       const j = await resp.json();
-      return {{ ok: true, license_key: j.license_key }};
+      return {{ ok: true, license_key: j.license_key, invoice_id: j.invoice_id }};
     }}
     let msg = 'HTTP ' + resp.status;
     try {{
@@ -516,6 +732,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   async function startPaidPurchase(code, email) {{
     const body = {{ product: PRODUCT_SLUG, buyer_email: email || undefined }};
     if (code) body.code = code;
+    if (selectedPolicy) body.policy_slug = selectedPolicy;
     const resp = await fetch('/v1/purchase', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
@@ -530,8 +747,16 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       throw new Error(msg);
     }}
     const j = await resp.json();
+    // Free-tier shortcut: server issued the license inline (no BTCPay).
+    // Show the license card directly instead of redirecting to a 0-sat
+    // checkout page.
+    if (j.license_key) {{
+      showLicense(j.license_key, j.invoice_id);
+      return {{ inline: true }};
+    }}
     if (!j.checkout_url) throw new Error('No checkout URL returned by server');
     window.location.href = j.checkout_url;
+    return {{ inline: false }};
   }}
 
   // "Copy" on the license key box.
@@ -559,7 +784,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       // Fast path: a free_license code was already validated via Apply.
       if (codeMatchesApplied && appliedCode.is_free) {{
         const r = await tryFreeRedeem(code, email);
-        if (r.ok) {{ showLicense(r.license_key, email); return; }}
+        if (r.ok) {{ showLicense(r.license_key, r.invoice_id); return; }}
         // If the server changed its mind, surface the error rather than silently
         // routing to a paid flow that the buyer didn't consent to.
         throw new Error(r.msg || 'Could not redeem free license.');
@@ -568,7 +793,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       // Slower path (no Apply or non-free code): keep the original try-then-fallthrough.
       if (code) {{
         const r = await tryFreeRedeem(code, email);
-        if (r.ok) {{ showLicense(r.license_key, email); return; }}
+        if (r.ok) {{ showLicense(r.license_key, r.invoice_id); return; }}
         if (!r.fallThrough) {{
           throw new Error(r.msg || 'Code rejected');
         }}
@@ -594,9 +819,139 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
         product_slug = product_slug,
         product_description = product_description,
         price_sats_fmt = price_sats_fmt,
+        tiers_html = tiers_html,
         slug_json = serde_json::to_string(&product.slug).unwrap_or_else(|_| "\"\"".into()),
+        tiers_json = tiers_json,
+        initial_policy_json = serde_json::to_string(&initial_policy_slug)
+            .unwrap_or_else(|_| "\"\"".into()),
     );
     Ok(Html(body))
+}
+
+/// Build the server-rendered tier-picker HTML. Returns an empty string
+/// when the product has fewer than 2 public policies (i.e., the existing
+/// single-price view is sufficient).
+fn render_tier_picker(
+    policies: &[crate::models::Policy],
+    initial: &Option<crate::models::Policy>,
+    product: &crate::models::Product,
+) -> String {
+    if policies.len() < 2 {
+        return String::new();
+    }
+    let n = policies.len().min(4);
+    let class_n = match n {
+        2 => "tiers-2",
+        3 => "tiers-3",
+        _ => "tiers-4",
+    };
+    let cards: Vec<String> = policies
+        .iter()
+        .map(|p| {
+            let name = html_escape(&p.name);
+            let slug_attr = html_escape(&p.slug);
+            let price = p.price_sats_override.unwrap_or(product.price_sats);
+            let price_fmt = format_thousands(price);
+            let description = p
+                .metadata
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let description_html = if description.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<p class=\"tier-description\">{}</p>",
+                    html_escape(description)
+                )
+            };
+            let highlighted = p
+                .metadata
+                .get("highlight")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let selected = initial
+                .as_ref()
+                .map(|ip| ip.slug == p.slug)
+                .unwrap_or(false);
+            let entitlements_html = if p.entitlements.is_empty() {
+                String::new()
+            } else {
+                let lis: Vec<String> = p
+                    .entitlements
+                    .iter()
+                    .map(|e| format!("<li>{}</li>", html_escape(e)))
+                    .collect();
+                format!("<ul class=\"tier-entitlements\">{}</ul>", lis.join(""))
+            };
+            let dur_html = if p.duration_seconds > 0 {
+                let days = p.duration_seconds / 86_400;
+                if days > 0 {
+                    format!("<div class=\"tier-meta\">{} days</div>", days)
+                } else {
+                    let hours = p.duration_seconds / 3600;
+                    format!("<div class=\"tier-meta\">{} hours</div>", hours.max(1))
+                }
+            } else {
+                "<div class=\"tier-meta\">Perpetual</div>".to_string()
+            };
+            let mut classes = String::from("tier");
+            if selected {
+                classes.push_str(" selected");
+            }
+            if highlighted {
+                classes.push_str(" highlighted");
+            }
+            let popular_pill = if highlighted {
+                "<div class=\"tier-popular\">Most popular</div>"
+            } else {
+                ""
+            };
+            let trial_meta = if p.is_trial {
+                "<div class=\"tier-meta\" style=\"color:var(--gold-700); font-weight:600\">Trial</div>".to_string()
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}<div class="tier-name">{name}</div><div class="tier-price">{price_fmt}<span class="tier-price-unit">sats</span></div>{dur_html}{trial_meta}{description_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                classes = classes,
+                slug = slug_attr,
+                popular_pill = popular_pill,
+                name = name,
+                price_fmt = price_fmt,
+                dur_html = dur_html,
+                trial_meta = trial_meta,
+                description_html = description_html,
+                entitlements_html = entitlements_html,
+            )
+        })
+        .collect();
+    format!(
+        "<div class=\"tiers {n_cls}\">{cards}</div>",
+        n_cls = class_n,
+        cards = cards.join("")
+    )
+}
+
+/// Build the JS-side TIERS map that the buy page uses to update the price
+/// card and submit the right `policy_slug`. Empty object when no public
+/// policies exist (script falls back to product price unchanged).
+fn build_tiers_json(
+    policies: &[crate::models::Policy],
+    product: &crate::models::Product,
+) -> String {
+    let mut map = serde_json::Map::new();
+    for p in policies {
+        let price = p.price_sats_override.unwrap_or(product.price_sats);
+        map.insert(
+            p.slug.clone(),
+            serde_json::json!({
+                "name": p.name,
+                "price_sats": price,
+            }),
+        );
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn not_found_html(slug: &str) -> String {

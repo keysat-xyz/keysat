@@ -69,8 +69,12 @@ RUN case "${TARGETARCH}" in \
 # -------- runtime --------
 FROM debian:bookworm-slim AS runtime
 
+# `sqlite3` is bundled in the runtime image so operators dropped into the
+# container via `start-cli package attach keysat` have an SQL shell on hand
+# for occasional admin tasks (test-data reset, hot-fix queries, audit
+# inspection). The CLI binary is ~1.4 MB stripped — negligible.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates tini \
+    ca-certificates tini sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Run as root inside the container. StartOS containers are isolated by

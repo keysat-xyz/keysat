@@ -33,6 +33,10 @@ pub struct RedeemReq {
     pub buyer_email: Option<String>,
     /// Optional free-text note (recorded on invoice).
     pub buyer_note: Option<String>,
+    /// Optional tier (policy slug). Same semantics as the purchase flow:
+    /// when set, the chosen public+active policy is remembered on the
+    /// invoice so its entitlements/expiry are baked into the license.
+    pub policy_slug: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +90,40 @@ pub async fn redeem(
         }
     }
 
+    // Resolve and validate the optional tier.
+    let chosen_policy = if let Some(ps) = req.policy_slug.as_deref().filter(|s| !s.is_empty()) {
+        let pol = repo::get_policy_by_slug(&state.db, &product.id, ps)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "policy '{ps}' for product '{}'",
+                    req.product
+                ))
+            })?;
+        if !pol.active {
+            return Err(AppError::BadRequest(format!(
+                "policy '{ps}' is not active"
+            )));
+        }
+        if !pol.public {
+            return Err(AppError::BadRequest(format!(
+                "policy '{ps}' is not available on the public buy page"
+            )));
+        }
+        Some(pol)
+    } else {
+        None
+    };
+    if let Some(restricted_pid) = &code.applies_to_policy_id {
+        if let Some(chosen) = &chosen_policy {
+            if restricted_pid != &chosen.id {
+                return Err(AppError::BadRequest(
+                    "code does not apply to the selected tier".into(),
+                ));
+            }
+        }
+    }
+
     // Atomic reserve. If reserved succeeds and any subsequent step fails,
     // we release the slot so a freed slot becomes available again.
     repo::try_reserve_code_slot(&state.db, &code.id).await?;
@@ -96,6 +134,7 @@ pub async fn redeem(
         &product.id,
         req.buyer_email.as_deref(),
         req.buyer_note.as_deref(),
+        chosen_policy.as_ref().map(|p| p.id.as_str()),
     )
     .await
     {

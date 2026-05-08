@@ -22,11 +22,13 @@ import { sdk } from '../sdk'
 import { activateLicense, showLicenseStatus } from './activateLicense'
 import { btcpayStatus, configureBtcpay, disconnectBtcpay } from './configureBtcpay'
 import { setOperatorName } from './setOperatorName'
+import { setWebUiPassword } from './setWebUiPassword'
 import { showCredentials } from './showCredentials'
 
 export const actions = sdk.Actions.of()
   // General
   .addAction(setOperatorName)
+  .addAction(setWebUiPassword)
   // BTCPay setup
   .addAction(configureBtcpay)
   .addAction(btcpayStatus)

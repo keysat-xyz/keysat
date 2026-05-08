@@ -144,15 +144,22 @@ pub async fn issue_license_for_invoice(
     state: &AppState,
     invoice: &crate::models::Invoice,
 ) -> AppResult<String> {
-    // Pick the "default" policy for the product: the first active policy
-    // whose slug is "default" if present, else the first active policy, else
-    // none (perpetual, no entitlements, max_machines=1).
-    let policies = repo::list_policies_by_product(&state.db, &invoice.product_id, true).await?;
-    let policy = policies
-        .iter()
-        .find(|p| p.slug == "default")
-        .or_else(|| policies.first())
-        .cloned();
+    // Tiered pricing (v0.1.0:27+): if the invoice carries a `policy_id`, the
+    // buyer chose a specific tier on /buy/<slug>. Use that policy verbatim
+    // (its entitlements, expiry, max_machines, trial flag get baked into the
+    // license). Otherwise fall back to the legacy default-pick: first
+    // active policy whose slug is "default", else the first active, else
+    // no policy (perpetual, no entitlements, max_machines=1).
+    let policy = if let Some(pid) = invoice.policy_id.as_deref() {
+        repo::get_policy_by_id(&state.db, pid).await?
+    } else {
+        let policies = repo::list_policies_by_product(&state.db, &invoice.product_id, true).await?;
+        policies
+            .iter()
+            .find(|p| p.slug == "default")
+            .or_else(|| policies.first())
+            .cloned()
+    };
 
     let now = Utc::now();
     let issued_at = now.to_rfc3339();

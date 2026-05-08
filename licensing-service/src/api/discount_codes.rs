@@ -51,6 +51,9 @@ pub async fn create(
     let actor_hash = require_admin(&state, &headers)?;
     let (ip, ua) = request_context(&headers);
 
+    // Tier-cap gate: Creator caps at 5 active discount codes.
+    crate::api::tier::enforce_code_cap(&state).await?;
+
     // Resolve product/policy slugs to ids if supplied.
     let product_id = if let Some(slug) = req.product_slug.as_deref() {
         let p = repo::get_product_by_slug(&state.db, slug)
@@ -148,6 +151,81 @@ pub async fn get_one(
     })))
 }
 
+/// Patch fields on a discount code. Only mutable fields are accepted —
+/// `code`, `kind`, `applies_to_product`, `applies_to_policy` are
+/// intentionally not editable to avoid silently invalidating links that
+/// have already been distributed. To change those, disable the existing
+/// code and create a new one. All fields are optional; `null` clears
+/// the field where the column is nullable (max_uses, expires_at,
+/// referrer_label).
+#[derive(Debug, Deserialize)]
+pub struct UpdateDiscountCodeReq {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<i64>,
+    /// Use `Some(Some(n))` to set a cap, `Some(null)` to clear.
+    #[serde(default, deserialize_with = "deser_double_option", skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deser_double_option", skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, deserialize_with = "deser_double_option", skip_serializing_if = "Option::is_none")]
+    pub referrer_label: Option<Option<String>>,
+}
+
+/// Helper for `Option<Option<T>>` with serde — distinguishes "not present in
+/// JSON" from "present but null". Used by PATCH endpoints that need to
+/// clear nullable columns explicitly.
+fn deser_double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+pub async fn update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateDiscountCodeReq>,
+) -> AppResult<Json<Value>> {
+    let actor_hash = require_admin(&state, &headers)?;
+    let (ip, ua) = request_context(&headers);
+
+    let updated = repo::update_discount_code(
+        &state.db,
+        &id,
+        req.amount,
+        req.max_uses,
+        req.expires_at.as_ref().map(|opt| opt.as_deref()),
+        req.description.as_deref(),
+        req.referrer_label.as_ref().map(|opt| opt.as_deref()),
+    )
+    .await?;
+
+    let _ = repo::insert_audit(
+        &state.db,
+        "admin_api_key",
+        Some(&actor_hash),
+        "discount_code.update",
+        Some("discount_code"),
+        Some(&id),
+        ip.as_deref(),
+        ua.as_deref(),
+        &json!({
+            "amount": req.amount,
+            "max_uses": req.max_uses,
+            "expires_at": req.expires_at,
+            "description": req.description,
+            "referrer_label": req.referrer_label,
+        }),
+    )
+    .await;
+
+    Ok(Json(json!(updated)))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetActiveReq {
     pub active: bool,
@@ -239,6 +317,12 @@ pub async fn delete(
 pub struct PreviewQuery {
     pub code: String,
     pub product: String,
+    /// Optional tier slug. When set, the preview computes the discount
+    /// against the policy's effective price (price_sats_override, falling
+    /// back to product.price_sats), and validates that the code's
+    /// applies_to_policy_id (if any) matches the chosen tier.
+    #[serde(default)]
+    pub policy_slug: Option<String>,
 }
 
 /// PUBLIC endpoint — buyers hit this from the buy page when they click
@@ -259,6 +343,15 @@ pub async fn preview(
     let product = repo::get_product_by_slug(&state.db, &q.product)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("product '{}'", q.product)))?;
+
+    // Resolve the chosen tier (if any). Lets the preview reflect the actual
+    // sat amount the buyer will see for that tier, AND lets us reject a
+    // code that's restricted to a different tier early.
+    let chosen_policy = if let Some(ps) = q.policy_slug.as_deref().filter(|s| !s.is_empty()) {
+        repo::get_policy_by_slug(&state.db, &product.id, ps).await?
+    } else {
+        None
+    };
 
     let code = match repo::get_discount_code_by_code(&state.db, code_str).await? {
         Some(c) => c,
@@ -301,6 +394,18 @@ pub async fn preview(
             })));
         }
     }
+    if let Some(restricted_pid) = &code.applies_to_policy_id {
+        if let Some(chosen) = &chosen_policy {
+            if restricted_pid != &chosen.id {
+                return Ok(Json(json!({
+                    "valid": false,
+                    "reason": "wrong_tier",
+                    "message": "This code does not apply to the selected tier.",
+                    "base_price_sats": chosen.price_sats_override.unwrap_or(product.price_sats),
+                })));
+            }
+        }
+    }
     if let Some(max) = code.max_uses {
         if code.used_count >= max {
             return Ok(Json(json!({
@@ -312,8 +417,12 @@ pub async fn preview(
         }
     }
 
-    // Compute the discounted price (mirroring purchase.rs's logic).
-    let base = product.price_sats;
+    // Compute the discounted price (mirroring purchase.rs's logic). Uses
+    // the chosen tier's effective price if a policy_slug was supplied.
+    let base = chosen_policy
+        .as_ref()
+        .and_then(|p| p.price_sats_override)
+        .unwrap_or(product.price_sats);
     let (final_price, discount_applied) = match code.kind.as_str() {
         "free_license" => (0i64, base),
         "percent" => {
@@ -325,6 +434,17 @@ pub async fn preview(
         "fixed_sats" => {
             let discount = code.amount.max(0).min(base);
             ((base - discount).max(1), discount)
+        }
+        // 'set_price' = the buyer pays exactly this many sats (regardless of
+        // the product's base price). If amount is >= base, the code provides
+        // no benefit and the buyer pays base price.
+        "set_price" => {
+            let target = code.amount.max(0);
+            if target >= base {
+                (base, 0)
+            } else {
+                ((target).max(1), base - target)
+            }
         }
         _ => (base, 0),
     };
@@ -348,6 +468,13 @@ pub async fn preview(
             "free_license" => "Free license — no payment required.".to_string(),
             "percent" => format!("{}% off applied.", code.amount as f64 / 100.0),
             "fixed_sats" => format!("{} sats off applied.", code.amount),
+            "set_price" => {
+                if code.amount >= base {
+                    "Code applied — but it doesn't lower the price for this product.".to_string()
+                } else {
+                    format!("Flat price applied: {} sats.", code.amount)
+                }
+            }
             _ => "Code applied.".to_string(),
         },
     })))

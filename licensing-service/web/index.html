@@ -345,13 +345,28 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       </svg>
     </div>
     <h1>Keysat admin</h1>
-    <div class="sub">Paste the admin API key from your StartOS service page.</div>
-    <div class="field">
-      <label class="lbl" for="api-key">Admin API key</label>
-      <input class="input mono" type="password" id="api-key" placeholder="64 hex chars" autocomplete="off">
-      <div class="hint">Find this in StartOS &rarr; Keysat &rarr; Actions &rarr; <em>Show admin API key</em>. The key is kept in your browser&rsquo;s localStorage and is sent only to this Keysat instance.</div>
+    <div class="sub" id="login-sub">Sign in with your web UI password.</div>
+
+    <!-- Password login (default) -->
+    <div id="login-pw" class="hide">
+      <div class="field">
+        <label class="lbl" for="pw">Password</label>
+        <input class="input" type="password" id="pw" placeholder="Web UI password" autocomplete="current-password">
+        <div class="hint">Set or rotate your password from StartOS &rarr; Keysat &rarr; Actions &rarr; <em>Set web UI password</em>.</div>
+      </div>
+      <button id="login-pw-btn" class="btn primary">Sign in</button>
     </div>
-    <button id="login-btn" class="btn primary">Sign in</button>
+
+    <!-- API-key fallback (shown when no password is configured yet) -->
+    <div id="login-key" class="hide">
+      <div class="field">
+        <label class="lbl" for="api-key">Admin API key</label>
+        <input class="input mono" type="password" id="api-key" placeholder="64 hex chars" autocomplete="off">
+        <div class="hint">No web UI password configured yet. Sign in with the API key from StartOS &rarr; Keysat &rarr; Actions &rarr; <em>Show admin API key</em>. Then set a web UI password via the <em>Set web UI password</em> action so you don&rsquo;t need the API key here again.</div>
+      </div>
+      <button id="login-btn" class="btn primary">Sign in (with API key)</button>
+    </div>
+
     <div id="login-err" class="err hide"></div>
   </div>
 </section>
@@ -383,6 +398,32 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       <div class="group-label">System</div>
       <a class="nav" data-route="webhooks"><i data-lucide="webhook"></i>Webhooks</a>
       <a class="nav" data-route="audit"><i data-lucide="scroll-text"></i>Audit log</a>
+      <!-- Tier banner: persistent. Shows current tier + next-tier CTA. -->
+      <div id="tier-banner" style="
+        margin-top:auto; margin-bottom:8px;
+        padding:12px 12px;
+        background:rgba(191,160,104,0.10);
+        border:1px solid rgba(191,160,104,0.30);
+        border-radius:8px;
+        font-size:11.5px; line-height:1.45;
+        color:var(--cream-50);
+        display:none;
+      ">
+        <div id="tier-banner-current" style="
+          font-size:10px; font-weight:700; letter-spacing:0.12em;
+          text-transform:uppercase; color:var(--gold-400);
+          margin-bottom:4px;
+        "></div>
+        <div id="tier-banner-msg" style="margin-bottom:8px;"></div>
+        <a id="tier-banner-cta" target="_blank" rel="noopener" style="
+          display:inline-block; padding:5px 10px;
+          background:var(--gold-500); color:var(--navy-950);
+          font-weight:700; font-size:11px;
+          border-radius:5px; text-decoration:none;
+          transition:background 120ms;
+        " onmouseover="this.style.background='var(--gold-400)'"
+           onmouseout="this.style.background='var(--gold-500)'"></a>
+      </div>
       <div class="footer" id="sidebar-footer">
         <span class="dot warn"></span>
         <div>
@@ -431,22 +472,192 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
   async function api(path, opts) {
     opts = opts || {}
+    const headers = {}
+    // Session-cookie path: don't send Authorization; the server-side
+    // middleware bridges the cookie to the API-key bearer for require_admin.
+    // API-key fallback path (first-run, before a password is set): send the
+    // bearer header explicitly.
+    if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey
+    if (opts.body) headers['Content-Type'] = 'application/json'
     const init = {
       method: opts.method || 'GET',
-      headers: Object.assign(
-        { 'Authorization': 'Bearer ' + apiKey },
-        opts.body ? { 'Content-Type': 'application/json' } : {},
-      ),
+      headers,
+      credentials: 'same-origin', // include keysat_session cookie when set
     }
     if (opts.body) init.body = JSON.stringify(opts.body)
     const resp = await fetch(path, init)
     if (!resp.ok) {
       let msg = resp.statusText
-      try { const j = await resp.json(); msg = j.message || j.error || msg } catch (_) {}
-      throw new Error('HTTP ' + resp.status + ': ' + msg)
+      let body = {}
+      try { body = await resp.json(); msg = body.message || body.error || msg } catch (_) {}
+      const err = new Error('HTTP ' + resp.status + ': ' + msg)
+      err.status = resp.status
+      err.body = body
+      throw err
     }
     if (resp.status === 204) return null
     return resp.json()
+  }
+
+  /// Tier-cap-aware error handler. If the error is a 402 from the
+  /// tier-cap gate, render an actionable modal with a clickable upgrade
+  /// button instead of a flat alert. Returns true if it handled the
+  /// error (so callers know whether to fall back to their default).
+  function handleTierCap(err) {
+    if (!err || err.status !== 402 || !err.body || !err.body.upgrade_url) return false
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px;',
+    })
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:440px; width:100%; padding:28px 26px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+    }, [
+      el('div', { class: 'eyebrow', style: 'color:var(--gold-700); margin-bottom:8px' }, 'Upgrade required'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:22px; margin:0 0 12px; color:var(--navy-950); letter-spacing:-0.01em;' }, 'You\'ve hit a Creator-tier cap'),
+      el('p', { style: 'font-size:14.5px; color:var(--ink-700); line-height:1.55; margin:0 0 20px;' }, err.body.message || ''),
+      el('div', { style: 'display:flex; gap:10px;' }, [
+        el('a', {
+          href: err.body.upgrade_url,
+          target: '_blank',
+          rel: 'noopener',
+          class: 'btn primary',
+          style: 'flex:1; text-align:center; text-decoration:none;',
+        }, [
+          el('span', null, 'Get Pro license '),
+          el('span', { style: 'opacity:0.7' }, '→'),
+        ]),
+        el('button', {
+          class: 'btn secondary',
+          onclick: () => overlay.remove(),
+        }, 'Close'),
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+    return true
+  }
+
+  /// Convenience wrapper: route 402 tier-cap errors to the modal,
+  /// fall back to alert() (or a custom fallback) for everything else.
+  function showApiErr(err, fallback) {
+    if (handleTierCap(err)) return
+    if (typeof fallback === 'function') fallback(err)
+    else alert(err && err.message ? err.message : String(err))
+  }
+
+  /// Generic safe-then-force delete flow.
+  /// Tries the regular DELETE first; if the server returns 409 (refers to
+  /// references), shows a modal that lets the operator either cancel or
+  /// type the slug to confirm a force-delete with cascade.
+  ///
+  /// `opts`:
+  ///   kind        — 'product' | 'policy' (used in the modal copy)
+  ///   slug        — what the operator must type to confirm
+  ///   pathBase    — '/v1/admin/products/<id>' or '/v1/admin/policies/<id>'
+  ///   onSuccess   — called after a successful delete (typically a route reload)
+  async function safeOrForceDelete(opts) {
+    const { kind, slug, pathBase, onSuccess } = opts
+    // Try safe path first.
+    try {
+      if (!confirm(`Permanently delete ${kind} "${slug}"? This cannot be undone. \
+The request will be refused if there are licenses or invoices tied to it — use force-delete in that case.`)) return
+      await api(pathBase, { method: 'DELETE' })
+      onSuccess()
+      return
+    } catch (e) {
+      if (handleTierCap(e)) return
+      if (e.status !== 409) {
+        alert(e.message)
+        return
+      }
+      // Fall through to the force-delete modal — server says references exist.
+      showForceDeleteModal({ kind, slug, message: e.body && e.body.message || e.message, pathBase, onSuccess })
+    }
+  }
+
+  function showForceDeleteModal({ kind, slug, message, pathBase, onSuccess }) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px;',
+    })
+    const slugInput = el('input', {
+      class: 'input mono',
+      placeholder: slug,
+      autocomplete: 'off',
+      style: 'width:100%; margin-top:6px;',
+    })
+    const forceBtn = el('button', {
+      class: 'btn danger',
+      disabled: true,
+      style: 'flex:1; opacity:0.5;',
+      onclick: async function () {
+        if (slugInput.value.trim() !== slug) return
+        forceBtn.disabled = true
+        forceBtn.textContent = 'Deleting…'
+        try {
+          const res = await api(pathBase + '?force=true', { method: 'DELETE' })
+          overlay.remove()
+          // Surface what got cascaded so the operator sees the blast radius.
+          const parts = []
+          if (res.cascaded_licenses)  parts.push(res.cascaded_licenses + ' license(s)')
+          if (res.cascaded_invoices)  parts.push(res.cascaded_invoices + ' invoice(s)')
+          if (res.cascaded_machines)  parts.push(res.cascaded_machines + ' machine row(s)')
+          if (res.cascaded_redemptions) parts.push(res.cascaded_redemptions + ' redemption(s)')
+          if (res.cascaded_policies)  parts.push(res.cascaded_policies + ' polic(y/ies)')
+          if (res.cascaded_codes)     parts.push(res.cascaded_codes + ' code(s)')
+          const summary = parts.length ? ' — also wiped: ' + parts.join(', ') : ''
+          // Show a brief toast-style banner instead of alert().
+          const toast = el('div', {
+            style: 'position:fixed; top:18px; left:50%; transform:translateX(-50%); ' +
+              'background:var(--navy-950); color:var(--cream-50); padding:10px 18px; ' +
+              'border-radius:8px; font-size:13.5px; z-index:10000; ' +
+              'box-shadow:0 4px 12px rgba(14,31,51,0.30);',
+          }, `${kind} "${slug}" force-deleted${summary}`)
+          document.body.appendChild(toast)
+          setTimeout(() => toast.remove(), 4500)
+          onSuccess()
+        } catch (e) {
+          forceBtn.disabled = false
+          forceBtn.textContent = 'Force delete (irreversible)'
+          alert(e.message)
+        }
+      },
+    }, 'Force delete (irreversible)')
+    slugInput.addEventListener('input', () => {
+      const ok = slugInput.value.trim() === slug
+      forceBtn.disabled = !ok
+      forceBtn.style.opacity = ok ? '1' : '0.5'
+    })
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:2px solid var(--danger); ' +
+        'border-radius:12px; max-width:480px; width:100%; padding:28px 26px; ' +
+        'box-shadow:0 16px 32px rgba(178,58,58,0.20);',
+    }, [
+      el('div', { class: 'eyebrow', style: 'color:var(--danger); margin-bottom:8px' }, 'Force delete — destructive'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:22px; margin:0 0 12px; color:var(--navy-950); letter-spacing:-0.01em;' }, `Wipe ${kind} "${slug}" and everything tied to it?`),
+      el('p', { style: 'font-size:14px; color:var(--ink-700); line-height:1.55; margin:0 0 12px;' }, message),
+      el('p', { style: 'font-size:14px; color:var(--ink-700); line-height:1.55; margin:0 0 18px;' },
+        `Force-delete will permanently remove every license, invoice, redemption, and machine row tied to this ${kind} — along with the ${kind} itself. There is no undo.`),
+      el('div', null, [
+        el('label', { style: 'font-size:12.5px; font-weight:600; color:var(--ink-700);' },
+          `Type the ${kind} slug "${slug}" to confirm:`),
+        slugInput,
+      ]),
+      el('div', { style: 'display:flex; gap:10px; margin-top:22px;' }, [
+        forceBtn,
+        el('button', {
+          class: 'btn secondary',
+          onclick: () => overlay.remove(),
+        }, 'Cancel'),
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+    setTimeout(() => slugInput.focus(), 0)
   }
 
   function el(tag, attrs, children) {
@@ -540,15 +751,48 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
     // Stats grid (skeleton first; fill in as data arrives)
     const stats = el('div', { class: 'stats' })
+    const sRevenue = stat('Revenue (lifetime)', '–', null, true)
     const sLicenses = stat('Active licenses', '–', null, true)
     const sCodes = stat('Discount codes', '–')
-    const sWebhooks = stat('Webhooks', '–')
     const sBtc = stat('BTCPay', el('span', { style: 'font-size:18px; font-family:var(--font-body); font-weight:600' }, '–'))
+    stats.appendChild(sRevenue)
     stats.appendChild(sLicenses)
     stats.appendChild(sCodes)
-    stats.appendChild(sWebhooks)
     stats.appendChild(sBtc)
     target.appendChild(stats)
+
+    // Revenue breakdown card — lifetime total + 30d/7d/24h.
+    function fmtSatsCard(n) {
+      const num = Number(n) || 0
+      return num.toLocaleString('en-US')
+    }
+    const revCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-body' }, [
+        el('div', { style: 'display:flex; align-items:baseline; justify-content:space-between; margin-bottom:14px' }, [
+          el('div', { class: 'eyebrow' }, 'Revenue'),
+          el('div', { class: 'muted', style: 'font-size:12px' }, 'Sum of settled BTCPay invoices stored locally. Free-license redemptions excluded.'),
+        ]),
+        el('div', {
+          id: 'revenue-grid',
+          style: 'display:grid; grid-template-columns:repeat(4, 1fr); gap:14px;',
+        }, [
+          el('div', { id: 'rev-total',  style: 'padding:10px 12px; background:var(--cream-100); border:1px solid var(--border-1); border-radius:8px;' },
+            [el('div', { class: 'muted', style: 'font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase' }, 'Lifetime'),
+             el('div', { style: 'font-family:var(--font-display); font-weight:700; font-size:22px; color:var(--navy-950); margin-top:4px;', class: 'rev-value' }, '–')]),
+          el('div', { id: 'rev-30d',    style: 'padding:10px 12px; background:var(--cream-100); border:1px solid var(--border-1); border-radius:8px;' },
+            [el('div', { class: 'muted', style: 'font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase' }, '30d'),
+             el('div', { style: 'font-family:var(--font-display); font-weight:700; font-size:22px; color:var(--navy-950); margin-top:4px;', class: 'rev-value' }, '–')]),
+          el('div', { id: 'rev-7d',     style: 'padding:10px 12px; background:var(--cream-100); border:1px solid var(--border-1); border-radius:8px;' },
+            [el('div', { class: 'muted', style: 'font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase' }, '7d'),
+             el('div', { style: 'font-family:var(--font-display); font-weight:700; font-size:22px; color:var(--navy-950); margin-top:4px;', class: 'rev-value' }, '–')]),
+          el('div', { id: 'rev-24h',    style: 'padding:10px 12px; background:var(--cream-100); border:1px solid var(--border-1); border-radius:8px;' },
+            [el('div', { class: 'muted', style: 'font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase' }, '24h'),
+             el('div', { style: 'font-family:var(--font-display); font-weight:700; font-size:22px; color:var(--navy-950); margin-top:4px;', class: 'rev-value' }, '–')]),
+        ]),
+        el('div', { class: 'muted', style: 'margin-top:10px; font-size:12px;', id: 'rev-count' }, ''),
+      ]),
+    ])
+    target.appendChild(revCard)
 
     // Welcome / instructions card
     target.appendChild(card('Welcome', null, [
@@ -596,6 +840,22 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
     // Fill in stat values
     try {
+      const j = await api('/v1/admin/revenue/summary').catch(() => null)
+      if (j) {
+        const fmt = (n) => fmtSatsCard(n) + ' sats'
+        sRevenue.querySelector('.value').textContent = fmt(j.total_sats || 0)
+        document.querySelector('#rev-total .rev-value').textContent = fmt(j.total_sats || 0)
+        document.querySelector('#rev-30d .rev-value').textContent = fmt(j.last_30d_sats || 0)
+        document.querySelector('#rev-7d .rev-value').textContent = fmt(j.last_7d_sats || 0)
+        document.querySelector('#rev-24h .rev-value').textContent = fmt(j.last_24h_sats || 0)
+        const c = j.settled_paid_invoice_count || 0
+        document.getElementById('rev-count').textContent =
+          c.toLocaleString() + ' settled paid invoice' + (c === 1 ? '' : 's')
+      } else {
+        sRevenue.querySelector('.value').textContent = '–'
+      }
+    } catch {}
+    try {
       const j = await api('/v1/admin/licenses/summary').catch(() => null)
       if (j && typeof j.active === 'number') {
         sLicenses.querySelector('.value').textContent = j.active.toString()
@@ -632,13 +892,22 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       sBtc.querySelector('.value').textContent = '?'
     }
 
-    // Public key fetch
+    // Public key fetch — pulls PEM from /v1/issuer/public-key (no auth
+    // required) and displays a short preview. Copy button copies the full
+    // PEM, including BEGIN/END headers, ready to paste into source.
     try {
       const j = await fetch('/v1/issuer/public-key').then((r) => r.json()).catch(() => null)
-      if (j && j.public_key_b64) {
-        const k = j.public_key_b64
-        document.getElementById('pubkey-preview').textContent = k.slice(0, 12) + '…' + k.slice(-12)
-        document.getElementById('pubkey-preview').dataset.full = k
+      const pem = j && (j.public_key_pem || j.public_key_b64) // accept either shape
+      if (pem && typeof pem === 'string') {
+        // Pull the base64 body out of the PEM for the in-card preview
+        // (BEGIN/END headers are noise on a single 12+12-char preview).
+        const body = pem
+          .replace(/-----BEGIN [^-]+-----/g, '')
+          .replace(/-----END [^-]+-----/g, '')
+          .replace(/\s+/g, '')
+        const preview = body.slice(0, 12) + '…' + body.slice(-12)
+        document.getElementById('pubkey-preview').textContent = preview
+        document.getElementById('pubkey-preview').dataset.full = pem
       } else {
         document.getElementById('pubkey-preview').textContent = 'unavailable'
       }
@@ -668,6 +937,56 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   }
 
   // -------- Products --------
+  // Edit-product modal. Opens when the operator clicks Edit on a product
+  // row. Mutable: name, description, price_sats. Slug is intentionally not
+  // editable (it's part of the public buy URL — changing breaks bookmarks).
+  function openEditProduct(p) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px;',
+    })
+    const nameField = formInput('e_p_name', 'Display name', { value: p.name || '', required: true })
+    const descField = formInput('e_p_description', 'Description', { textarea: true, value: p.description || '' })
+    const priceField = formInput('e_p_price', 'Price (sats)', { type: 'number', value: String(p.price_sats || 0), required: true })
+    const status = el('div', { class: 'muted', style: 'margin-top:6px; font-size:12.5px;' }, '')
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:480px; width:100%; padding:24px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+    }, [
+      el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Edit product'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:20px; margin:0 0 6px; color:var(--navy-950);' }, p.slug),
+      el('p', { class: 'muted', style: 'margin:0 0 16px; font-size:13px' },
+        'Slug is not editable — it is part of your public /buy/' + p.slug + ' URL. Disable + create a new product if you need to rename.'),
+      nameField,
+      descField,
+      priceField,
+      status,
+      el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
+        el('button', { class: 'btn primary', onclick: async function () {
+          status.textContent = 'Saving…'
+          try {
+            const body = {
+              name: card.querySelector('[name=e_p_name]').value.trim(),
+              description: card.querySelector('[name=e_p_description]').value || '',
+              price_sats: Math.max(0, parseInt(card.querySelector('[name=e_p_price]').value, 10) || 0),
+            }
+            await api('/v1/admin/products/' + p.id, { method: 'PATCH', body })
+            overlay.remove()
+            routes.products()
+          } catch (e) {
+            status.textContent = e.message
+            status.style.color = 'var(--danger)'
+          }
+        } }, 'Save'),
+        el('button', { class: 'btn secondary', onclick: () => overlay.remove() }, 'Cancel'),
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+  }
+
   routes.products = async function () {
     const target = document.getElementById('route-target')
     target.innerHTML = ''
@@ -693,7 +1012,11 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             }})
             status.replaceWith(ok('Created. Reloading…'))
             setTimeout(routes.products, 600)
-          } catch (e) { status.replaceWith(err(e.message)) }
+          } catch (e) {
+            // Tier-cap 402 → upgrade modal; everything else → inline status pill.
+            if (handleTierCap(e)) status.remove()
+            else status.replaceWith(err(e.message))
+          }
         }}, 'Create product'),
       ]),
     ])
@@ -705,25 +1028,182 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     ]))
 
     try {
-      const j = await api('/v1/products')
+      const [j, counts] = await Promise.all([
+        api('/v1/products'),
+        api('/v1/admin/licenses/counts').catch(() => ({ by_product: {}, by_policy: {} })),
+      ])
       const products = j.products || j || []
+      const byProduct = (counts && counts.by_product) || {}
       const rows = products.map((p) => el('tr', null, [
         el('td', null, el('code', null, p.slug)),
         el('td', { style: 'font-weight:600; color:var(--navy-950)' }, p.name),
         el('td', null, (p.price_sats || 0).toLocaleString() + ' sats'),
+        el('td', null, el('span', { class: 'muted' }, String(byProduct[p.id] || 0))),
         el('td', null, activePill(p.active)),
         el('td', { class: 'muted' }, fmtDate(p.created_at)),
+        el('td', null, el('div', { class: 'actions-row' }, [
+          el('button', {
+            class: 'btn sm secondary',
+            onclick: function () { openEditProduct(p) },
+          }, 'Edit'),
+          el('button', {
+            class: 'btn sm danger',
+            title: 'Delete this product. Safe by default; offers a force-delete with cascade if the product has licenses or invoices.',
+            onclick: function () {
+              safeOrForceDelete({
+                kind: 'product',
+                slug: p.slug,
+                pathBase: '/v1/admin/products/' + p.id,
+                onSuccess: () => routes.products(),
+              })
+            },
+          }, 'Delete'),
+        ])),
       ]))
       target.appendChild(tableCard(
         'All products',
         products.length + ' total',
-        ['Slug', 'Name', 'Price', 'Status', 'Created'],
+        ['Slug', 'Name', 'Price', 'Licenses', 'Status', 'Created', ''],
         rows,
         'No products yet. Create one above to start selling.'
       ))
     } catch (e) {
       target.appendChild(plainCard([err(e.message)]))
     }
+  }
+
+  // Edit-policy modal. Mutable: name, description, price_sats_override,
+  // duration, grace, max_machines, is_trial, entitlements, highlight.
+  // Slug + product + tip config are NOT editable here (tip has its own
+  // dedicated PATCH endpoint with its own validation rules).
+  function openEditPolicy(pol, prod) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px; ' +
+        'overflow-y:auto;',
+    })
+    const DURATION_PRESETS = [
+      { value: '0',         label: 'Perpetual (no expiry)' },
+      { value: '604800',    label: '7 days' },
+      { value: '2592000',   label: '30 days' },
+      { value: '7776000',   label: '90 days' },
+      { value: '15552000',  label: '6 months' },
+      { value: '31536000',  label: '1 year' },
+      { value: '63072000',  label: '2 years' },
+      { value: 'custom',    label: 'Custom (in seconds)' },
+    ]
+    // Map current duration to a preset value if it matches; else 'custom'.
+    const dur = pol.duration_seconds || 0
+    const matched = DURATION_PRESETS.find((p) => p.value === String(dur) && p.value !== 'custom')
+    const initialPreset = matched ? matched.value : 'custom'
+
+    const meta = pol.metadata || {}
+    const description = (typeof meta.description === 'string') ? meta.description : ''
+    const highlight = !!meta.highlight
+
+    const nameField = formInput('e_pol_name', 'Display name', { value: pol.name || '', required: true })
+    const descField = formInput('e_pol_description', 'Tier description (optional)', {
+      value: description,
+      hint: 'Shown on the tier card on /buy/' + (prod.slug || '<product>') + '. One sentence.',
+    })
+    const priceField = formInput('e_pol_price', 'Price (sats)', {
+      type: 'number',
+      value: String(pol.price_sats_override == null ? prod.price_sats || 0 : pol.price_sats_override),
+      hint: 'Override for this tier. 0 = free.',
+    })
+    const presetSel = formSelect('e_pol_preset', 'Duration', DURATION_PRESETS, { required: true, value: initialPreset })
+    const customDur = formInput('e_pol_custom', 'Custom (seconds)', { type: 'number', value: String(dur) })
+    const graceField = formInput('e_pol_grace', 'Grace period (days)', {
+      type: 'number',
+      value: String(Math.floor((pol.grace_seconds || 0) / 86400)),
+    })
+    const machinesField = formInput('e_pol_machines', 'Max devices (0 = unlimited)', {
+      type: 'number', value: String(pol.max_machines == null ? 1 : pol.max_machines),
+    })
+    const entField = formInput('e_pol_entitlements', 'Entitlements (one per line, or comma-separated)', {
+      textarea: true,
+      value: (pol.entitlements || []).join('\n'),
+      hint: 'Examples: self_host, ai_summaries, export. No quotes or brackets.',
+    })
+    const highlightField = formCheckbox('e_pol_highlight', 'Mark as "Most popular" on the tier picker')
+    if (highlight) setTimeout(() => {
+      const cb = card.querySelector('[name=e_pol_highlight]')
+      if (cb) cb.checked = true
+    }, 0)
+    const trialField = formCheckbox('e_pol_trial', 'Trial flag')
+    if (pol.is_trial) setTimeout(() => {
+      const cb = card.querySelector('[name=e_pol_trial]')
+      if (cb) cb.checked = true
+    }, 0)
+
+    const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px;' }, '')
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:560px; width:100%; padding:24px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); ' +
+        'max-height:90vh; overflow-y:auto;',
+    }, [
+      el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Edit policy'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:20px; margin:0 0 6px; color:var(--navy-950);' },
+        prod.name + ' — ' + pol.slug),
+      el('p', { class: 'muted', style: 'margin:0 0 16px; font-size:13px' },
+        'Slug not editable — disable + create a new policy if you need to rename. To change tip config, use the dedicated tip endpoint.'),
+      nameField,
+      descField,
+      priceField,
+      el('div', { class: 'row-2' }, [presetSel, customDur]),
+      el('div', { class: 'row-2' }, [graceField, machinesField]),
+      entField,
+      el('div', { class: 'row-2' }, [highlightField, trialField]),
+      status,
+      el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
+        el('button', { class: 'btn primary', onclick: async function () {
+          status.textContent = 'Saving…'
+          status.style.color = ''
+          try {
+            const presetV = card.querySelector('[name=e_pol_preset]').value
+            const customV = parseInt(card.querySelector('[name=e_pol_custom]').value, 10) || 0
+            const duration_seconds = presetV === 'custom' ? customV : parseInt(presetV, 10)
+            const grace_days = parseInt(card.querySelector('[name=e_pol_grace]').value, 10) || 0
+            const grace_seconds = grace_days * 86400
+            const rawEnts = card.querySelector('[name=e_pol_entitlements]').value || ''
+            const ents = Array.from(new Set(
+              rawEnts.replace(/[\[\]"'`]/g, '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
+            ))
+            const newDescription = (card.querySelector('[name=e_pol_description]').value || '').trim()
+            const newHighlight = card.querySelector('[name=e_pol_highlight]').checked
+            // Preserve any other metadata keys we don't manage in the form.
+            const newMetadata = Object.assign({}, meta)
+            if (newDescription) newMetadata.description = newDescription
+            else delete newMetadata.description
+            if (newHighlight) newMetadata.highlight = true
+            else delete newMetadata.highlight
+            const priceRaw = card.querySelector('[name=e_pol_price]').value.trim()
+            const price_sats_override = priceRaw === '' ? null : Math.max(0, parseInt(priceRaw, 10) || 0)
+            const body = {
+              name: card.querySelector('[name=e_pol_name]').value.trim(),
+              duration_seconds,
+              grace_seconds,
+              max_machines: parseInt(card.querySelector('[name=e_pol_machines]').value, 10) || 0,
+              is_trial: card.querySelector('[name=e_pol_trial]').checked,
+              entitlements: ents,
+              metadata: newMetadata,
+              price_sats_override,
+            }
+            await api('/v1/admin/policies/' + pol.id, { method: 'PATCH', body })
+            overlay.remove()
+            routes.policies()
+          } catch (e) {
+            status.textContent = e.message
+            status.style.color = 'var(--danger)'
+          }
+        } }, 'Save'),
+        el('button', { class: 'btn secondary', onclick: () => overlay.remove() }, 'Cancel'),
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
   }
 
   // -------- Policies --------
@@ -740,23 +1220,88 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       return
     }
 
+    // Duration presets — operators rarely think in seconds. Custom drops
+    // them back to a raw-seconds field so power users still have it.
+    const DURATION_PRESETS = [
+      { value: '0',         label: 'Perpetual (no expiry)' },
+      { value: '604800',    label: '7 days' },
+      { value: '2592000',   label: '30 days' },
+      { value: '7776000',   label: '90 days' },
+      { value: '15552000',  label: '6 months' },
+      { value: '31536000',  label: '1 year' },
+      { value: '63072000',  label: '2 years' },
+      { value: 'custom',    label: 'Custom (in seconds)' },
+    ]
+
+    // Price for a given product slug. Used to prefill the override field
+    // when the operator picks a product from the dropdown.
+    const PRODUCT_PRICE_BY_SLUG = Object.fromEntries(products.map((p) => [p.slug, p.price_sats]))
+    const initialProductSlug = products[0] ? products[0].slug : ''
+    const initialProductPrice = PRODUCT_PRICE_BY_SLUG[initialProductSlug] || 0
+
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new policy'),
       el('div', { class: 'body' }, [
-        formSelect('product_slug', 'Product', products.map((p) => ({ value: p.slug, label: p.name + ' (' + p.slug + ')' })), { required: true }),
+        formSelect('product_slug', 'Product', products.map((p) => ({ value: p.slug, label: p.name + ' (' + p.slug + ', ' + p.price_sats.toLocaleString() + ' sats)' })), { required: true }),
         el('div', { class: 'row-2' }, [
-          formInput('slug', 'Policy slug', { required: true, value: 'default', hint: 'use "default" for the public purchase flow' }),
-          formInput('name', 'Display name', { required: true, value: 'Standard' }),
+          formInput('slug', 'Policy slug', {
+            required: true,
+            value: 'default',
+            hint: 'machine-readable id, lower-case. Examples: default, free, pro, patron. Cannot be changed later.',
+          }),
+          formInput('name', 'Display name', {
+            required: true,
+            value: 'Standard',
+            hint: 'shown to buyers on the tier picker on /buy/<product>.',
+          }),
         ]),
+
+        // Description (maps to metadata.description) — shown on the tier card.
+        formInput('tier_description', 'Tier description (optional)', {
+          hint: 'One-sentence blurb shown on the tier card. e.g. "Run Keysat for your own software" or "Unlocks Zaprite + recurring billing".',
+        }),
+
+        // Price override — prefilled with the product's base price; operator
+        // edits it to set this tier's price. Setting it equal to the product
+        // price still locks in that price on the policy (predictable across
+        // future product-price changes).
+        formInput('price_sats_override', 'Price (sats)', {
+          type: 'number',
+          required: true,
+          value: String(initialProductPrice),
+          hint: 'Pre-filled with the product\'s base price. Edit to set a different price for this tier (e.g. Free = 0, Pro = 250000, Patron = 500000). Set 0 for free tiers.',
+        }),
+
+        // Duration: preset + optional custom seconds.
         el('div', { class: 'row-2' }, [
-          formInput('duration_seconds', 'Duration (sec, 0 = perpetual)', { type: 'number', required: true, value: '0' }),
-          formInput('grace_seconds', 'Grace period (sec)', { type: 'number', required: true, value: '0' }),
+          formSelect('duration_preset', 'Duration', DURATION_PRESETS, { required: true, value: '0' }),
+          formInput('duration_custom', 'Custom (seconds)', {
+            type: 'number', value: '0',
+            hint: 'Used only when the dropdown is "Custom". 86400 = 1 day. 31536000 = 1 year.',
+          }),
         ]),
+
         el('div', { class: 'row-2' }, [
-          formInput('max_machines', 'Max machines (0 = unlimited)', { type: 'number', required: true, value: '1' }),
-          formCheckbox('is_trial', 'Trial flag (sets TRIAL bit)'),
+          formInput('grace_days', 'Grace period after expiry (days)', {
+            type: 'number', value: '0',
+            hint: 'Validate calls return ok-with-warning during the grace window. 0 = no grace.',
+          }),
+          formInput('max_machines', 'Max devices (0 = unlimited)', {
+            type: 'number', required: true, value: '1',
+            hint: '1 = single seat. Set higher for team licenses.',
+          }),
         ]),
-        formInput('entitlements', 'Entitlements (comma-separated, optional)', { hint: 'e.g. core, sync, export. Embedded in the signed key.' }),
+
+        // Entitlements — textarea, one-per-line OR comma-separated. No JSON brackets, no quotes.
+        formInput('entitlements', 'Entitlements (one per line, or comma-separated)', {
+          textarea: true,
+          hint: 'Plain words. Examples: core, ai_summaries, export, recurring_billing, card_payments. These get baked into the signed license key; your software checks for them with `entitlements.has("ai_summaries")` to decide what to unlock. Don\'t add quotes or brackets — the form does that for you.',
+        }),
+
+        el('div', { class: 'row-2' }, [
+          formCheckbox('mark_highlight', 'Mark as "Most popular" (gold pill on tier picker)'),
+          formCheckbox('is_trial', 'Trial flag (sets TRIAL bit on the signed license)'),
+        ]),
 
         // ---------- Tip recipient (optional) ----------
         el('div', {
@@ -764,10 +1309,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         }, [
           el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'Tip recipient (optional)'),
           el('p', { class: 'hint', style: 'margin:0 0 10px' },
-            'On every successful license issuance under this policy, send a Lightning tip to the recipient as a percentage of what the buyer paid. Operator-controlled — fully optional. Suggestions: tip@keysat.xyz to support Keysat, opensats@nostrplebs.com for OpenSats, your co-founder, a charity, anyone with a Lightning Address.'),
+            'On every successful license issuance under this policy, send a Lightning tip to the recipient as a percentage of what the buyer paid. Operator-controlled — fully optional. Suggestions: keysat@primal.net to support Keysat, opensats@npub.cash for OpenSats (FOSS Bitcoin development), your co-founder, a charity, or any Lightning Address.'),
           el('div', { class: 'row-2' }, [
             formInput('tip_recipient', 'Lightning Address', {
-              hint: 'e.g. tip@keysat.xyz. Leave blank to disable.',
+              hint: 'e.g. keysat@primal.net. Leave blank to disable.',
             }),
             formInput('tip_pct', 'Tip percentage', {
               type: 'number', value: '0',
@@ -783,21 +1328,55 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
           create.querySelector('.body').appendChild(status)
           try {
-            const ents = (create.querySelector('[name=entitlements]').value || '').split(',').map((s) => s.trim()).filter(Boolean)
+            // Entitlements: split on newlines OR commas, trim, dedupe, drop empties.
+            // Also strip any quotes/brackets a paranoid operator might have typed.
+            const rawEnts = create.querySelector('[name=entitlements]').value || ''
+            const ents = Array.from(new Set(
+              rawEnts
+                .replace(/[\[\]"'`]/g, '') // strip JSON noise if pasted
+                .split(/[\n,]/)
+                .map((s) => s.trim())
+                .filter(Boolean)
+            ))
+
+            // Duration: preset wins unless "custom" selected.
+            const preset = create.querySelector('[name=duration_preset]').value
+            const customSecs = parseInt(create.querySelector('[name=duration_custom]').value, 10) || 0
+            const duration_seconds = preset === 'custom' ? customSecs : parseInt(preset, 10)
+
+            // Grace days → seconds.
+            const grace_days = parseInt(create.querySelector('[name=grace_days]').value, 10) || 0
+            const grace_seconds = grace_days * 86400
+
+            // Metadata: dedicated fields → JSON. Operator never sees the JSON.
+            const description = (create.querySelector('[name=tier_description]').value || '').trim()
+            const highlight = create.querySelector('[name=mark_highlight]').checked
+            const metadata = {}
+            if (description) metadata.description = description
+            if (highlight) metadata.highlight = true
+
             const tipRecipient = (create.querySelector('[name=tip_recipient]').value || '').trim()
             const tipPctRaw = parseFloat(create.querySelector('[name=tip_pct]').value) || 0
             // UI percent → basis points. Cap at 10000 (= 100%).
             const tipPctBps = Math.max(0, Math.min(10000, Math.round(tipPctRaw * 100)))
             const tipLabel = (create.querySelector('[name=tip_label]').value || '').trim()
+            // Price override: always send what the operator typed. The form
+            // pre-filled it to the product price; the value is whatever they
+            // ended up with (edited or unedited).
+            const priceRaw = create.querySelector('[name=price_sats_override]').value
+            const price_sats_override = priceRaw === '' ? null : Math.max(0, parseInt(priceRaw, 10) || 0)
+
             const body = {
               product_slug: create.querySelector('[name=product_slug]').value,
               slug: create.querySelector('[name=slug]').value,
               name: create.querySelector('[name=name]').value,
-              duration_seconds: parseInt(create.querySelector('[name=duration_seconds]').value, 10),
-              grace_seconds: parseInt(create.querySelector('[name=grace_seconds]').value, 10),
+              duration_seconds,
+              grace_seconds,
               max_machines: parseInt(create.querySelector('[name=max_machines]').value, 10),
               is_trial: create.querySelector('[name=is_trial]').checked,
               entitlements: ents,
+              metadata,
+              price_sats_override,
             }
             if (tipRecipient) {
               body.tip_recipient = tipRecipient
@@ -807,15 +1386,55 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             await api('/v1/admin/policies', { method: 'POST', body })
             status.replaceWith(ok('Created. Reloading…'))
             setTimeout(routes.policies, 600)
-          } catch (e) { status.replaceWith(err(e.message)) }
+          } catch (e) {
+            // Tier-cap 402 → upgrade modal; everything else → inline status pill.
+            if (handleTierCap(e)) status.remove()
+            else status.replaceWith(err(e.message))
+          }
         }}, 'Create policy'),
       ]),
     ])
+
+    // Toggle the custom-seconds field disabled state based on the preset.
+    const presetEl = create.querySelector('[name=duration_preset]')
+    const customEl = create.querySelector('[name=duration_custom]')
+    function syncDurationCustom() {
+      if (presetEl.value === 'custom') {
+        customEl.disabled = false
+        customEl.style.opacity = '1'
+      } else {
+        customEl.disabled = true
+        customEl.style.opacity = '0.5'
+      }
+    }
+    presetEl.addEventListener('change', syncDurationCustom)
+    syncDurationCustom()
+
+    // When the product changes, prefill the price-override field with that
+    // product's base price. The operator can still edit afterward; this just
+    // saves them from looking up the price elsewhere.
+    const productSelEl = create.querySelector('[name=product_slug]')
+    const priceFieldEl = create.querySelector('[name=price_sats_override]')
+    let lastPrefilledPrice = String(initialProductPrice)
+    productSelEl.addEventListener('change', function () {
+      const newSlug = productSelEl.value
+      const newPrice = PRODUCT_PRICE_BY_SLUG[newSlug] || 0
+      // Only auto-update the price field if the operator hasn't edited it
+      // away from the previous prefill — so a manual edit isn't clobbered.
+      if (priceFieldEl.value === lastPrefilledPrice || priceFieldEl.value === '') {
+        priceFieldEl.value = String(newPrice)
+      }
+      lastPrefilledPrice = String(newPrice)
+    })
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' },
         'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance.'),
       create,
     ]))
+
+    // License-count map (one fetch covers all products / policies on the page).
+    const counts = await api('/v1/admin/licenses/counts').catch(() => ({ by_policy: {} }))
+    const byPolicy = (counts && counts.by_policy) || {}
 
     for (const p of products) {
       try {
@@ -831,12 +1450,46 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             ? el('span', { class: 'badge b-warning' }, 'trial')
             : el('span', { class: 'muted' }, '–')),
           el('td', { class: 'muted' }, (pol.entitlements || []).join(', ') || '–'),
+          el('td', null, el('span', { class: 'muted' }, String(byPolicy[pol.id] || 0))),
           el('td', null, activePill(pol.active)),
+          el('td', null, pol.public
+            ? el('span', { class: 'badge b-gold', title: 'Visible on /buy/' + p.slug + ' tier picker' }, 'public')
+            : el('span', { class: 'muted', title: 'Hidden from public buy page; admin issuance only' }, 'private')),
+          el('td', null, el('div', { class: 'actions-row' }, [
+            el('button', {
+              class: 'btn sm secondary',
+              onclick: function () { openEditPolicy(pol, p) },
+            }, 'Edit'),
+            el('button', {
+              class: 'btn sm secondary',
+              title: pol.public ? 'Hide from /buy/' + p.slug : 'Show on /buy/' + p.slug,
+              onclick: async function () {
+                try {
+                  await api('/v1/admin/policies/' + pol.id + '/public', {
+                    method: 'PATCH', body: { public: !pol.public },
+                  })
+                  routes.policies()
+                } catch (e) { alert(e.message) }
+              },
+            }, pol.public ? 'Hide' : 'Show'),
+            el('button', {
+              class: 'btn sm danger',
+              title: 'Delete this policy. Safe by default; offers a force-delete with cascade if the policy has licenses or invoices.',
+              onclick: function () {
+                safeOrForceDelete({
+                  kind: 'policy',
+                  slug: pol.slug,
+                  pathBase: '/v1/admin/policies/' + pol.id,
+                  onSuccess: () => routes.policies(),
+                })
+              },
+            }, 'Delete'),
+          ])),
         ]))
         target.appendChild(tableCard(
           p.name + ' — ' + p.slug,
           policies.length + ' polic' + (policies.length === 1 ? 'y' : 'ies'),
-          ['Slug', 'Name', 'Duration', 'Grace', 'Seats', 'Trial', 'Entitlements', 'Status'],
+          ['Slug', 'Name', 'Duration', 'Grace', 'Seats', 'Trial', 'Entitlements', 'Licenses', 'Status', 'On buy page', ''],
           rows,
           '(no policies yet)'
         ))
@@ -851,6 +1504,14 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
+    function amountHint(kind) {
+      if (kind === 'percent') return 'percent off, e.g. 50 = 50%. Range: 1–100.'
+      if (kind === 'fixed_sats') return 'sats subtracted from the base price.'
+      if (kind === 'set_price') return 'flat price the buyer pays in sats (e.g. 5000 = "buy at 5000 sats regardless of base price"). If higher than base, the code provides no benefit.'
+      if (kind === 'free_license') return 'amount is ignored — buyer pays nothing.'
+      return ''
+    }
+
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new code'),
       el('div', { class: 'body' }, [
@@ -859,11 +1520,12 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           formSelect('kind', 'Kind', [
             { value: 'percent', label: 'Percent off' },
             { value: 'fixed_sats', label: 'Fixed sats off' },
+            { value: 'set_price', label: 'Set flat price (in sats)' },
             { value: 'free_license', label: 'Free license (no payment)' },
           ], { required: true, value: 'percent' }),
         ]),
         el('div', { class: 'row-2' }, [
-          formInput('amount', 'Amount', { type: 'number', value: '50', hint: 'percent: 1–100. fixed_sats: positive integer. free_license: ignored.' }),
+          formInput('amount', 'Amount', { type: 'number', value: '50', hint: amountHint('percent') }),
           formInput('max_uses', 'Max uses (0 = unlimited)', { type: 'number', value: '0' }),
         ]),
         el('div', { class: 'row-2' }, [
@@ -895,15 +1557,106 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             await api('/v1/admin/discount-codes', { method: 'POST', body })
             status.replaceWith(ok('Created. Reloading…'))
             setTimeout(routes.codes, 600)
-          } catch (e) { status.replaceWith(err(e.message)) }
+          } catch (e) {
+            // Tier-cap 402 → upgrade modal; everything else → inline status pill.
+            if (handleTierCap(e)) status.remove()
+            else status.replaceWith(err(e.message))
+          }
         }}, 'Create code'),
       ]),
     ])
+
+    // Live-update the amount hint as the operator changes the Kind dropdown.
+    const kindSelEl = create.querySelector('[name=kind]')
+    if (kindSelEl) {
+      kindSelEl.addEventListener('change', function () {
+        const hintEl = create.querySelector('[name=amount]').parentElement.querySelector('.hint')
+        if (hintEl) hintEl.textContent = amountHint(kindSelEl.value)
+      })
+    }
+
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' },
-        'Codes can be percent-off, fixed-sats-off, or free-license (no payment required). Buyers append ?code=YOUR_CODE to your purchase URL, or for free-license codes use the /v1/redeem endpoint.'),
+        'Codes are entered by the buyer on /buy/<product-slug>. Four kinds: percent off, fixed sats off, set flat price (e.g. 5000 sats regardless of base), or free-license (no payment, instant redemption).'),
       create,
     ]))
+
+    // Edit panel — hidden until Edit is clicked. Populated with the chosen
+    // code's current values; saving PATCHes /v1/admin/discount-codes/:id and
+    // reloads the route.
+    const editPanel = el('div', { id: 'edit-code-panel', style: 'display:none; margin:16px 0;' })
+    target.appendChild(editPanel)
+
+    function openEdit(c) {
+      editPanel.innerHTML = ''
+      editPanel.style.display = 'block'
+      const amtField = formInput('e_amount', 'Amount', {
+        type: 'number',
+        value: c.kind === 'percent' ? String(c.amount / 100) : String(c.amount),
+        hint: c.kind === 'free_license'
+          ? 'free_license codes have no amount.'
+          : amountHint(c.kind) + ' (kind: ' + c.kind + ', not editable)',
+      })
+      const muField = formInput('e_max_uses', 'Max uses (0 = unlimited)', {
+        type: 'number',
+        value: c.max_uses == null ? '0' : String(c.max_uses),
+        hint: c.used_count > 0 ? 'cannot go below current used_count (' + c.used_count + ').' : null,
+      })
+      const expField = formInput('e_expires_at', 'Expires at (RFC3339, blank to clear)', {
+        value: c.expires_at || '',
+      })
+      const refField = formInput('e_referrer_label', 'Referrer / campaign label (blank to clear)', {
+        value: c.referrer_label || '',
+      })
+      const descField = formInput('e_description', 'Description (internal note)', {
+        textarea: true,
+        value: c.description || '',
+      })
+      const saveBtn = el('button', { class: 'btn primary', onclick: async function () {
+        const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Saving…')
+        editPanel.appendChild(status)
+        try {
+          const body = {}
+          if (c.kind !== 'free_license') {
+            const rawAmt = parseInt(editPanel.querySelector('[name=e_amount]').value, 10)
+            if (Number.isFinite(rawAmt) && rawAmt >= 0) {
+              body.amount = c.kind === 'percent' ? rawAmt * 100 : rawAmt
+            }
+          }
+          const muRaw = parseInt(editPanel.querySelector('[name=e_max_uses]').value, 10) || 0
+          body.max_uses = muRaw > 0 ? muRaw : null
+          const expRaw = editPanel.querySelector('[name=e_expires_at]').value.trim()
+          body.expires_at = expRaw === '' ? null : expRaw
+          const refRaw = editPanel.querySelector('[name=e_referrer_label]').value.trim()
+          body.referrer_label = refRaw === '' ? null : refRaw
+          body.description = editPanel.querySelector('[name=e_description]').value || ''
+          await api('/v1/admin/discount-codes/' + c.id, { method: 'PATCH', body })
+          status.replaceWith(ok('Saved. Reloading…'))
+          setTimeout(routes.codes, 600)
+        } catch (e) {
+          status.replaceWith(err(e.message))
+        }
+      } }, 'Save changes')
+      const cancelBtn = el('button', {
+        class: 'btn secondary',
+        style: 'margin-left:8px',
+        onclick: function () { editPanel.style.display = 'none'; editPanel.innerHTML = '' },
+      }, 'Cancel')
+
+      editPanel.appendChild(plainCard([
+        el('div', { style: 'display:flex; align-items:baseline; justify-content:space-between; margin-bottom:12px' }, [
+          el('strong', null, 'Editing code '),
+          el('code', { style: 'font-size:14px' }, c.code),
+        ]),
+        el('p', { class: 'muted', style: 'margin:0 0 16px; font-size:13px' },
+          'Editable: amount, max uses, expiry, referrer label, description. The code string, kind, and product/policy scope cannot be changed — disable + create a new code instead.'),
+        el('div', { class: 'row-2' }, [amtField, muField]),
+        el('div', { class: 'row-2' }, [expField, refField]),
+        descField,
+        el('div', { style: 'margin-top:8px' }, [saveBtn, cancelBtn]),
+      ]))
+      editPanel.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
 
     try {
       const j = await api('/v1/admin/discount-codes?include_inactive=true')
@@ -911,7 +1664,8 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       const rows = codes.map((c) => {
         let amountStr = ''
         if (c.kind === 'percent') amountStr = (c.amount / 100) + '%'
-        else if (c.kind === 'fixed_sats') amountStr = c.amount.toLocaleString() + ' sats'
+        else if (c.kind === 'fixed_sats') amountStr = c.amount.toLocaleString() + ' sats off'
+        else if (c.kind === 'set_price') amountStr = c.amount.toLocaleString() + ' sats flat'
         else amountStr = el('span', { class: 'badge b-gold' }, 'free')
         const usage = c.used_count + ' / ' + (c.max_uses == null ? '∞' : c.max_uses)
         return el('tr', null, [
@@ -922,6 +1676,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           el('td', { class: 'muted' }, c.expires_at ? fmtDate(c.expires_at) : '–'),
           el('td', null, activePill(c.active)),
           el('td', null, el('div', { class: 'actions-row' }, [
+            el('button', {
+              class: 'btn sm secondary',
+              onclick: function () { openEdit(c) },
+            }, 'Edit'),
             el('button', {
               class: 'btn sm ' + (c.active ? 'danger' : 'secondary'),
               onclick: async function () {
@@ -964,7 +1722,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
-    const queryInput = el('input', { class: 'input', type: 'text', placeholder: 'email, npub, or invoice id' })
+    const queryInput = el('input', { class: 'input', type: 'text', placeholder: 'email, npub, or invoice id (leave blank for recent)' })
     const fieldSel = el('select', { class: 'select' }, [
       el('option', { value: 'email' }, 'Email'),
       el('option', { value: 'npub' }, 'Nostr npub'),
@@ -972,19 +1730,42 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     ])
     const tableHolder = el('div')
 
-    async function doSearch() {
+    async function loadLicenses() {
       const q = queryInput.value.trim()
-      if (!q) return
       tableHolder.innerHTML = ''
-      tableHolder.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Searching…')))
+      tableHolder.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, q ? 'Searching…' : 'Loading recent licenses…')))
       try {
-        const params = new URLSearchParams()
-        params.set(fieldSel.value, q)
-        const j = await api('/v1/admin/licenses/search?' + params.toString())
+        let url = '/v1/admin/licenses/search'
+        if (q) {
+          const params = new URLSearchParams()
+          params.set(fieldSel.value, q)
+          url += '?' + params.toString()
+        }
+        const j = await api(url)
         const lic = j.licenses || []
+        function entitlementsCell(ents) {
+          if (!ents || ents.length === 0) {
+            return el('span', { class: 'muted' }, '–')
+          }
+          const wrap = el('div', { style: 'display:flex; flex-wrap:wrap; gap:4px;' })
+          ents.forEach((e) => {
+            wrap.appendChild(el('span', {
+              class: 'badge',
+              style: 'font-size:10.5px; padding:2px 7px; background:var(--cream-200); color:var(--ink-700); font-family:var(--font-mono); font-weight:500;',
+              title: e,
+            }, e))
+          })
+          return wrap
+        }
         const rows = lic.map((l) => el('tr', null, [
           el('td', null, el('code', null, shortId(l.id))),
-          el('td', null, shortId(l.product_id)),
+          el('td', null, l.product_slug
+            ? el('code', { title: l.product_id }, l.product_slug)
+            : shortId(l.product_id)),
+          el('td', null, l.policy_slug
+            ? el('span', { title: l.policy_name || l.policy_id || '' }, l.policy_slug)
+            : el('span', { class: 'muted' }, '–')),
+          el('td', null, entitlementsCell(l.entitlements)),
           el('td', null, statusBadge(l.status)),
           el('td', { class: 'muted' }, fmtDate(l.issued_at)),
           el('td', { class: 'muted' }, l.expires_at ? fmtDate(l.expires_at) : el('span', { class: 'badge b-gold' }, 'perpetual')),
@@ -1001,13 +1782,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               : null,
           ])),
         ]))
+        const title = q ? 'Search results' : 'Recent licenses'
+        const subtitle = lic.length + ' license' + (lic.length === 1 ? '' : 's') +
+          (q ? '' : (lic.length >= 100 ? ' (most recent 100)' : ''))
         tableHolder.innerHTML = ''
         tableHolder.appendChild(tableCard(
-          'Results',
-          lic.length + ' license' + (lic.length === 1 ? '' : 's'),
-          ['ID', 'Product', 'Status', 'Issued', 'Expires', 'Buyer', ''],
+          title,
+          subtitle,
+          ['ID', 'Product', 'Policy', 'Entitlements', 'Status', 'Issued', 'Expires', 'Buyer', ''],
           rows,
-          'No matches.'
+          q ? 'No matches.' : 'No licenses issued yet — once a buyer purchases or redeems, they appear here.'
         ))
       } catch (e) {
         tableHolder.innerHTML = ''
@@ -1020,26 +1804,174 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       const reason = prompt('Reason (optional):') || ''
       try {
         await api('/v1/admin/licenses/' + l.id + '/' + op, { method: 'POST', body: { reason } })
-        doSearch()
+        loadLicenses()
       } catch (e) { alert(e.message) }
     }
 
-    queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') doSearch() })
+    queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') loadLicenses() })
+
+    // ---------- Manual issue (admin comp / promo / paper-licensed) ----------
+    const issueDisclosure = el('details', { class: 'disclosure' }, [
+      el('summary', null, 'Manually issue a license'),
+      el('div', { class: 'body', id: 'issue-body' },
+        el('div', { class: 'muted', style: 'margin:0' }, 'Loading products + policies…')
+      ),
+    ])
+
+    async function buildIssueForm() {
+      const body = issueDisclosure.querySelector('#issue-body')
+      body.innerHTML = ''
+      let products = []
+      try {
+        const j = await api('/v1/products')
+        products = j.products || []
+      } catch (e) {
+        body.appendChild(err('Could not load products: ' + e.message))
+        return
+      }
+      if (products.length === 0) {
+        body.appendChild(el('p', { class: 'muted', style: 'margin:0' },
+          'Create a product first (Products tab).'))
+        return
+      }
+
+      const productOptions = products.map((p) => ({ value: p.slug, label: p.name + ' (' + p.slug + ')' }))
+      const productSel = formSelect('issue_product', 'Product', productOptions, { required: true })
+      const policySel = formSelect('issue_policy', 'Policy', [{ value: '', label: '— loading —' }], { required: true })
+      const policyHint = el('div', { class: 'hint', style: 'margin-top:-6px; margin-bottom:12px;' }, 'Pick a tier; the license inherits its entitlements + duration + max_machines.')
+      const noteField = formInput('issue_note', 'Internal note (optional)', { hint: 'e.g. "comp", "press", "self-issue Pro for dogfood".' })
+      const emailField = formInput('issue_email', 'Buyer email (optional)', { type: 'email' })
+
+      // Populate policy dropdown when product changes.
+      async function refreshPolicies() {
+        const slug = productSel.querySelector('select').value
+        const sel = policySel.querySelector('select')
+        sel.innerHTML = ''
+        try {
+          const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(slug))
+          const policies = (j.policies || []).filter((p) => p.active)
+          if (policies.length === 0) {
+            const opt = document.createElement('option')
+            opt.value = ''; opt.textContent = '(no active policies on this product)'
+            sel.appendChild(opt)
+            return
+          }
+          policies.forEach((p) => {
+            const opt = document.createElement('option')
+            opt.value = p.slug
+            opt.textContent = p.name + ' (' + p.slug + ')'
+            sel.appendChild(opt)
+          })
+        } catch (e) {
+          const opt = document.createElement('option')
+          opt.value = ''; opt.textContent = 'error: ' + e.message
+          sel.appendChild(opt)
+        }
+      }
+      productSel.querySelector('select').addEventListener('change', refreshPolicies)
+
+      const submitBtn = el('button', { class: 'btn primary', onclick: async function () {
+        const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Issuing…')
+        body.appendChild(status)
+        try {
+          const product_slug = productSel.querySelector('select').value
+          const policy_slug = policySel.querySelector('select').value
+          if (!policy_slug) throw new Error('Pick a policy.')
+          const note = (body.querySelector('[name=issue_note]').value || '').trim()
+          const email = (body.querySelector('[name=issue_email]').value || '').trim()
+          const reqBody = { product_slug, policy_slug }
+          if (note) reqBody.note = note
+          if (email) reqBody.buyer_email = email
+          const j = await api('/v1/admin/licenses', { method: 'POST', body: reqBody })
+          status.remove()
+          showLicenseIssued(j.license_key, j.license_id)
+          loadLicenses()
+        } catch (e) {
+          if (handleTierCap(e)) status.remove()
+          else status.replaceWith(err(e.message))
+        }
+      } }, 'Issue license')
+
+      body.appendChild(productSel)
+      body.appendChild(policySel)
+      body.appendChild(policyHint)
+      body.appendChild(emailField)
+      body.appendChild(noteField)
+      body.appendChild(submitBtn)
+      refreshPolicies()
+    }
+
+    /// Modal showing the just-issued signed license_key with a Copy button
+    /// — the only place this string is ever shown post-issue. Operators
+    /// must save it before closing.
+    function showLicenseIssued(key, id) {
+      const overlay = el('div', {
+        style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+          'display:flex; align-items:center; justify-content:center; padding:20px;',
+      })
+      const card = el('div', {
+        style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+          'border-radius:12px; max-width:560px; width:100%; padding:28px 26px; ' +
+          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+      }, [
+        el('div', { class: 'eyebrow', style: 'color:var(--gold-700); margin-bottom:8px' }, 'License issued'),
+        el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:22px; margin:0 0 6px; color:var(--navy-950); letter-spacing:-0.01em;' }, 'Save the key now'),
+        el('p', { style: 'font-size:13.5px; color:var(--ink-700); line-height:1.55; margin:0 0 14px;' },
+          'This is the only time the signed key is shown. Copy it before closing.'),
+        el('div', {
+          id: 'issued-key-box',
+          style: 'background:var(--navy-950); color:var(--cream-50); padding:14px 16px; ' +
+            'border-radius:8px; font-family:var(--font-mono); font-size:12.5px; ' +
+            'word-break:break-all; line-height:1.5; max-height:200px; overflow-y:auto;',
+        }, key),
+        el('div', { class: 'muted', style: 'margin-top:10px; font-size:12px;' },
+          'License id: ' + (id || '?')),
+        el('div', { style: 'display:flex; gap:10px; margin-top:18px;' }, [
+          el('button', {
+            class: 'btn primary',
+            onclick: async function () {
+              try {
+                await navigator.clipboard.writeText(key)
+                this.textContent = 'Copied'
+                setTimeout(() => { this.textContent = 'Copy license key' }, 1400)
+              } catch {}
+            },
+          }, 'Copy license key'),
+          el('button', {
+            class: 'btn secondary',
+            onclick: () => overlay.remove(),
+          }, 'Close'),
+        ]),
+      ])
+      overlay.appendChild(card)
+      document.body.appendChild(overlay)
+    }
 
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' },
-        'Search by buyer email, Nostr npub, or BTCPay invoice id. Results show all matching licenses with their current state.'),
+        'Showing the 100 most recently issued licenses by default. Search by buyer email, Nostr npub, or BTCPay invoice id to filter.'),
       el('div', { class: 'toolbar' }, [
         fieldSel,
         queryInput,
-        el('button', { class: 'btn primary', onclick: doSearch }, [
+        el('button', { class: 'btn primary', onclick: loadLicenses }, [
           el('i', { 'data-lucide': 'search' }),
           'Search',
         ]),
+        el('button', {
+          class: 'btn secondary',
+          onclick: () => { queryInput.value = ''; loadLicenses() },
+          title: 'Clear search and show recent',
+        }, 'Clear'),
       ]),
+      issueDisclosure,
     ]))
     target.appendChild(tableHolder)
+    buildIssueForm()
     if (window.lucide) lucide.createIcons()
+
+    // Auto-load on tab open — was the bug; tab used to render an empty
+    // search box and never call the backend, hiding all issued licenses.
+    loadLicenses()
   }
 
   // -------- Machines --------
@@ -1261,7 +2193,55 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     a.addEventListener('click', (e) => { e.preventDefault(); setRoute(a.getAttribute('data-route')) })
   })
 
+  async function refreshTierBanner() {
+    const wrap = document.getElementById('tier-banner')
+    const current = document.getElementById('tier-banner-current')
+    const msg = document.getElementById('tier-banner-msg')
+    const cta = document.getElementById('tier-banner-cta')
+    if (!wrap) return
+    try {
+      const t = await api('/v1/admin/tier')
+      // Tier label header.
+      current.textContent = t.tier === 'unlicensed'
+        ? 'Unlicensed'
+        : (t.tier_name || 'Creator') + ' tier'
+      // Body copy + CTA based on tier.
+      if (t.tier === 'patron') {
+        msg.innerHTML = 'You’re a Patron — thank you for funding development.'
+        cta.style.display = 'none'
+      } else if (t.tier === 'pro') {
+        msg.innerHTML = 'Same features as Pro, plus a Patron badge — voluntary upgrade to fund Keysat development.'
+        cta.textContent = 'Become a Patron →'
+        cta.href = t.upgrade_url
+        cta.style.display = 'inline-block'
+      } else if (t.tier === 'creator') {
+        const productCap = (t.caps && t.caps.products) || 5
+        const productUsed = (t.usage && t.usage.products) || 0
+        msg.innerHTML = 'Up to ' + productCap + ' products, ' + productCap +
+          ' policies/product, ' + ((t.caps && t.caps.active_codes) || 5) +
+          ' active codes. Currently using ' + productUsed + '/' + productCap + ' products. ' +
+          'Upgrade for unlimited products, recurring billing, and Zaprite.'
+        cta.textContent = 'Upgrade to Pro →'
+        cta.href = t.upgrade_url
+        cta.style.display = 'inline-block'
+      } else {
+        // Unlicensed.
+        msg.innerHTML = 'Running without a Keysat license. You’re limited to ' +
+          ((t.caps && t.caps.products) || 5) + ' products. ' +
+          'Get a Creator license (free codes available) or upgrade to Pro for unlimited.'
+        cta.textContent = 'Get Keysat license →'
+        cta.href = 'https://licensing.keysat.xyz/buy/keysat'
+        cta.style.display = 'inline-block'
+      }
+      wrap.style.display = 'block'
+    } catch (e) {
+      // Hide silently if endpoint not available (older daemon, etc.)
+      wrap.style.display = 'none'
+    }
+  }
+
   async function refreshSidebarFooter() {
+    refreshTierBanner()
     const f = document.getElementById('sidebar-footer')
     try {
       const s = await api('/v1/admin/btcpay/status')
@@ -1289,10 +2269,22 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     }
   }
 
+  // sessionAuth = true means the browser has a valid keysat_session cookie;
+  // the server-side middleware handles bridging it to the API-key auth used
+  // by all admin handlers. apiKey is only set in the legacy fallback path
+  // (first-time login on a fresh install before a password has been set).
+  let sessionAuth = false
+
+  function whoLabel() {
+    if (sessionAuth) return 'signed in'
+    if (apiKey) return apiKey.slice(0, 6) + '…' + apiKey.slice(-4)
+    return ''
+  }
+
   function showApp() {
     document.getElementById('login-view').classList.add('hide')
     document.getElementById('app-view').classList.remove('hide')
-    document.getElementById('who').textContent = apiKey.slice(0, 6) + '…' + apiKey.slice(-4)
+    document.getElementById('who').textContent = whoLabel()
     fetch('/').then((r) => r.json()).then((j) => {
       serviceInfo = j
     }).catch(() => {}).finally(() => {
@@ -1303,17 +2295,83 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     refreshSidebarFooter()
   }
 
-  function showLogin() {
+  async function showLogin() {
     document.getElementById('login-view').classList.remove('hide')
     document.getElementById('app-view').classList.add('hide')
+    const errEl = document.getElementById('login-err')
+    errEl.classList.add('hide')
+    // Pick which login mode to show based on whether a password is configured.
+    let status
+    try {
+      const r = await fetch('/admin/login/status', { credentials: 'same-origin' })
+      status = await r.json()
+    } catch {
+      status = { has_password: false, logged_in: false }
+    }
+    const sub = document.getElementById('login-sub')
+    const pwBox = document.getElementById('login-pw')
+    const keyBox = document.getElementById('login-key')
+    if (status.has_password) {
+      pwBox.classList.remove('hide')
+      keyBox.classList.add('hide')
+      sub.textContent = 'Sign in with your web UI password.'
+      setTimeout(() => document.getElementById('pw').focus(), 0)
+    } else {
+      pwBox.classList.add('hide')
+      keyBox.classList.remove('hide')
+      sub.textContent = 'No web UI password set yet. Sign in with the API key, then set a password via the StartOS action.'
+      setTimeout(() => document.getElementById('api-key').focus(), 0)
+    }
   }
 
+  // ---- Password login (preferred) ----
+  document.getElementById('login-pw-btn').addEventListener('click', async () => {
+    const errEl = document.getElementById('login-err')
+    errEl.classList.add('hide')
+    const password = document.getElementById('pw').value
+    if (!password) { errEl.textContent = 'Enter your password.'; errEl.classList.remove('hide'); return }
+    try {
+      const r = await fetch('/admin/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      })
+      if (r.status === 204) {
+        sessionAuth = true
+        apiKey = ''
+        // Probe an admin endpoint to confirm the cookie works end-to-end.
+        await api('/v1/admin/audit?limit=1')
+        showApp()
+      } else if (r.status === 401) {
+        throw new Error('Wrong password')
+      } else if (r.status === 429) {
+        throw new Error('Too many login attempts. Try again in a few minutes.')
+      } else if (r.status === 503) {
+        throw new Error('Web UI password not set. Use the StartOS action to set one.')
+      } else {
+        let msg = 'HTTP ' + r.status
+        try { const j = await r.json(); msg = j.message || j.error || msg } catch {}
+        throw new Error(msg)
+      }
+    } catch (e) {
+      sessionAuth = false
+      errEl.textContent = e.message
+      errEl.classList.remove('hide')
+    }
+  })
+  document.getElementById('pw').addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') document.getElementById('login-pw-btn').click()
+  })
+
+  // ---- API-key fallback (first-run only) ----
   document.getElementById('login-btn').addEventListener('click', async () => {
     const errEl = document.getElementById('login-err')
     errEl.classList.add('hide')
     const k = document.getElementById('api-key').value.trim()
     if (!k) { errEl.textContent = 'Enter your admin API key.'; errEl.classList.remove('hide'); return }
     apiKey = k
+    sessionAuth = false
     try {
       await api('/v1/admin/audit?limit=1')
       localStorage.setItem(LS_KEY, k)
@@ -1327,20 +2385,50 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   document.getElementById('api-key').addEventListener('keypress', (e) => {
     if (e.key === 'Enter') document.getElementById('login-btn').click()
   })
-  document.getElementById('logout').addEventListener('click', () => {
+
+  document.getElementById('logout').addEventListener('click', async () => {
+    if (sessionAuth) {
+      try { await fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' }) } catch {}
+    }
+    sessionAuth = false
     localStorage.removeItem(LS_KEY)
     apiKey = ''
-    document.getElementById('api-key').value = ''
+    const apiKeyInput = document.getElementById('api-key'); if (apiKeyInput) apiKeyInput.value = ''
+    const pwInput = document.getElementById('pw'); if (pwInput) pwInput.value = ''
     showLogin()
   })
 
-  const saved = localStorage.getItem(LS_KEY)
-  if (saved) {
-    apiKey = saved
-    api('/v1/admin/audit?limit=1').then(showApp).catch(() => { apiKey = ''; localStorage.removeItem(LS_KEY); showLogin() })
-  } else {
+  // On first load: prefer cookie session if valid, else fall through to
+  // saved API key, else show the login form.
+  ;(async function bootstrap() {
+    let status = null
+    try {
+      status = await (await fetch('/admin/login/status', { credentials: 'same-origin' })).json()
+    } catch {}
+    if (status && status.logged_in) {
+      sessionAuth = true
+      try {
+        await api('/v1/admin/audit?limit=1')
+        showApp()
+        return
+      } catch {
+        sessionAuth = false
+      }
+    }
+    const saved = localStorage.getItem(LS_KEY)
+    if (saved) {
+      apiKey = saved
+      try {
+        await api('/v1/admin/audit?limit=1')
+        showApp()
+        return
+      } catch {
+        apiKey = ''
+        localStorage.removeItem(LS_KEY)
+      }
+    }
     showLogin()
-  }
+  })()
 
   if (window.lucide) lucide.createIcons()
 })()

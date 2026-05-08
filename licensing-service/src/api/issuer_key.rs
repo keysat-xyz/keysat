@@ -1,4 +1,4 @@
-//! Admin-only issuer-key import endpoint.
+//! Issuer-key endpoints — public read of the public key, admin-only import.
 //!
 //! Used exactly once, by exactly one operator: when bootstrapping a
 //! "master Keysat" instance (the one that issues licenses for the Keysat
@@ -147,4 +147,19 @@ pub async fn import(
                     key to take effect — until then, in-memory state still holds \
                     the previous keypair."
     })))
+}
+
+
+/// PUBLIC: GET /v1/issuer/public-key — returns the daemon's signing
+/// public key in PEM and a couple of conveniences. No auth required —
+/// the public key is, by definition, public. Used by SDK consumers and
+/// by the admin Overview's "Embed your public key" tip card.
+pub async fn public(
+    axum::extract::State(state): axum::extract::State<crate::api::AppState>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "public_key_pem": state.keypair.public_key_pem,
+        "key_algorithm": "ed25519",
+        "key_format_version": crate::crypto::KEY_VERSION,
+    }))
 }

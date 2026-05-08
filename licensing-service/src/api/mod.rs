@@ -26,6 +26,8 @@
 //! | POST   | `/v1/admin/licenses`                   | manually issue license (comp/dev)           |
 //! | GET    | `/v1/admin/licenses`                   | list licenses by product                    |
 //! | GET    | `/v1/admin/licenses/search`            | search by email / npub / invoice            |
+//! | GET    | `/v1/admin/licenses/summary`           | aggregate counts (total/active/24h/7d)      |
+//! | GET    | `/v1/admin/revenue/summary`            | lifetime / 30d / 7d / 24h sats earned       |
 //! | POST   | `/v1/admin/licenses/:id/revoke`        | revoke a license                            |
 //! | POST   | `/v1/admin/licenses/:id/suspend`       | suspend (reversible)                        |
 //! | POST   | `/v1/admin/licenses/:id/unsuspend`     | unsuspend                                   |
@@ -42,12 +44,18 @@
 //! | GET    | `/v1/admin/discount-codes`             | list discount codes                         |
 //! | GET    | `/v1/admin/discount-codes/:id`         | one code with redemption history            |
 //! | PATCH  | `/v1/admin/discount-codes/:id/active`  | enable / disable code                       |
+//! | PATCH  | `/v1/admin/discount-codes/:id`         | edit amount / max_uses / expires / desc     |
 //! | DELETE | `/v1/admin/discount-codes/:id`         | hard-delete (refused if redeemed)           |
 //! | GET    | `/v1/discount-codes/preview`           | PUBLIC: preview discount on a product       |
 //! | GET    | `/v1/admin/audit`                      | list audit log entries                      |
+//! | POST   | `/admin/login`                         | PUBLIC: web UI password login (sets cookie) |
+//! | POST   | `/admin/logout`                        | clear session cookie                        |
+//! | GET    | `/admin/login/status`                  | PUBLIC: {has_password, logged_in}           |
+//! | POST   | `/v1/admin/web-password`               | admin-only: set/rotate web UI password      |
 
 pub mod admin;
 pub mod admin_ui;
+pub mod auth;
 pub mod btcpay_authorize;
 pub mod discount_codes;
 pub mod machines;
@@ -58,6 +66,8 @@ pub mod buy_page;
 pub mod issuer_key;
 pub mod redeem;
 pub mod self_license;
+pub mod session_layer;
+pub mod tier;
 pub mod validate;
 pub mod webhook;
 pub mod webhook_endpoints;
@@ -207,6 +217,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/admin/products", post(admin::create_product))
         .route(
+            "/v1/admin/products/:id",
+            patch(admin::update_product).delete(admin::delete_product),
+        )
+        .route(
             "/v1/admin/products/:id/active",
             patch(admin::set_product_active),
         )
@@ -219,6 +233,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/admin/licenses/search",
             get(admin::search_licenses),
+        )
+        .route(
+            "/v1/admin/licenses/summary",
+            get(admin::licenses_summary),
+        )
+        .route(
+            "/v1/admin/licenses/counts",
+            get(admin::license_counts),
+        )
+        .route(
+            "/v1/admin/revenue/summary",
+            get(admin::revenue_summary),
         )
         .route(
             "/v1/admin/licenses/:id/revoke",
@@ -238,12 +264,25 @@ pub fn router(state: AppState) -> Router {
             get(policies::list).post(policies::create),
         )
         .route(
+            "/v1/admin/policies/:id",
+            patch(policies::update).delete(policies::delete),
+        )
+        .route(
             "/v1/admin/policies/:id/active",
             patch(policies::set_active),
         )
         .route(
+            "/v1/admin/policies/:id/public",
+            patch(policies::set_public),
+        )
+        .route(
             "/v1/admin/policies/:id/tip",
             patch(policies::set_tip),
+        )
+        // Public tier listing — drives the /buy/<slug> tier picker.
+        .route(
+            "/v1/products/:slug/policies",
+            get(policies::list_public_policies),
         )
         .route("/v1/admin/tips", get(policies::list_tips))
         // Machines (admin views).
@@ -272,7 +311,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/v1/admin/discount-codes/:id",
-            get(discount_codes::get_one).delete(discount_codes::delete),
+            get(discount_codes::get_one)
+                .patch(discount_codes::update)
+                .delete(discount_codes::delete),
         )
         .route(
             "/v1/admin/discount-codes/:id/active",
@@ -300,6 +341,23 @@ pub fn router(state: AppState) -> Router {
         // Issuer-key import — admin-only, master-bootstrap path. No
         // StartOS Action surface; documented in MASTER_KEYPAIR_PROCEDURE.md.
         .route("/v1/admin/import-issuer-key", post(issuer_key::import))
+        // Public read of the issuer's signing public key — used by the
+        // admin Overview "Embed your public key" tip and by SDK consumers.
+        .route("/v1/issuer/public-key", get(issuer_key::public))
+        // Tier model — drives the admin sidebar's persistent upgrade banner.
+        .route("/v1/admin/tier", get(tier::admin_status))
+        // Web-UI password auth (v0.1.0:28+).
+        .route("/admin/login", post(auth::login))
+        .route("/admin/logout", post(auth::logout))
+        .route("/admin/login/status", get(auth::login_status))
+        .route("/v1/admin/web-password", post(auth::set_password))
+        // Bridge cookie-based sessions onto the existing API-key require_admin
+        // guard. Has to be the last layer so it runs first (axum applies
+        // layers in reverse-of-declaration order).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            session_layer::session_to_bearer,
+        ))
         .with_state(state)
 }
 
@@ -461,6 +519,15 @@ h1 {{
   border-radius:7px; padding:8px 12px;
   color:var(--ink-700); text-align:center;
 }}
+.invoice-ref {{
+  margin-top:12px; padding:8px 12px;
+  font-family:var(--font-mono); font-size:11.5px;
+  color:var(--ink-500); text-align:center;
+}}
+.invoice-ref code {{
+  background:var(--cream-100); border:1px solid var(--border-1);
+  padding:1px 6px; border-radius:5px; color:var(--ink-700);
+}}
 .license-success h2 {{
   font-family:var(--font-display); font-weight:500; font-size:22px;
   color:var(--navy-950); margin:0 0 6px; letter-spacing:-0.015em; text-align:center;
@@ -521,16 +588,17 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   <div class="pending-card" id="pending-card">
     <div class="stamp">&mdash; Awaiting confirmation &mdash;</div>
     <h2>Hang tight.</h2>
-    <p class="sub">This page will refresh automatically when your license is ready.</p>
+    <p class="sub">This page will refresh automatically when your license is ready. Safe to bookmark this URL and come back later — your license will be here.</p>
     <div class="spinner" aria-hidden="true"></div>
     <div class="status-detail" id="status-detail">checking status&hellip;</div>
+    <div class="invoice-ref" id="invoice-ref"></div>
   </div>
 
   <!-- success state: license card -->
   <div class="license-success hide" id="license-success" role="region" aria-label="License issued">
     <div class="stamp">&mdash; License issued &mdash;</div>
     <h2>You&rsquo;re licensed.</h2>
-    <p class="sub">Your signed license is below. We&rsquo;ll also email a copy.</p>
+    <p class="sub">Your signed license is below. Save it before closing this tab.</p>
     <div class="field-label">License key</div>
     <div class="key-box">
       <span class="key-text" id="license-key-text">&hellip;</span>
@@ -569,6 +637,11 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   const errorMsg = document.getElementById('error-msg');
   const pageTitle = document.getElementById('page-title');
   const pageLede = document.getElementById('page-lede');
+  const invoiceRef = document.getElementById('invoice-ref');
+  if (invoiceRef) {{
+    invoiceRef.innerHTML = 'Reference for support: <code>' +
+      INVOICE_ID.replace(/[<>&]/g, '') + '</code>';
+  }}
 
   // Copy button.
   document.getElementById('license-key-copy').addEventListener('click', async function() {{
@@ -596,8 +669,35 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     pageLede.textContent = 'See the message below for details.';
   }}
 
+  // Adaptive polling: tight cadence for the first 2 minutes (most invoices
+  // settle within one block), then back off so a slow block + clearnet flake
+  // doesn't burn battery/data on the buyer's phone. URL is bookmark-friendly:
+  // a buyer can close this tab and return any time — polling resumes from
+  // wherever the invoice currently is.
   let attempt = 0;
-  const MAX_ATTEMPTS = 240; // 240 * 3s = 12 min total. Most settle inside 1.
+  let elapsedMs = 0;
+  const TIGHT_MS = 3000;     // 0–2 min  → poll every 3s
+  const MED_MS   = 10000;    // 2–10 min → poll every 10s
+  const SLOW_MS  = 30000;    // 10–30 min→ poll every 30s
+  const TIGHT_DEADLINE = 2  * 60 * 1000;
+  const MED_DEADLINE   = 10 * 60 * 1000;
+  const HARD_DEADLINE  = 30 * 60 * 1000;
+
+  function nextDelay() {{
+    if (elapsedMs < TIGHT_DEADLINE) return TIGHT_MS;
+    if (elapsedMs < MED_DEADLINE)   return MED_MS;
+    return SLOW_MS;
+  }}
+
+  function waitingCopy(status) {{
+    const min = Math.floor(elapsedMs / 60000);
+    if (status === 'pending' || status === 'processing') {{
+      if (min < 2) return 'invoice ' + status + ' — should settle within a block (~10 min).';
+      if (min < 10) return 'invoice ' + status + ' — waiting for block confirmation. Safe to leave this tab open or bookmark this URL and come back.';
+      return 'invoice ' + status + ' — slow block. Still polling. Bookmark this URL and refresh later if you close the tab.';
+    }}
+    return 'invoice status: ' + (status || 'pending');
+  }}
 
   async function poll() {{
     attempt++;
@@ -615,9 +715,9 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
         return showSuccess(j.license_key);
       }}
       const status = j.status || 'pending';
-      statusDetail.textContent = 'invoice status: ' + status + (attempt > 1 ? ' (still polling)' : '');
+      statusDetail.textContent = waitingCopy(status);
       if (status === 'expired' || status === 'invalid') {{
-        return showError('Payment was not completed (status: ' + status + '). If you sent funds, contact the seller.');
+        return showError('Payment was not completed (status: ' + status + '). If you sent funds, contact the seller and reference your invoice id above.');
       }}
       scheduleNext();
     }} catch (err) {{
@@ -626,11 +726,14 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     }}
   }}
   function scheduleNext() {{
-    if (attempt >= MAX_ATTEMPTS) {{
-      statusDetail.textContent = 'still waiting — refresh the page or come back later.';
+    if (elapsedMs >= HARD_DEADLINE) {{
+      statusDetail.textContent =
+        'still waiting after 30 minutes. Bookmark this URL and refresh in a few minutes — your license will appear automatically once the invoice settles. If you still see this in an hour, contact the seller and reference the invoice id at the top of this page.';
       return;
     }}
-    setTimeout(poll, 3000);
+    const d = nextDelay();
+    elapsedMs += d;
+    setTimeout(poll, d);
   }}
   poll();
 }})();

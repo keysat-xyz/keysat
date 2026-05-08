@@ -21,6 +21,15 @@ use subtle::ConstantTimeEq;
 /// SHA-256 hex of the token on success so handlers can write an audit row
 /// that identifies *which* credential made the call without logging the raw
 /// key.
+///
+/// Cookie-based session authentication is layered on top of this via the
+/// `session_to_bearer_layer` axum middleware (see `crate::api::session_layer`):
+/// when the SPA presents a valid `keysat_session` cookie, that middleware
+/// injects an `Authorization: Bearer <api_key>` header on the way in, so
+/// `require_admin` keeps working unchanged. The audit log limitation is
+/// that all cookie-authenticated calls show the API key's sha256 as the
+/// actor — IP / user-agent on the same row distinguish sessions in
+/// practice. A v0.2 follow-up adds proper per-session actor identity.
 pub fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<String> {
     let header_val = headers
         .get(header::AUTHORIZATION)
@@ -77,6 +86,8 @@ pub async fn create_product(
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_admin(&state, &headers)?;
     let (ip, ua) = request_context(&headers);
+    // Tier-cap gate: Creator caps at 5 products. 402 if over.
+    crate::api::tier::enforce_product_cap(&state).await?;
     if req.price_sats <= 0 {
         return Err(AppError::BadRequest("price_sats must be positive".into()));
     }
@@ -118,6 +129,227 @@ pub async fn create_product(
 #[derive(Debug, Deserialize)]
 pub struct SetActiveReq {
     pub active: bool,
+}
+
+/// Query options for product / policy delete.
+#[derive(Debug, Deserialize)]
+pub struct DeleteOpts {
+    /// When true, cascades through every dependent row — licenses,
+    /// invoices, discount-code redemptions, machines — instead of
+    /// refusing with 409. Use only when tinkering or wiping pre-launch
+    /// test data; in production this destroys customer history.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Hard-delete a product. Two modes:
+///
+/// - **Safe (default)**: refuses if any invoice or license references
+///   the product. Policies and unredeemed product-scoped codes are
+///   cascade-deleted along with the product (templates only — no
+///   audit-trail value on their own).
+///
+/// - **Force (`?force=true`)**: also wipes machines → discount
+///   redemptions → licenses → invoices in dependency order before
+///   removing the product. Destructive; reserved for testing /
+///   pre-launch cleanup. Audit log records the cascade counts for
+///   forensic backtracking.
+pub async fn delete_product(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(opts): Query<DeleteOpts>,
+) -> AppResult<Json<Value>> {
+    let actor_hash = require_admin(&state, &headers)?;
+    let (ip, ua) = request_context(&headers);
+
+    let product = repo::get_product_by_id(&state.db, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("product '{id}'")))?;
+
+    let invoice_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE product_id = ?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await?;
+    let license_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM licenses WHERE product_id = ?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await?;
+    if !opts.force && invoice_count + license_count > 0 {
+        return Err(AppError::Conflict(format!(
+            "cannot delete product '{}' — it has {} invoice(s) and {} license(s) \
+             referencing it. Disable it instead (existing licenses keep working; \
+             the product just stops being available for new purchases). To override \
+             and wipe all references, use ?force=true.",
+            product.slug, invoice_count, license_count
+        )));
+    }
+
+    // Count what we'll cascade — informational, for the audit row + response.
+    let policy_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM policies WHERE product_id = ?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await?;
+    let code_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM discount_codes WHERE applies_to_product_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    let machine_count: i64 = if opts.force {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM machines WHERE license_id IN
+             (SELECT id FROM licenses WHERE product_id = ?)",
+        )
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await?
+    } else {
+        0
+    };
+    let redemption_count: i64 = if opts.force {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM discount_redemptions WHERE invoice_id IN
+             (SELECT id FROM invoices WHERE product_id = ?)",
+        )
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await?
+    } else {
+        0
+    };
+
+    // Cascade. Wrapped in a transaction so a partial failure leaves
+    // consistent state.
+    let mut tx = state.db.begin().await?;
+    if opts.force {
+        // Force: also wipe customer-history rows. Order matters — most
+        // dependent rows first.
+        sqlx::query(
+            "DELETE FROM machines WHERE license_id IN
+             (SELECT id FROM licenses WHERE product_id = ?)",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM discount_redemptions WHERE invoice_id IN
+             (SELECT id FROM invoices WHERE product_id = ?)",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM licenses WHERE product_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM invoices WHERE product_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM discount_codes WHERE applies_to_product_id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM policies WHERE product_id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM products WHERE id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    let _ = repo::insert_audit(
+        &state.db,
+        "admin_api_key",
+        Some(&actor_hash),
+        if opts.force { "product.force_delete" } else { "product.delete" },
+        Some("product"),
+        Some(&id),
+        ip.as_deref(),
+        ua.as_deref(),
+        &json!({
+            "slug": product.slug,
+            "name": product.name,
+            "force": opts.force,
+            "cascaded_policies": policy_count,
+            "cascaded_codes": code_count,
+            "cascaded_licenses": if opts.force { license_count } else { 0 },
+            "cascaded_invoices": if opts.force { invoice_count } else { 0 },
+            "cascaded_machines": machine_count,
+            "cascaded_redemptions": redemption_count,
+        }),
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": true,
+        "deleted": product.slug,
+        "force": opts.force,
+        "cascaded_policies": policy_count,
+        "cascaded_codes": code_count,
+        "cascaded_licenses": if opts.force { license_count } else { 0 },
+        "cascaded_invoices": if opts.force { invoice_count } else { 0 },
+        "cascaded_machines": machine_count,
+        "cascaded_redemptions": redemption_count,
+    })))
+}
+
+/// Patch mutable fields on a product. Slug is NOT editable — it's part
+/// of the public buy URL.
+#[derive(Debug, Deserialize)]
+pub struct UpdateProductReq {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub price_sats: Option<i64>,
+}
+
+pub async fn update_product(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateProductReq>,
+) -> AppResult<Json<Value>> {
+    let actor_hash = require_admin(&state, &headers)?;
+    let (ip, ua) = request_context(&headers);
+    if let Some(p) = req.price_sats {
+        if p < 0 {
+            return Err(AppError::BadRequest("price_sats must be >= 0".into()));
+        }
+    }
+    let updated = repo::update_product(
+        &state.db,
+        &id,
+        req.name.as_deref(),
+        req.description.as_deref(),
+        req.price_sats,
+    )
+    .await?;
+    let _ = repo::insert_audit(
+        &state.db,
+        "admin_api_key",
+        Some(&actor_hash),
+        "product.update",
+        Some("product"),
+        Some(&id),
+        ip.as_deref(),
+        ua.as_deref(),
+        &json!({
+            "name": req.name,
+            "description": req.description,
+            "price_sats": req.price_sats,
+        }),
+    )
+    .await;
+    Ok(Json(json!(updated)))
 }
 
 pub async fn set_product_active(
@@ -170,7 +402,11 @@ pub struct SearchLicensesQuery {
 
 /// Free-form lookup used by the "lost key recovery" flow. Searches by email,
 /// Nostr npub, or invoice id (whichever is supplied), returns up to 100
-/// matching licenses.
+/// matching licenses. With no filters supplied, returns the 100 most-recent
+/// licenses (used by the admin UI's "recent licenses" default view).
+///
+/// Each row is hydrated with `policy_slug`, `policy_name`, and `product_slug`
+/// so the admin UI can render those without extra round-trips.
 pub async fn search_licenses(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -184,7 +420,189 @@ pub async fn search_licenses(
         q.invoice_id.as_deref(),
     )
     .await?;
-    Ok(Json(json!({ "licenses": licenses })))
+
+    // Hydrate with policy + product slugs. Two small lookup queries against
+    // the unique ids referenced; cheap even for the 100-row max page.
+    let policy_ids: Vec<String> = licenses
+        .iter()
+        .filter_map(|l| l.policy_id.clone())
+        .collect();
+    let product_ids: Vec<String> = licenses
+        .iter()
+        .map(|l| l.product_id.clone())
+        .collect();
+
+    let mut policy_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    if !policy_ids.is_empty() {
+        let placeholders = vec!["?"; policy_ids.len()].join(",");
+        let sql = format!("SELECT id, slug, name FROM policies WHERE id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String, String, String)>(&sql);
+        for id in &policy_ids {
+            q = q.bind(id);
+        }
+        for (id, slug, name) in q.fetch_all(&state.db).await? {
+            policy_map.insert(id, (slug, name));
+        }
+    }
+
+    let mut product_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if !product_ids.is_empty() {
+        let placeholders = vec!["?"; product_ids.len()].join(",");
+        let sql = format!("SELECT id, slug FROM products WHERE id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for id in &product_ids {
+            q = q.bind(id);
+        }
+        for (id, slug) in q.fetch_all(&state.db).await? {
+            product_map.insert(id, slug);
+        }
+    }
+
+    let enriched: Vec<Value> = licenses
+        .into_iter()
+        .map(|l| {
+            let mut v = serde_json::to_value(&l).unwrap_or(json!({}));
+            if let Some(pid) = &l.policy_id {
+                if let Some((slug, name)) = policy_map.get(pid) {
+                    v["policy_slug"] = json!(slug);
+                    v["policy_name"] = json!(name);
+                }
+            }
+            if let Some(slug) = product_map.get(&l.product_id) {
+                v["product_slug"] = json!(slug);
+            }
+            v
+        })
+        .collect();
+
+    Ok(Json(json!({ "licenses": enriched })))
+}
+
+/// Lifetime / 30d / 7d / 24h revenue from settled BTCPay invoices stored
+/// locally. Powers the admin Overview "Revenue" stat card. Free-license
+/// invoices have amount_sats = 0 and don't contribute. We deliberately
+/// don't call the BTCPay API here — the local DB has every invoice we
+/// ever created, including amount and status, so summing locally is
+/// faster and works even if BTCPay is temporarily unreachable. (If we
+/// ever want refunds / fees / chargebacks / Lightning vs on-chain
+/// breakdown, that's when we'd hit BTCPay's API.)
+pub async fn revenue_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM invoices WHERE status = 'settled'",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    let last_24h: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM invoices
+         WHERE status = 'settled' AND updated_at >= datetime('now','-24 hours')",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    let last_7d: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM invoices
+         WHERE status = 'settled' AND updated_at >= datetime('now','-7 days')",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    let last_30d: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM invoices
+         WHERE status = 'settled' AND updated_at >= datetime('now','-30 days')",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    let settled_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE status = 'settled' AND amount_sats > 0")
+            .fetch_one(&state.db)
+            .await?;
+    Ok(Json(json!({
+        "total_sats": total,
+        "last_24h_sats": last_24h,
+        "last_7d_sats": last_7d,
+        "last_30d_sats": last_30d,
+        "settled_paid_invoice_count": settled_count,
+    })))
+}
+
+/// License counts grouped by product_id and policy_id. Powers the
+/// "X licenses" badge on the Products and Policies tables. Two small
+/// COUNT-by-group queries; cheap to run on every Products/Policies route
+/// open.
+pub async fn license_counts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let by_product: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT product_id, COUNT(*) FROM licenses GROUP BY product_id",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let by_policy: Vec<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT policy_id, COUNT(*) FROM licenses GROUP BY policy_id",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let by_product_map: serde_json::Map<String, Value> = by_product
+        .into_iter()
+        .map(|(id, n)| (id, Value::from(n)))
+        .collect();
+    let by_policy_map: serde_json::Map<String, Value> = by_policy
+        .into_iter()
+        .filter_map(|(id, n)| id.map(|i| (i, Value::from(n))))
+        .collect();
+    Ok(Json(json!({
+        "by_product": by_product_map,
+        "by_policy": by_policy_map,
+    })))
+}
+
+/// Aggregate counts for the admin Overview dashboard. Populates the
+/// "Active licenses" stat card (and is small/cheap enough to query on
+/// every dashboard load).
+pub async fn licenses_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    require_admin(&state, &headers)?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await?;
+    let active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM licenses WHERE status = 'active'")
+            .fetch_one(&state.db)
+            .await?;
+    let suspended: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM licenses WHERE status = 'suspended'")
+            .fetch_one(&state.db)
+            .await?;
+    let revoked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM licenses WHERE status = 'revoked'")
+            .fetch_one(&state.db)
+            .await?;
+    let last_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM licenses WHERE issued_at >= datetime('now','-24 hours')",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    let last_7d: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM licenses WHERE issued_at >= datetime('now','-7 days')",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(json!({
+        "total": total,
+        "active": active,
+        "suspended": suspended,
+        "revoked": revoked,
+        "last_24h": last_24h,
+        "last_7d": last_7d,
+    })))
 }
 
 #[derive(Debug, Deserialize)]

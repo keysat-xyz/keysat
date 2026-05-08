@@ -57,6 +57,11 @@ pub struct Invoice {
     pub checkout_url: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Policy chosen by the buyer at purchase time. NULL on pre-:27 invoices,
+    /// in which case `issue_license_for_invoice` falls back to picking the
+    /// product's default policy. Migration 0007 adds the column.
+    #[serde(default)]
+    pub policy_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,9 +140,18 @@ pub struct Policy {
     pub tip_pct_bps: i64,
     /// Free-form label for the tip recipient — surfaced in the audit log.
     pub tip_label: Option<String>,
+    /// When true, the policy is rendered on /buy/<product-slug> as a
+    /// selectable tier card. Operators can mark "Comp / press" or
+    /// "Internal team seat" policies as private to keep them off the
+    /// public buy page while still issuing them via admin tooling.
+    /// Defaults to true; migration 0007 adds this column.
+    #[serde(default = "default_true")]
+    pub public: bool,
     pub created_at: String,
     pub updated_at: String,
 }
+
+fn default_true() -> bool { true }
 
 /// A machine activated under a license. One row per active install.
 #[derive(Debug, Clone, Serialize, Deserialize)]

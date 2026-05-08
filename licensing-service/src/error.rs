@@ -35,6 +35,23 @@ pub enum AppError {
     #[error("BTCPay not configured: connect via the StartOS dashboard first")]
     BtcpayNotConfigured,
 
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    /// 402 Payment Required — used for tier-gate enforcement when the
+    /// operator's Keysat self-license doesn't include the entitlement
+    /// or capacity needed for the requested operation. The fields are
+    /// surfaced in the JSON body so the admin SPA can render an upgrade
+    /// CTA without parsing the message string.
+    #[error("payment required: {message}")]
+    PaymentRequired {
+        message: String,
+        upgrade_url: String,
+    },
+
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -53,17 +70,31 @@ impl IntoResponse for AppError {
             AppError::LicenseInvalid(_) => (StatusCode::OK, "invalid"),
             AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             AppError::BtcpayNotConfigured => (StatusCode::SERVICE_UNAVAILABLE, "btcpay_not_configured"),
+            AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+            AppError::PaymentRequired { .. } => (StatusCode::PAYMENT_REQUIRED, "tier_cap"),
             AppError::Database(_) | AppError::Internal(_) => {
                 tracing::error!(error = %self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }
         };
 
-        let body = Json(json!({
-            "ok": false,
-            "error": code,
-            "message": self.to_string(),
-        }));
+        // Tier-cap 402 carries a structured upgrade_url alongside the
+        // message so the SPA can render an upgrade-CTA button without
+        // having to parse a URL out of the human-facing message.
+        let body = match &self {
+            AppError::PaymentRequired { message, upgrade_url } => Json(json!({
+                "ok": false,
+                "error": code,
+                "message": message,
+                "upgrade_url": upgrade_url,
+            })),
+            _ => Json(json!({
+                "ok": false,
+                "error": code,
+                "message": self.to_string(),
+            })),
+        };
 
         (status, body).into_response()
     }

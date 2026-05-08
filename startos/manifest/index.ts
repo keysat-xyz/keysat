@@ -13,7 +13,7 @@ import { short, long } from './i18n'
 
 export const manifest = setupManifest({
   id: 'keysat',
-  title: 'Keysat',
+  title: 'Keysat Licensing',
   license: 'LicenseRef-Proprietary',
   packageRepo: 'https://github.com/keysat-xyz/keysat-startos',
   upstreamRepo: 'https://github.com/keysat-xyz/keysat',

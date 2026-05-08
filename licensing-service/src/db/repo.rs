@@ -100,6 +100,55 @@ pub async fn set_product_active(pool: &SqlitePool, id: &str, active: bool) -> Ap
     Ok(())
 }
 
+/// Patch mutable fields on a product. `slug` and `id` are intentionally
+/// not editable — slug is part of the public buy URL, and changing it
+/// would break links operators have shared. Each Option is "Some →
+/// update, None → leave alone."
+pub async fn update_product(
+    pool: &SqlitePool,
+    id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    price_sats: Option<i64>,
+) -> AppResult<Product> {
+    let mut sets: Vec<&str> = Vec::new();
+    if name.is_some() {
+        sets.push("name = ?");
+    }
+    if description.is_some() {
+        sets.push("description = ?");
+    }
+    if price_sats.is_some() {
+        sets.push("price_sats = ?");
+    }
+    if sets.is_empty() {
+        return get_product_by_id(pool, id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("product {id}")));
+    }
+    sets.push("updated_at = ?");
+    let now = Utc::now().to_rfc3339();
+    let sql = format!("UPDATE products SET {} WHERE id = ?", sets.join(", "));
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = name {
+        q = q.bind(v);
+    }
+    if let Some(v) = description {
+        q = q.bind(v);
+    }
+    if let Some(v) = price_sats {
+        q = q.bind(v);
+    }
+    q = q.bind(&now).bind(id);
+    let rows = q.execute(pool).await?.rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("product {id}")));
+    }
+    get_product_by_id(pool, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("product {id}")))
+}
+
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
     let metadata_json: String = row.try_get("metadata_json")?;
     let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap_or_default();
@@ -119,6 +168,7 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
 
 // ---------- Invoices ----------
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_invoice(
     pool: &SqlitePool,
     id: &str,
@@ -128,12 +178,14 @@ pub async fn create_invoice(
     checkout_url: &str,
     buyer_email: Option<&str>,
     buyer_note: Option<&str>,
+    policy_id: Option<&str>,
 ) -> AppResult<Invoice> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO invoices
-         (id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note, amount_sats, checkout_url, created_at, updated_at)
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+         (id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
+          amount_sats, checkout_url, policy_id, created_at, updated_at)
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(btcpay_invoice_id)
@@ -142,6 +194,7 @@ pub async fn create_invoice(
     .bind(buyer_note)
     .bind(amount_sats)
     .bind(checkout_url)
+    .bind(policy_id)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -162,6 +215,7 @@ pub async fn create_free_invoice(
     product_id: &str,
     buyer_email: Option<&str>,
     buyer_note: Option<&str>,
+    policy_id: Option<&str>,
 ) -> AppResult<Invoice> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -169,14 +223,15 @@ pub async fn create_free_invoice(
     sqlx::query(
         "INSERT INTO invoices
          (id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-          amount_sats, checkout_url, created_at, updated_at)
-         VALUES (?, ?, ?, 'settled', ?, ?, 0, '', ?, ?)",
+          amount_sats, checkout_url, policy_id, created_at, updated_at)
+         VALUES (?, ?, ?, 'settled', ?, ?, 0, '', ?, ?, ?)",
     )
     .bind(&id)
     .bind(&synthetic_btcpay_id)
     .bind(product_id)
     .bind(buyer_email)
     .bind(buyer_note)
+    .bind(policy_id)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -189,7 +244,7 @@ pub async fn create_free_invoice(
 pub async fn get_invoice_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Invoice>> {
     let row = sqlx::query(
         "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at
+                amount_sats, checkout_url, created_at, updated_at, policy_id
          FROM invoices WHERE id = ?",
     )
     .bind(id)
@@ -204,7 +259,7 @@ pub async fn get_invoice_by_btcpay_id(
 ) -> AppResult<Option<Invoice>> {
     let row = sqlx::query(
         "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at
+                amount_sats, checkout_url, created_at, updated_at, policy_id
          FROM invoices WHERE btcpay_invoice_id = ?",
     )
     .bind(btcpay_invoice_id)
@@ -240,7 +295,7 @@ pub async fn list_pending_invoices(
     let cutoff = (Utc::now() - chrono::Duration::hours(max_age_hours)).to_rfc3339();
     let rows = sqlx::query(
         "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at
+                amount_sats, checkout_url, created_at, updated_at, policy_id
          FROM invoices
          WHERE status = 'pending' AND created_at >= ?
          ORDER BY created_at ASC",
@@ -263,6 +318,7 @@ fn row_to_invoice(row: sqlx::sqlite::SqliteRow) -> Invoice {
         checkout_url: row.get("checkout_url"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        policy_id: row.try_get("policy_id").ok().flatten(),
     }
 }
 
@@ -553,7 +609,8 @@ pub async fn log_validation(
 const POLICY_COLS: &str = "id, product_id, name, slug, duration_seconds, grace_seconds,
                            tip_recipient, tip_pct_bps, tip_label,
                            max_machines, is_trial, price_sats_override,
-                           entitlements_json, metadata_json, active, created_at, updated_at";
+                           entitlements_json, metadata_json, active, public,
+                           created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_policy(
@@ -577,12 +634,13 @@ pub async fn create_policy(
     let entitlements_json = serde_json::to_string(entitlements).unwrap_or_else(|_| "[]".into());
     let metadata_json = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".into());
     let tip_pct = tip_pct_bps.clamp(0, 10_000);
+    // public defaults to 1 here; admin can flip via PATCH /v1/admin/policies/:id/public.
     sqlx::query(
         "INSERT INTO policies
            (id, product_id, name, slug, duration_seconds, grace_seconds, max_machines,
-            is_trial, price_sats_override, entitlements_json, metadata_json, active,
+            is_trial, price_sats_override, entitlements_json, metadata_json, active, public,
             tip_recipient, tip_pct_bps, tip_label, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(product_id)
@@ -650,6 +708,127 @@ pub async fn list_policies_by_product(
     Ok(rows.into_iter().map(row_to_policy).collect())
 }
 
+/// Public-buyer view: only active+public policies. Sorted by ascending
+/// effective price so the cheapest tier renders leftmost. The buy page
+/// is the only caller; admin should use `list_policies_by_product`.
+pub async fn list_public_policies_by_product(
+    pool: &SqlitePool,
+    product_id: &str,
+) -> AppResult<Vec<Policy>> {
+    let sql = format!(
+        "SELECT {POLICY_COLS} FROM policies
+         WHERE product_id = ? AND active = 1 AND public = 1
+         ORDER BY COALESCE(price_sats_override, 0) ASC, name ASC"
+    );
+    let rows = sqlx::query(&sql).bind(product_id).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(row_to_policy).collect())
+}
+
+/// Patch mutable fields on a policy. Slug, product_id, and id are
+/// intentionally not editable — they're identifiers that operators may
+/// have hard-coded into integration docs or buy URLs. Tip-related fields
+/// have their own admin endpoint (`set_policy_tip_config`) since they
+/// have their own validation rules (basis points, paired recipient/pct).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_policy(
+    pool: &SqlitePool,
+    id: &str,
+    name: Option<&str>,
+    duration_seconds: Option<i64>,
+    grace_seconds: Option<i64>,
+    max_machines: Option<i64>,
+    is_trial: Option<bool>,
+    price_sats_override: Option<Option<i64>>,
+    entitlements: Option<&[String]>,
+    metadata: Option<&serde_json::Value>,
+) -> AppResult<Policy> {
+    let mut sets: Vec<&str> = Vec::new();
+    if name.is_some() {
+        sets.push("name = ?");
+    }
+    if duration_seconds.is_some() {
+        sets.push("duration_seconds = ?");
+    }
+    if grace_seconds.is_some() {
+        sets.push("grace_seconds = ?");
+    }
+    if max_machines.is_some() {
+        sets.push("max_machines = ?");
+    }
+    if is_trial.is_some() {
+        sets.push("is_trial = ?");
+    }
+    if price_sats_override.is_some() {
+        sets.push("price_sats_override = ?");
+    }
+    if entitlements.is_some() {
+        sets.push("entitlements_json = ?");
+    }
+    if metadata.is_some() {
+        sets.push("metadata_json = ?");
+    }
+    if sets.is_empty() {
+        return get_policy_by_id(pool, id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("policy {id}")));
+    }
+    sets.push("updated_at = ?");
+    let now = Utc::now().to_rfc3339();
+    let sql = format!("UPDATE policies SET {} WHERE id = ?", sets.join(", "));
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = name {
+        q = q.bind(v);
+    }
+    if let Some(v) = duration_seconds {
+        q = q.bind(v);
+    }
+    if let Some(v) = grace_seconds {
+        q = q.bind(v);
+    }
+    if let Some(v) = max_machines {
+        q = q.bind(v);
+    }
+    if let Some(v) = is_trial {
+        q = q.bind(v as i64);
+    }
+    if let Some(opt_p) = price_sats_override {
+        q = q.bind(opt_p);
+    }
+    let ent_json;
+    if let Some(ents) = entitlements {
+        ent_json = serde_json::to_string(ents).unwrap_or_else(|_| "[]".into());
+        q = q.bind(&ent_json);
+    }
+    let meta_json;
+    if let Some(m) = metadata {
+        meta_json = serde_json::to_string(m).unwrap_or_else(|_| "{}".into());
+        q = q.bind(&meta_json);
+    }
+    q = q.bind(&now).bind(id);
+    let rows = q.execute(pool).await?.rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("policy {id}")));
+    }
+    get_policy_by_id(pool, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("policy {id}")))
+}
+
+pub async fn set_policy_public(pool: &SqlitePool, id: &str, public: bool) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    let rows = sqlx::query("UPDATE policies SET public = ?, updated_at = ? WHERE id = ?")
+        .bind(public as i64)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("policy {id}")));
+    }
+    Ok(())
+}
+
 pub async fn set_policy_active(pool: &SqlitePool, id: &str, active: bool) -> AppResult<()> {
     let now = Utc::now().to_rfc3339();
     let rows = sqlx::query("UPDATE policies SET active = ?, updated_at = ? WHERE id = ?")
@@ -673,6 +852,7 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
     let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap_or_default();
     let active_int: i64 = row.get("active");
     let is_trial_int: i64 = row.get("is_trial");
+    let public_int: i64 = row.try_get("public").unwrap_or(1);
     Policy {
         id: row.get("id"),
         product_id: row.get("product_id"),
@@ -686,6 +866,7 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
         entitlements,
         metadata,
         active: active_int != 0,
+        public: public_int != 0,
         tip_recipient: row.get("tip_recipient"),
         tip_pct_bps: row.get("tip_pct_bps"),
         tip_label: row.get("tip_label"),
@@ -1348,9 +1529,12 @@ pub async fn create_discount_code(
     referrer_label: Option<&str>,
     description: &str,
 ) -> AppResult<DiscountCode> {
-    if !matches!(kind, "percent" | "fixed_sats" | "free_license") {
+    if !matches!(
+        kind,
+        "percent" | "fixed_sats" | "set_price" | "free_license"
+    ) {
         return Err(AppError::BadRequest(format!(
-            "discount kind must be 'percent', 'fixed_sats', or 'free_license', got '{kind}'"
+            "discount kind must be 'percent', 'fixed_sats', 'set_price', or 'free_license', got '{kind}'"
         )));
     }
     if amount < 0 {
@@ -1364,6 +1548,11 @@ pub async fn create_discount_code(
     if kind == "fixed_sats" && amount == 0 {
         return Err(AppError::BadRequest(
             "fixed_sats amount must be > 0".into(),
+        ));
+    }
+    if kind == "set_price" && amount <= 0 {
+        return Err(AppError::BadRequest(
+            "set_price amount (the buyer's flat-price target, in sats) must be > 0".into(),
         ));
     }
     // free_license codes ignore `amount`; we force it to 0 on insert below.
@@ -1487,6 +1676,117 @@ pub async fn set_discount_code_active(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Patch mutable fields on a discount code. Mutable fields are the ones
+/// that don't change behavior in confusing ways for codes already in
+/// circulation: `amount`, `max_uses`, `expires_at`, `description`,
+/// `referrer_label`. The code string itself, kind, and product/policy
+/// scope are intentionally NOT editable — changing those would silently
+/// invalidate links that are already out in the wild. Operators should
+/// disable + create a new code instead. Each `Option<T>` parameter is
+/// `Some(value_or_clear)` to update, `None` to leave alone; for fields
+/// that can be NULL'd, callers pass `Some(None)` to clear.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_discount_code(
+    pool: &SqlitePool,
+    id: &str,
+    amount: Option<i64>,
+    max_uses: Option<Option<i64>>,
+    expires_at: Option<Option<&str>>,
+    description: Option<&str>,
+    referrer_label: Option<Option<&str>>,
+) -> AppResult<DiscountCode> {
+    // Re-fetch to validate amount against the existing kind.
+    let existing = get_discount_code_by_id(pool, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("discount code {id}")))?;
+    if let Some(a) = amount {
+        if a < 0 {
+            return Err(AppError::BadRequest("amount must be >= 0".into()));
+        }
+        if existing.kind == "percent" && a > 10_000 {
+            return Err(AppError::BadRequest(
+                "percent amount must be in basis points (0..=10000); 10000 = 100%".into(),
+            ));
+        }
+        if existing.kind == "fixed_sats" && a == 0 {
+            return Err(AppError::BadRequest(
+                "fixed_sats amount must be > 0".into(),
+            ));
+        }
+        if existing.kind == "set_price" && a <= 0 {
+            return Err(AppError::BadRequest(
+                "set_price amount (the buyer's flat-price target, in sats) must be > 0".into(),
+            ));
+        }
+        if existing.kind == "free_license" && a != 0 {
+            return Err(AppError::BadRequest(
+                "free_license codes have no amount; pass 0 or leave unchanged".into(),
+            ));
+        }
+    }
+    if let Some(Some(m)) = max_uses {
+        if m <= 0 {
+            return Err(AppError::BadRequest(
+                "max_uses must be > 0 (or pass null to clear it for unlimited)".into(),
+            ));
+        }
+        if m < existing.used_count {
+            return Err(AppError::BadRequest(format!(
+                "max_uses ({m}) cannot be lower than the current used_count ({})",
+                existing.used_count
+            )));
+        }
+    }
+
+    let mut sets: Vec<&str> = Vec::new();
+    if amount.is_some() {
+        sets.push("amount = ?");
+    }
+    if max_uses.is_some() {
+        sets.push("max_uses = ?");
+    }
+    if expires_at.is_some() {
+        sets.push("expires_at = ?");
+    }
+    if description.is_some() {
+        sets.push("description = ?");
+    }
+    if referrer_label.is_some() {
+        sets.push("referrer_label = ?");
+    }
+    if sets.is_empty() {
+        return Ok(existing);
+    }
+    sets.push("updated_at = ?");
+    let sql = format!(
+        "UPDATE discount_codes SET {} WHERE id = ?",
+        sets.join(", ")
+    );
+    let now = Utc::now().to_rfc3339();
+    let mut q = sqlx::query(&sql);
+    if let Some(a) = amount {
+        q = q.bind(a);
+    }
+    if let Some(opt_m) = max_uses {
+        q = q.bind(opt_m);
+    }
+    if let Some(opt_e) = expires_at {
+        q = q.bind(opt_e);
+    }
+    if let Some(d) = description {
+        q = q.bind(d);
+    }
+    if let Some(opt_r) = referrer_label {
+        q = q.bind(opt_r);
+    }
+    q = q.bind(&now).bind(id);
+    q.execute(pool).await?;
+
+    get_discount_code_by_id(pool, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("discount code {id}")))
 }
 
 /// Phase 1 of redemption: atomically increment `used_count` on the
@@ -1695,6 +1995,85 @@ pub async fn settings_get(pool: &SqlitePool, key: &str) -> AppResult<Option<Stri
         .fetch_optional(pool)
         .await?;
     Ok(row.and_then(|r| r.get::<Option<String>, _>("value")))
+}
+
+// ---------- Web UI sessions ----------
+
+/// Create a new session row. Token is the random URL-safe base64 string
+/// (callers generate it with `crate::api::auth::new_session_token`).
+pub async fn create_session(
+    pool: &SqlitePool,
+    token: &str,
+    created_at: &str,
+    expires_at: &str,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO sessions (token, created_at, expires_at, last_seen_at, ip, user_agent)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(token)
+    .bind(created_at)
+    .bind(expires_at)
+    .bind(created_at) // last_seen_at = created_at on insert
+    .bind(ip)
+    .bind(user_agent)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Returns true if the session exists and hasn't expired. Side-effect:
+/// bumps `last_seen_at` so an active session stays alive (sliding window).
+pub async fn is_session_valid(pool: &SqlitePool, token: &str) -> AppResult<bool> {
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT token, expires_at FROM sessions WHERE token = ?",
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+    let Some((_, expires_at)) = row else { return Ok(false) };
+    let exp = match chrono::DateTime::parse_from_rfc3339(&expires_at) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(_) => return Ok(false),
+    };
+    if exp < Utc::now() {
+        return Ok(false);
+    }
+    let now = Utc::now().to_rfc3339();
+    let _ = sqlx::query("UPDATE sessions SET last_seen_at = ? WHERE token = ?")
+        .bind(&now)
+        .bind(token)
+        .execute(pool)
+        .await;
+    Ok(true)
+}
+
+/// Hard-delete a single session row. Idempotent.
+pub async fn delete_session(pool: &SqlitePool, token: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM sessions WHERE token = ?")
+        .bind(token)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Wipe every session row — used on password rotation.
+pub async fn delete_all_sessions(pool: &SqlitePool) -> AppResult<()> {
+    sqlx::query("DELETE FROM sessions").execute(pool).await?;
+    Ok(())
+}
+
+/// Background cleanup: drop sessions whose `expires_at` is in the past.
+/// Returns the number of rows removed (for logging).
+pub async fn reap_expired_sessions(pool: &SqlitePool) -> AppResult<u64> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query("DELETE FROM sessions WHERE expires_at < ?")
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 /// Upsert a key into the runtime settings table. Pass `None` to clear it.

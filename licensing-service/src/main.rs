@@ -98,6 +98,23 @@ async fn main() -> anyhow::Result<()> {
     reconcile::spawn(state.clone());
     webhooks::spawn_delivery_worker(state.clone());
 
+    // Hourly session reaper — drops sessions whose expires_at < now.
+    {
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                match db::repo::reap_expired_sessions(&pool).await {
+                    Ok(n) if n > 0 => tracing::info!("reaped {n} expired session(s)"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("session reaper: {e}"),
+                }
+            }
+        });
+    }
+
     let app = api::router(state).layer(TraceLayer::new_for_http());
 
     // --- serve ---
