@@ -70,6 +70,7 @@ pub mod session_layer;
 pub mod tier;
 pub mod validate;
 pub mod webhook;
+pub mod webhook_deliveries;
 pub mod webhook_endpoints;
 
 use crate::btcpay::client::BtcpayClient;
@@ -303,6 +304,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/admin/webhook-endpoints/:id",
             axum::routing::delete(webhook_endpoints::delete),
+        )
+        // Webhook delivery history (the dead-letter inspection +
+        // manual-retry surface; see webhook_deliveries.rs for why).
+        .route(
+            "/v1/admin/webhook-deliveries",
+            get(webhook_deliveries::list),
+        )
+        .route(
+            "/v1/admin/webhook-deliveries/:id/retry",
+            post(webhook_deliveries::retry),
         )
         // Discount / referral codes.
         .route(

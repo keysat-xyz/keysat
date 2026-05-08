@@ -827,3 +827,167 @@ async fn tier_caps_block_at_creator_limit_and_unlock_after_upgrade() {
         .unwrap();
     assert_eq!(count, 6, "the previously-blocked product should now exist");
 }
+
+/// Webhook DLQ (dead-letter queue) — list + retry round trip.
+///
+/// The delivery worker retries failed deliveries with exponential
+/// backoff up to 10 attempts, then sets `next_attempt_at = NULL` and
+/// walks away. Pre-this-feature, those rows were invisible to the
+/// operator. Now `GET /v1/admin/webhook-deliveries?status=failed`
+/// surfaces them and `POST /v1/admin/webhook-deliveries/:id/retry`
+/// puts them back in the queue.
+///
+/// We seed a "dead-lettered" row directly via SQL — the worker isn't
+/// spawned in tests, so we don't need to drive 10 real failures to
+/// reach the dead state. This tests the admin surface, not the
+/// worker.
+#[tokio::test]
+async fn webhook_dlq_lists_failed_and_retry_requeues() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let now = Utc::now().to_rfc3339();
+
+    // Configure a webhook endpoint to own the deliveries.
+    let endpoint_id = "ep1";
+    sqlx::query(
+        "INSERT INTO webhook_endpoints(id, url, secret, event_types, active, \
+         description, created_at, updated_at) \
+         VALUES(?, 'https://operator.example/keysat-hook', \
+                '0123456789abcdef0123456789abcdef', '[\"*\"]', 1, '', ?, ?)",
+    )
+    .bind(endpoint_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // One delivery in each state: delivered (success), pending
+    // (in-queue), and failed (DLQ — what we mostly care about).
+    let mk = |id: &str, attempts: i64, next: Option<&str>, delivered: Option<&str>| {
+        let id = id.to_string();
+        let attempts = attempts;
+        let next = next.map(|s| s.to_string());
+        let delivered = delivered.map(|s| s.to_string());
+        let pool = state.db.clone();
+        let now = now.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO webhook_deliveries(id, endpoint_id, event_type, \
+                 payload_json, attempt_count, next_attempt_at, delivered_at, created_at) \
+                 VALUES(?, ?, 'license.issued', '{}', ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(endpoint_id)
+            .bind(attempts)
+            .bind(next.as_deref())
+            .bind(delivered.as_deref())
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    mk("d-delivered", 1, None, Some(&now)).await;
+    mk("d-pending", 2, Some(&now), None).await;
+    // The dead-lettered case: 10 attempts, next_attempt_at NULL, never delivered.
+    mk("d-failed", 10, None, None).await;
+
+    // List with status=failed should return ONLY the dead-lettered row.
+    let req = build_request(
+        "GET",
+        "/v1/admin/webhook-deliveries?status=failed",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let deliveries = body["deliveries"].as_array().expect("deliveries array");
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "status=failed should return the one DLQ row, got {deliveries:?}"
+    );
+    assert_eq!(deliveries[0]["id"], "d-failed");
+    assert_eq!(deliveries[0]["attempt_count"], 10);
+
+    // Retry the dead-lettered delivery.
+    let req = build_request(
+        "POST",
+        "/v1/admin/webhook-deliveries/d-failed/retry",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "retry should succeed");
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["attempt_count"], 0,
+        "retry should reset attempt_count to 0"
+    );
+    assert!(
+        body["next_attempt_at"].is_string(),
+        "retry should set next_attempt_at: {body:?}"
+    );
+
+    // After retry: status=failed should be empty (the row left the
+    // DLQ); status=pending should now contain it.
+    let req = build_request(
+        "GET",
+        "/v1/admin/webhook-deliveries?status=failed",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["deliveries"].as_array().unwrap().len(),
+        0,
+        "after retry, the row should no longer be 'failed'"
+    );
+
+    let req = build_request(
+        "GET",
+        "/v1/admin/webhook-deliveries?status=pending",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    let body = body_json(resp).await;
+    let pending = body["deliveries"].as_array().unwrap();
+    assert!(
+        pending.iter().any(|d| d["id"] == "d-failed"),
+        "after retry, the previously-failed row should appear in 'pending'"
+    );
+
+    // Audit log captured the retry.
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'webhook_delivery.retry' AND target_id = 'd-failed'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1, "retry must write an audit log entry");
+
+    // Retry on a non-existent id is 404.
+    let req = build_request(
+        "POST",
+        "/v1/admin/webhook-deliveries/never-existed/retry",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Bad status filter is 400 (a typo'd query string shouldn't
+    // silently succeed; that's a UI footgun).
+    let req = build_request(
+        "GET",
+        "/v1/admin/webhook-deliveries?status=garbage",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

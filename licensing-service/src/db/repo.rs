@@ -1379,6 +1379,114 @@ pub async fn mark_delivery_failure(
     Ok(())
 }
 
+/// Filter modes for `list_deliveries`. Strings match the values
+/// accepted by the admin endpoint's `?status=...` query param.
+pub enum DeliveryStatusFilter {
+    /// `delivered_at IS NULL AND next_attempt_at IS NOT NULL` — in
+    /// the retry queue, will be picked up by the worker on the next
+    /// tick that's past `next_attempt_at`.
+    Pending,
+    /// `delivered_at IS NOT NULL` — successfully delivered.
+    Delivered,
+    /// `delivered_at IS NULL AND next_attempt_at IS NULL AND
+    /// attempt_count > 0` — the dead-letter case. Worker exhausted
+    /// retries (or hit a hard error like a deleted endpoint) and
+    /// won't re-pick it. Operators see these via the admin list and
+    /// can manually re-queue via `requeue_delivery`.
+    Failed,
+    /// All deliveries.
+    All,
+}
+
+impl DeliveryStatusFilter {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "delivered" => Some(Self::Delivered),
+            "failed" => Some(Self::Failed),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// List webhook deliveries with optional filtering. Newest first
+/// (orders by `created_at DESC`) so the admin UI shows recent
+/// activity at the top.
+pub async fn list_deliveries(
+    pool: &SqlitePool,
+    endpoint_id: Option<&str>,
+    status: DeliveryStatusFilter,
+    limit: i64,
+) -> AppResult<Vec<WebhookDelivery>> {
+    let mut sql = String::from(
+        "SELECT id, endpoint_id, event_type, payload_json, attempt_count,
+                next_attempt_at, last_status_code, last_error, delivered_at, created_at
+         FROM webhook_deliveries WHERE 1=1",
+    );
+    if endpoint_id.is_some() {
+        sql.push_str(" AND endpoint_id = ?");
+    }
+    match status {
+        DeliveryStatusFilter::Pending => {
+            sql.push_str(" AND delivered_at IS NULL AND next_attempt_at IS NOT NULL")
+        }
+        DeliveryStatusFilter::Delivered => sql.push_str(" AND delivered_at IS NOT NULL"),
+        DeliveryStatusFilter::Failed => sql.push_str(
+            " AND delivered_at IS NULL AND next_attempt_at IS NULL AND attempt_count > 0",
+        ),
+        DeliveryStatusFilter::All => {}
+    }
+    sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+
+    let mut q = sqlx::query(&sql);
+    if let Some(eid) = endpoint_id {
+        q = q.bind(eid);
+    }
+    q = q.bind(limit);
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows.into_iter().map(row_to_delivery).collect())
+}
+
+/// Re-queue a previously-failed (or even successfully-delivered)
+/// delivery for another attempt. Resets `attempt_count` to 0, clears
+/// `delivered_at` and `last_error`, and sets `next_attempt_at` to
+/// now so the worker picks it up on the next tick.
+///
+/// Returns the affected row, or `Ok(None)` if no row with the given
+/// id exists.
+pub async fn requeue_delivery(
+    pool: &SqlitePool,
+    id: &str,
+) -> AppResult<Option<WebhookDelivery>> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query(
+        "UPDATE webhook_deliveries
+         SET attempt_count = 0,
+             delivered_at = NULL,
+             last_error = NULL,
+             last_status_code = NULL,
+             next_attempt_at = ?
+         WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT id, endpoint_id, event_type, payload_json, attempt_count,
+                next_attempt_at, last_status_code, last_error, delivered_at, created_at
+         FROM webhook_deliveries WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(Some(row_to_delivery(row)))
+}
+
 fn row_to_delivery(row: sqlx::sqlite::SqliteRow) -> WebhookDelivery {
     WebhookDelivery {
         id: row.get("id"),
