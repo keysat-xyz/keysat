@@ -7,7 +7,8 @@
 
 use anyhow::Context;
 use keysat::{
-    analytics, api, btcpay, config, crypto, db, license_self, payment, reconcile, webhooks,
+    analytics, api, btcpay, config, crypto, db, license_self, payment, reconcile, subscriptions,
+    webhooks,
 };
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -131,6 +132,11 @@ async fn main() -> anyhow::Result<()> {
     // and short-circuits if disabled (default), so spawning is safe
     // unconditionally.
     analytics::spawn(state.clone());
+    // Recurring subscriptions renewal worker. Picks up subs whose
+    // next_renewal_at has passed, creates fresh invoices via the
+    // active provider, transitions state. No-op if no recurring
+    // subscriptions exist; safe to spawn unconditionally.
+    subscriptions::spawn(state.clone());
 
     // Hourly session reaper — drops sessions whose expires_at < now.
     {

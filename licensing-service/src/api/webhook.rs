@@ -124,6 +124,21 @@ pub async fn handle(
         return Ok(StatusCode::OK);
     };
 
+    // If this settled invoice is associated with a subscription
+    // (renewal cycle), flip the sub back to `active` and fire
+    // `subscription.renewed`. Idempotent — re-running on a sub
+    // already in `active` state is a no-op UPDATE. Runs BEFORE
+    // the license-issuance branch so the sub state is correct
+    // even on first-cycle subs (where the license is also being
+    // issued for the first time).
+    if let Err(e) = crate::subscriptions::on_invoice_settled(&state, &invoice).await {
+        tracing::warn!(
+            invoice_id = %invoice.id,
+            error = %e,
+            "subscriptions::on_invoice_settled failed; non-fatal, license issuance proceeds"
+        );
+    }
+
     // Idempotency: if a license already exists for this invoice, do nothing.
     if repo::get_license_by_invoice(&state.db, &invoice.id)
         .await?

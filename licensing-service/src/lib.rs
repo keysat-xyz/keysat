@@ -20,6 +20,7 @@ pub mod payment;
 pub mod rate_limit;
 pub mod rates;
 pub mod reconcile;
+pub mod subscriptions;
 pub mod tipping;
 pub mod webhooks;
 
