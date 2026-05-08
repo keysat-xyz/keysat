@@ -363,8 +363,19 @@ async fn migration_0009_is_idempotent() {
         .await
         .unwrap();
 
-    let last = migration_files().into_iter().last().unwrap();
-    let sql = std::fs::read_to_string(&last).unwrap();
+    // Pinned to migration 0009 by its filename prefix, not by
+    // "last in the list" — once 0010+ land they may not be
+    // idempotent (additive ALTER TABLE statements aren't), but
+    // 0009's whole point was being safely re-runnable.
+    let nine = migration_files()
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .map_or(false, |s| s.starts_with("0009_"))
+        })
+        .expect("migration 0009 file must be present");
+    let sql = std::fs::read_to_string(&nine).unwrap();
     let mut tx = pool.begin().await.unwrap();
     sqlx::raw_sql(&sql)
         .execute(&mut *tx)
@@ -384,6 +395,93 @@ async fn migration_0009_is_idempotent() {
     assert_eq!(code_before, code_after, "discount_codes unchanged on re-apply");
 
     assert_db_clean(&pool).await.expect("db clean after re-apply");
+}
+
+/// Migration 0010 (multi-currency foundation): verifies that the
+/// backfill correctly populates the new `price_currency` and
+/// `price_value` columns against products that existed before the
+/// migration. This is the contract the rest of the multi-currency
+/// build assumes — every existing row must end up with
+/// `price_currency = 'SAT'` and `price_value = price_sats`.
+#[tokio::test]
+async fn migration_0010_backfills_existing_products_to_sat() {
+    let (pool, _tmp) = make_pool().await;
+    apply_range(&pool, 0, 9)
+        .await
+        .expect("apply 0001..=0009 (everything before 0010)");
+
+    // Seed three products with different sat amounts (including 0
+    // for the free case) before 0010 runs.
+    sqlx::query(
+        "INSERT INTO products(id, slug, name, price_sats, created_at, updated_at) \
+         VALUES('pa', 'a', 'Product A', 0, 't', 't'), \
+               ('pb', 'b', 'Product B', 10000, 't', 't'), \
+               ('pc', 'c', 'Product C', 250000, 't', 't')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed products");
+
+    // Seed a policy with a price override so the policy backfill
+    // (price_value_override = price_sats_override) is exercised.
+    sqlx::query(
+        "INSERT INTO policies(id, product_id, name, slug, price_sats_override, \
+         created_at, updated_at) \
+         VALUES('pol1', 'pb', 'Pro', 'pro', 50000, 't', 't')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed policy with override");
+
+    // Apply 0010.
+    apply_range(&pool, 9, 10)
+        .await
+        .expect("apply 0010_multi_currency");
+
+    // After: every product has price_currency='SAT' and
+    // price_value matches price_sats.
+    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, price_currency, price_value, price_sats \
+         FROM products ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3);
+    for (id, currency, value, sats) in &rows {
+        assert_eq!(currency, "SAT", "{id}: currency must default to SAT");
+        assert_eq!(value, sats, "{id}: price_value must mirror price_sats");
+    }
+
+    // The policy override was backfilled.
+    let pol: (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT price_currency_override, price_value_override, price_sats_override \
+         FROM policies WHERE id = 'pol1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        pol.0.is_none(),
+        "currency_override should stay NULL = 'inherit from product'"
+    );
+    assert_eq!(pol.1, Some(50000), "price_value_override backfilled");
+    assert_eq!(pol.2, Some(50000), "original price_sats_override preserved");
+
+    // The new currency index exists (uses CREATE INDEX IF NOT
+    // EXISTS so this is implicit-correct, but assert the index is
+    // there so a future schema rebuild can't silently lose it).
+    let idx_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type='index' AND name='idx_products_currency'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(idx_count, 1, "currency index should exist after 0010");
+
+    // FK + integrity invariants still hold.
+    assert_db_clean(&pool).await.expect("db clean after 0010");
 }
 
 /// Future-proofing. Always seeds fixtures one migration before the end,

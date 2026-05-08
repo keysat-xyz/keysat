@@ -14,10 +14,10 @@ use uuid::Uuid;
 
 pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Vec<Product>> {
     let q = if only_active {
-        "SELECT id, slug, name, description, price_sats, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
          FROM products WHERE active = 1 ORDER BY name"
     } else {
-        "SELECT id, slug, name, description, price_sats, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
          FROM products ORDER BY name"
     };
     let rows = sqlx::query(q).fetch_all(pool).await?;
@@ -26,7 +26,7 @@ pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Ve
 
 pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Option<Product>> {
     let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
          FROM products WHERE slug = ?",
     )
     .bind(slug)
@@ -37,7 +37,7 @@ pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Opt
 
 pub async fn get_product_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Product>> {
     let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
          FROM products WHERE id = ?",
     )
     .bind(id)
@@ -59,15 +59,21 @@ pub async fn create_product(
     let metadata_json = serde_json::to_string(metadata)
         .map_err(|e| AppError::BadRequest(format!("invalid metadata JSON: {e}")))?;
 
+    // Dual-write: products created via this legacy entry point are
+    // SAT-priced (price_currency = 'SAT', price_value = price_sats).
+    // A future `create_product_with_currency` can land alongside
+    // the fiat-pricing admin-UI work without re-touching this row.
     sqlx::query(
-        "INSERT INTO products (id, slug, name, description, price_sats, active, metadata_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        "INSERT INTO products (id, slug, name, description, price_sats, \
+         price_currency, price_value, active, metadata_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, 'SAT', ?, 1, ?, ?, ?)",
     )
     .bind(&id)
     .bind(slug)
     .bind(name)
     .bind(description)
     .bind(price_sats)
+    .bind(price_sats) // price_value mirrors price_sats for SAT-currency rows
     .bind(&metadata_json)
     .bind(&now)
     .bind(&now)
@@ -119,7 +125,12 @@ pub async fn update_product(
         sets.push("description = ?");
     }
     if price_sats.is_some() {
+        // Dual-write so SAT-currency products keep `price_value`
+        // in sync. Fiat-priced products will use a separate
+        // `update_product_currency_value` (lands with the admin
+        // UI for fiat pricing).
         sets.push("price_sats = ?");
+        sets.push("price_value = ?");
     }
     if sets.is_empty() {
         return get_product_by_id(pool, id)
@@ -138,6 +149,7 @@ pub async fn update_product(
     }
     if let Some(v) = price_sats {
         q = q.bind(v);
+        q = q.bind(v); // for the paired price_value placeholder
     }
     q = q.bind(&now).bind(id);
     let rows = q.execute(pool).await?.rows_affected();
@@ -153,12 +165,25 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
     let metadata_json: String = row.try_get("metadata_json")?;
     let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap_or_default();
     let active_int: i64 = row.try_get("active")?;
+    // The new currency columns landed in migration 0010. try_get is
+    // tolerant — if a row predates 0010 (shouldn't happen since the
+    // migration always runs at boot, but this is defensive), fall
+    // back to the SAT defaults so callers get well-formed rows.
+    let price_currency: String = row
+        .try_get("price_currency")
+        .unwrap_or_else(|_| "SAT".to_string());
+    let price_sats_value: i64 = row.try_get("price_sats")?;
+    let price_value: i64 = row
+        .try_get("price_value")
+        .unwrap_or(price_sats_value);
     Ok(Product {
         id: row.try_get("id")?,
         slug: row.try_get("slug")?,
         name: row.try_get("name")?,
         description: row.try_get("description")?,
-        price_sats: row.try_get("price_sats")?,
+        price_sats: price_sats_value,
+        price_currency,
+        price_value,
         active: active_int != 0,
         metadata,
         created_at: row.try_get("created_at")?,

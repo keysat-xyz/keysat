@@ -8,12 +8,31 @@ pub struct Product {
     pub slug: String,
     pub name: String,
     pub description: String,
+    /// Sat-denominated price. For SAT-currency products this equals
+    /// `price_value`. For fiat-priced products (USD, EUR, etc.) this
+    /// is a snapshot from the most recent invoice creation against
+    /// the product, kept for back-compat with v0.1 SDKs and admin UI
+    /// that haven't migrated to the typed currency view yet. The
+    /// canonical price is `price_currency` + `price_value`.
     pub price_sats: i64,
+    /// Operator-facing currency: 'SAT', 'BTC', 'USD', 'EUR' (and
+    /// future ISO 4217 codes). Defaults to 'SAT' for products
+    /// created before v0.1.0:48 / migration 0010.
+    #[serde(default = "default_currency")]
+    pub price_currency: String,
+    /// Price in the smallest indivisible unit of `price_currency`:
+    /// sats for SAT/BTC, cents for USD/EUR.
+    #[serde(default)]
+    pub price_value: i64,
     pub active: bool,
     /// Arbitrary JSON metadata the developer can attach.
     pub metadata: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_currency() -> String {
+    "SAT".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
