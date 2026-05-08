@@ -58,6 +58,26 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:4 — **Recurring subscriptions are functional end-to-end.** Migration 0011 stopped being dormant: operators on Pro/Patron tier can now mark a policy as recurring, the renewal worker creates fresh invoices on cadence, the buy page renders subscription pricing, and both operator and buyer can cancel cleanly.',
+  '',
+  '**Admin UI.** Policy editor (create + edit) gains a "Recurring subscription (Pro)" section: tick the box, pick a cadence (Monthly / Quarterly / Semi-annual / Annual / Custom days), set grace-period days (default 7) and optional free-trial days. The Policies list table shows a gold "every Nd" badge alongside the existing trial badge so recurring tiers are recognisable at a glance. Free / Creator-tier operators see a 402 with an upgrade link if they try to flip a policy to recurring — same gating pattern as the existing product/policy/code caps.',
+  '',
+  '**Buy page.** Recurring tier cards render a "Renews monthly / annually / every N days" line plus a "/mo" / "/yr" / "/Nd" suffix on the headline price ("$25 / mo" not just "$25"). First-cycle trial banner shows when trial_days > 0 ("14 day free trial"). Tier-switching JS keeps the cadence suffix in sync as the buyer clicks between tiers.',
+  '',
+  '**Renewal worker.** Background worker sweeps every 60 seconds for subs whose `next_renewal_at` has passed. SAT-priced subs use identity conversion (no rate fetcher); fiat-priced subs re-quote each cycle so a billing cycle always reflects the BTC/USD rate at the moment of renewal (per MULTI_CURRENCY_DESIGN). Failed renewals back off on a 5min → 30min → 2h → 6h → 12h schedule, capped at 5 consecutive failures before the worker stops touching the row. Past-due subs whose grace window has elapsed transition to `lapsed` automatically.',
+  '',
+  '**New Subscriptions tab in the admin UI.** Lists all subs with status filter pills (All / Active / Past due / Cancelled / Lapsed). Each row shows the license, cadence, listed price (in original currency), status, next renewal, consecutive failures, and a one-click Cancel button (confirms with an optional reason captured to the audit log). Cancellation is non-destructive — the license stays valid through the end of the current billing cycle, the renewal worker just stops creating new invoices.',
+  '',
+  '**Buyer self-service cancel.** New `POST /v1/subscriptions/cancel` endpoint takes the buyer\'s signed license key as auth (no admin token, no cookie) and cancels the tied subscription. SDKs can wire a "Cancel subscription" button in the operator\'s app without involving the operator\'s support workflow. Bad/wrong/revoked keys all return 401 (not 404) so a probe can\'t enumerate which licenses have active subs.',
+  '',
+  '**Webhooks.** New `subscription.cancelled` event fires with `actor=admin|buyer` so operators can distinguish self-service cancels in their downstream tooling. The existing `subscription.lapsed` event fires when the worker transitions a past-due sub past its grace window.',
+  '',
+  '**Auto-charge via saved payment profiles is NOT in this release.** The renewal worker creates fresh invoices that the buyer must pay manually. v0.2.0:5+ adds the auto-charge path (Zaprite\'s `paymentProfileId` flow). Until then, subscriptions are "we send you a fresh invoice link every month" — closer to GitHub Sponsors than Stripe.',
+  '',
+  '**Test count: 57** (was 42 at v0.2.0:3). +7 renewal-worker integration tests, +4 admin policy tests covering recurring fields and the Pro-tier gate, +4 cancellation tests covering both admin and buyer paths.',
+  '',
+  '**Upgrade path.** v0.2.0:3 → v0.2.0:4 is a drop-in. The schema columns for recurring policies were already added in v0.2.0:2 (migration 0011); existing policies have `is_recurring=0` so the renewal worker has nothing to do. No behavior change unless an operator explicitly creates a recurring policy.',
+  '',
   '0.2.0:3 — **Durable payment-provider switching.** Fixes a gap from v0.2.0:2 where Connect Zaprite swapped the in-memory provider but BTCPay silently re-took active on the next daemon restart. Both providers\' configurations can now coexist, with a persisted preference flag determining which one is active. New "Activate BTCPay" / "Activate Zaprite" StartOS Actions let operators flip between configured providers in one click without re-running Connect. Disconnect on either provider clears the preference only if it pointed at the disconnected one — symmetric handling preserves operator intent.',
   '',
   'New endpoints: `GET /v1/admin/payment-provider/status` (both configs\' state + active preference in one call), `POST /v1/admin/payment-provider/activate` (flip active without re-authorizing). The boot-time loader now reads the persisted preference, so what an operator activates today is what loads tomorrow regardless of which config rows happen to be in the DB.',
@@ -86,7 +106,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:3',
+  version: '0.2.0:4',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
