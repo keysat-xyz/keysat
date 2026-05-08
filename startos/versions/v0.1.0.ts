@@ -9,8 +9,24 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const v0_1_0 = VersionInfo.of({
-  version: '0.1.0:41',
+  version: '0.1.0:42',
   releaseNotes: [
+    `Alpha-iteration revision 42 of v0.1.0 — Test infrastructure expansion. No daemon-behaviour changes for operators; this release ships safety nets for future development. Skip if v0.1.0:41 is running cleanly — the next release with new functionality will roll forward whatever shipped here.`,
+    ``,
+    `**API integration tests.** New \`tests/api.rs\` with seven integration tests that drive real HTTP requests through the daemon's \`axum::Router\` against a real SQLite tempfile. Covers: health endpoint, admin auth (401 vs 403 paths), admin product creation (full happy path: auth → handler → DB → audit log → response), license validation (parse-fail surface plus full crypto round-trip), free-tier purchase with inline license issuance, and BTCPay webhook idempotency (re-delivered settle webhooks MUST NOT duplicate the license — the production-correctness invariant we most needed to lock down).`,
+    ``,
+    `**Library refactor.** Adds \`src/lib.rs\` that re-exports the daemon's modules so integration tests under \`tests/\` can drive \`AppState\` + \`Router\` directly. Production binary at \`src/main.rs\` is now a thin wrapper that imports from the library. No runtime behaviour change — same module sources, same compiled binary modulo build metadata.`,
+    ``,
+    `**MockPaymentProvider.** A test-only \`PaymentProvider\` impl that bypasses HMAC signature verification and parses test-supplied JSON bodies into \`ProviderWebhookEvent\` variants. Used by the webhook test to drive deterministic settle / expire / invalid events without a real BTCPay round-trip. Lives entirely in \`tests/api.rs\` — never compiled into the production binary.`,
+    ``,
+    `**Test count.** 9 unit + 4 migration + 7 API = 20 tests, up from 13 in v0.1.0:41. \`cargo test\` exercises the full set in under a second.`,
+    ``,
+    `**KEYSAT_INTEGRATION.md restored.** v0.1.0:41's release notes erroneously claimed the file was "removed from this repo" — that was a misread of intent. The 1378-line integration guide is back at the daemon repo's root where integrators (and LLMs running fresh against a target codebase) expect to find it via \`https://raw.githubusercontent.com/keysat-xyz/keysat/main/KEYSAT_INTEGRATION.md\`. The 12-line stub at the parent licensing/ folder was removed since it referred to a "moved" arrangement that no longer applies.`,
+    ``,
+    `**Known limitation: paid-purchase test deferred.** The HTTP \`/v1/purchase\` endpoint's paid path still uses the legacy \`state.btcpay_client()\` compat accessor (which downcasts the active provider specifically to the concrete \`BtcpayProvider\` type) rather than the abstract \`PaymentProvider\` trait. A \`MockPaymentProvider\` can't satisfy that downcast. Migrating \`purchase::start\` to \`state.payment_provider().await?.create_invoice(...)\` is a small refactor on the v0.3 backlog; once it lands, a paid-purchase integration test slots right in. The webhook handler IS already on the trait surface, which is why the webhook idempotency test works.`,
+    ``,
+    `**Upgrade path.** v0.1.0:41 → v0.1.0:42 is a straight drop-in. No new migrations (the migration set still ends at 0009). No schema changes. No on-disk format changes. If you hit a checksum-mismatch error on boot, you're upgrading from a version older than :41 — see :41's release notes for the recovery command.`,
+    ``,
     `Alpha-iteration revision 41 of v0.1.0 — Second hotfix to migration 0009. v40 passed on a clean install but crashed on any database with existing rows in discount_redemptions. Also lands the migration test infrastructure that would have caught this before it shipped.`,
     ``,
     `**The bug.** v40 rebuilt only the discount_codes table (using \`PRAGMA defer_foreign_keys = 1\` to avoid intra-transaction FK errors). On a clean install that works. On any install with even one row in discount_redemptions — the child table whose foreign key points back into discount_codes — it doesn't. SQLite's deferred FK check fires at COMMIT, sees the dropped parent's row-deletion bookkeeping as unsatisfied (regardless of whether the rebuilt table contains the same IDs), and rolls the whole transaction back with "FOREIGN KEY constraint failed (787)". Daemon kept restart-looping; API never came up.`,

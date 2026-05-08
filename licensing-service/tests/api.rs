@@ -11,8 +11,9 @@
 //! pool, signing key, and admin token are reachable from inside the test
 //! body.
 
+use anyhow::Result;
 use axum::body::{to_bytes, Body};
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::Response;
 use chrono::Utc;
 use keysat::api::{self, AppState};
@@ -20,12 +21,18 @@ use keysat::config::Config;
 use keysat::crypto::{self, LicensePayload};
 use keysat::db::repo;
 use keysat::license_self::Tier;
+use keysat::payment::{
+    CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceStatus,
+    ProviderKind, ProviderWebhookEvent,
+};
 use serde_json::{json, Value};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
+use std::any::Any;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -361,4 +368,301 @@ async fn validate_accepts_well_formed_license() {
     assert_eq!(body["license_id"], license_id.to_string());
     assert_eq!(body["product_id"], product.id);
     assert_eq!(body["status"], "active");
+}
+
+// ---------------------------------------------------------------------
+// MockPaymentProvider — exercises the purchase + webhook code paths
+// without talking to a real BTCPay. Reports kind=Btcpay so the daemon's
+// BTCPay-specific compat accessors keep working; produces deterministic
+// invoice ids so tests can assert on them; bypasses HMAC verification
+// in `validate_webhook` and instead parses the test-supplied JSON body.
+// ---------------------------------------------------------------------
+
+struct MockPaymentProvider {
+    next_invoice_id: AtomicU64,
+}
+
+impl MockPaymentProvider {
+    fn new() -> Self {
+        Self {
+            next_invoice_id: AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentProvider for MockPaymentProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Btcpay
+    }
+
+    async fn create_invoice(
+        &self,
+        _params: CreateInvoiceParams<'_>,
+    ) -> Result<CreatedInvoiceHandle> {
+        let n = self.next_invoice_id.fetch_add(1, Ordering::SeqCst);
+        Ok(CreatedInvoiceHandle {
+            provider_invoice_id: format!("mock-inv-{n}"),
+            checkout_url: format!("http://mock-checkout.test/i/{n}"),
+        })
+    }
+
+    async fn get_invoice_status(
+        &self,
+        _provider_invoice_id: &str,
+    ) -> Result<ProviderInvoiceStatus> {
+        // Reconcile loop isn't exercised by these tests; return a sane
+        // default in case it gets called transitively.
+        Ok(ProviderInvoiceStatus::Settled)
+    }
+
+    /// Test-friendly webhook validator. Production providers would
+    /// HMAC-verify the body; we instead parse the body as JSON of
+    /// shape `{"kind": "settled"|"expired"|"invalid"|"refunded"|<other>,
+    /// "provider_invoice_id": "..."}`. Tests construct their own
+    /// payloads with no signature ceremony.
+    fn validate_webhook(
+        &self,
+        _headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<ProviderWebhookEvent> {
+        let v: Value = serde_json::from_slice(body)?;
+        let kind = v["kind"].as_str().unwrap_or("");
+        let id = v["provider_invoice_id"].as_str().unwrap_or("").to_string();
+        Ok(match kind {
+            "settled" => ProviderWebhookEvent::InvoiceSettled {
+                provider_invoice_id: id,
+            },
+            "expired" => ProviderWebhookEvent::InvoiceExpired {
+                provider_invoice_id: id,
+            },
+            "invalid" => ProviderWebhookEvent::InvoiceInvalid {
+                provider_invoice_id: id,
+            },
+            other => ProviderWebhookEvent::Other {
+                kind: other.to_string(),
+                provider_invoice_id: Some(id).filter(|s| !s.is_empty()),
+            },
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Build a state with a MockPaymentProvider already installed. Mirror of
+/// `make_test_state` for tests that drive the purchase / webhook paths.
+async fn make_test_state_with_mock_provider() -> (AppState, NamedTempFile) {
+    let (state, tmp) = make_test_state().await;
+    state
+        .set_payment_provider(Arc::new(MockPaymentProvider::new()))
+        .await;
+    (state, tmp)
+}
+
+// ---------------------------------------------------------------------
+// Purchase + webhook tests
+// ---------------------------------------------------------------------
+
+/// The free-tier shortcut: when post-discount, post-policy-override
+/// price is 0 sats, the daemon synthesizes a settled invoice locally,
+/// issues a license inline, and returns the signed key in the response.
+/// No payment provider involved — `payment` stays `None`. This test
+/// verifies that fast path end-to-end.
+#[tokio::test]
+async fn free_purchase_issues_license_inline() {
+    let (state, _tmp) = make_test_state().await;
+    let now = Utc::now().to_rfc3339();
+
+    // Seed a product (price > 0) plus a "free" policy that overrides
+    // the price to 0 sats. This is the common shape: paid product with
+    // an optional free tier on the buy page.
+    let product = repo::create_product(
+        &state.db,
+        "free-test",
+        "Free Test",
+        "",
+        10_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    sqlx::query(
+        "INSERT INTO policies(id, product_id, name, slug, price_sats_override, \
+         max_machines, public, created_at, updated_at) \
+         VALUES('pol-free', ?, 'Free', 'free', 0, 1, 1, ?, ?)",
+    )
+    .bind(&product.id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .expect("insert free policy");
+
+    let req = build_request(
+        "POST",
+        "/v1/purchase",
+        &[],
+        Some(json!({
+            "product": "free-test",
+            "policy_slug": "free"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["amount_sats"], 0,
+        "free policy should produce zero-sat invoice"
+    );
+    assert!(
+        body["license_key"].is_string(),
+        "free purchase should return license inline: {body:?}"
+    );
+    assert_eq!(body["checkout_url"], "");
+
+    // License row exists in DB.
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 1, "exactly one license should be issued");
+
+    // The inline license_key validates round-trip via /v1/validate.
+    let key = body["license_key"].as_str().unwrap().to_string();
+    let req = build_request("POST", "/v1/validate", &[], Some(json!({"key": key})));
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let validation = body_json(resp).await;
+    assert_eq!(
+        validation["ok"], true,
+        "the inlined license_key must validate cleanly: {validation:?}"
+    );
+}
+
+// Note on the missing paid-purchase test:
+//
+// `purchase::start` still uses the legacy compat accessor
+// `state.btcpay_client()`, which downcasts the active provider
+// specifically to the concrete `BtcpayProvider` type rather than
+// going through the `PaymentProvider` trait. A `MockPaymentProvider`
+// can't satisfy that downcast — it'd need to BE a `BtcpayProvider`,
+// which requires a working HTTP client.
+//
+// The fix is a small refactor of `purchase::start` to use
+// `state.payment_provider().await?.create_invoice(...)` instead of
+// the compat path. That's already on the v0.3 backlog (see
+// `src/payment/mod.rs` "Why a trait" doc comment). Once it lands, a
+// `paid_purchase_creates_invoice_via_provider` test slots right in.
+// For now we test the webhook handler — which IS already on the
+// trait surface — directly against a fixture invoice.
+
+/// The settle webhook: provider POSTs an InvoiceSettled event, daemon
+/// flips the invoice status and issues a license. Re-POSTing the same
+/// webhook (which providers DO retry, sometimes aggressively) must not
+/// duplicate the license — idempotency is critical because a flaky
+/// network or provider retries can deliver the same event multiple
+/// times. This is the production-correctness invariant we most need to
+/// hold.
+#[tokio::test]
+async fn webhook_settles_invoice_and_issues_license_idempotently() {
+    let (state, _tmp) = make_test_state_with_mock_provider().await;
+
+    // Seed a product + a pending invoice directly via the repo (the
+    // HTTP purchase endpoint still uses BTCPay-specific compat code —
+    // see the comment block above). The webhook handler itself is on
+    // the abstract `PaymentProvider` trait, which the mock satisfies,
+    // so we can drive it through the router.
+    let product = repo::create_product(
+        &state.db,
+        "webhook-test",
+        "Webhook Test",
+        "",
+        5_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let provider_invoice_id = "mock-inv-fixture".to_string();
+    repo::create_invoice(
+        &state.db,
+        &internal_invoice_id,
+        &provider_invoice_id,
+        &product.id,
+        5_000,
+        "http://mock-checkout.test/i/1",
+        None, // buyer_email
+        None, // buyer_note
+        None, // policy_id
+    )
+    .await
+    .expect("create_invoice");
+
+    // First webhook delivery: daemon flips invoice → settled, issues
+    // license.
+    let webhook_body = json!({
+        "kind": "settled",
+        "provider_invoice_id": provider_invoice_id,
+    });
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(webhook_body.clone()),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "settle webhook should ack 200"
+    );
+
+    // Verify state changes.
+    let status_after_first: String = sqlx::query_scalar(
+        "SELECT status FROM invoices WHERE btcpay_invoice_id = ?",
+    )
+    .bind(&provider_invoice_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status_after_first, "settled");
+
+    let licenses_after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        licenses_after_first, 1,
+        "first settle webhook should issue exactly one license"
+    );
+
+    // Re-deliver the same webhook. Daemon must NOT issue a second
+    // license — provider retries are routine and a duplicated license
+    // means duplicated revenue or duplicated revocation surface area.
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(webhook_body),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "redelivered webhook should also ack 200"
+    );
+
+    let licenses_after_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        licenses_after_second, 1,
+        "redelivered settle webhook MUST NOT duplicate the license"
+    );
 }
