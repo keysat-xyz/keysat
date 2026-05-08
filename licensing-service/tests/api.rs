@@ -1818,3 +1818,276 @@ async fn community_analytics_opt_in_and_privacy_contract() {
         "install_uuid must be wiped after reset: {body:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Recurring-subscription policy admin (Phase 4 of recurring subs)
+//
+// The renewal worker (src/subscriptions.rs + tests/subscriptions.rs)
+// has its own coverage. This block is about the ADMIN surface — can an
+// operator create a recurring policy through the API, can they edit
+// it, and does the public buy-page endpoint surface the right cadence
+// fields for the front-end to render?
+// ---------------------------------------------------------------------
+
+/// Helper: swap `state.self_tier` to a Pro-equivalent licensed tier
+/// (carries `unlimited_products`, `unlimited_policies`, AND
+/// `recurring_billing`). Mirrors what `Activate Keysat license` does
+/// in production.
+async fn upgrade_to_pro(state: &AppState) {
+    *state.self_tier.write().await = Tier::Licensed {
+        license_id: Uuid::new_v4(),
+        product_id: Uuid::new_v4(),
+        expires_at: 0,
+        entitlements: vec![
+            "self_host".into(),
+            "unlimited_products".into(),
+            "unlimited_policies".into(),
+            "unlimited_codes".into(),
+            "recurring_billing".into(),
+            "card_payments".into(),
+        ],
+    };
+}
+
+/// Operator on Creator tier (no `recurring_billing` entitlement)
+/// cannot create a recurring policy. The 402 should mention upgrade.
+#[tokio::test]
+async fn recurring_policy_blocked_on_creator_tier() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Seed a product so `product_slug` lookup succeeds and the test
+    // exercises the recurring-feature gate, not the not-found path.
+    let _ = repo::create_product(
+        &state.db,
+        "rec-blocked",
+        "Blocked",
+        "",
+        100_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let req = build_request(
+        "POST",
+        "/v1/admin/policies",
+        &[("authorization", &auth)],
+        Some(json!({
+            "product_slug": "rec-blocked",
+            "name": "Monthly",
+            "slug": "monthly",
+            "is_recurring": true,
+            "renewal_period_days": 30
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "Creator tier must see 402 for recurring=true; got {}",
+        resp.status()
+    );
+    let body = body_json(resp).await;
+    assert!(
+        body["upgrade_url"].as_str().unwrap_or("").contains("buy/keysat"),
+        "402 should carry an upgrade_url to the master Keysat: {body:?}"
+    );
+}
+
+/// Operator on Pro tier can create a monthly subscription policy. The
+/// stored row carries the recurring fields, the public list endpoint
+/// echoes them, and the policies admin list shows is_recurring=true.
+#[tokio::test]
+async fn pro_tier_creates_monthly_recurring_policy() {
+    let (state, _tmp) = make_test_state().await;
+    upgrade_to_pro(&state).await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    let _ = repo::create_product(
+        &state.db,
+        "rec-product",
+        "Recurring Product",
+        "",
+        25_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    // Create a recurring monthly policy with a 14-day trial.
+    let req = build_request(
+        "POST",
+        "/v1/admin/policies",
+        &[("authorization", &auth)],
+        Some(json!({
+            "product_slug": "rec-product",
+            "name": "Monthly",
+            "slug": "monthly",
+            "duration_seconds": 30 * 86_400,
+            "max_machines": 1,
+            "is_recurring": true,
+            "renewal_period_days": 30,
+            "grace_period_days": 7,
+            "trial_days": 14
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "create with Pro tier should succeed; got {}",
+        resp.status()
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["is_recurring"], true);
+    assert_eq!(body["renewal_period_days"], 30);
+    assert_eq!(body["grace_period_days"], 7);
+    assert_eq!(body["trial_days"], 14);
+
+    // Public buy-page API surfaces the same shape so the JS price
+    // renderer can reach for it.
+    let req = build_request("GET", "/v1/products/rec-product/policies", &[], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let policies = body["policies"].as_array().expect("policies array");
+    let monthly = policies
+        .iter()
+        .find(|p| p["slug"] == "monthly")
+        .expect("monthly policy in public list");
+    assert_eq!(monthly["is_recurring"], true);
+    assert_eq!(monthly["renewal_period_days"], 30);
+    assert_eq!(monthly["trial_days"], 14);
+}
+
+/// Validation: recurring=true with renewal_period_days=0 must be rejected.
+/// Catches a foot-gun where the operator forgets to fill in the cadence.
+#[tokio::test]
+async fn recurring_requires_positive_period() {
+    let (state, _tmp) = make_test_state().await;
+    upgrade_to_pro(&state).await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    let _ = repo::create_product(&state.db, "rec-bad", "Bad", "", 100, &json!({}))
+        .await
+        .expect("create_product");
+
+    let req = build_request(
+        "POST",
+        "/v1/admin/policies",
+        &[("authorization", &auth)],
+        Some(json!({
+            "product_slug": "rec-bad",
+            "name": "Bad",
+            "slug": "bad",
+            "is_recurring": true,
+            "renewal_period_days": 0
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "is_recurring=true with renewal_period_days=0 must be rejected"
+    );
+}
+
+/// Edit-policy can flip a non-recurring policy to recurring on Pro tier
+/// and a Pro-tier-gated operator gets a 402 trying the same.
+#[tokio::test]
+async fn edit_policy_to_recurring_respects_tier_gate() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Pre-create product + non-recurring policy directly via the repo,
+    // so we don't need to go through Pro tier just for setup.
+    let product = repo::create_product(
+        &state.db,
+        "rec-edit",
+        "Edit Test",
+        "",
+        100_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+    let policy = repo::create_policy(
+        &state.db,
+        &product.id,
+        "Default",
+        "default",
+        0,
+        0,
+        1,
+        false,
+        None,
+        &[],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig::off(),
+    )
+    .await
+    .expect("create_policy");
+
+    // Creator-tier attempt to flip is_recurring=true → 402.
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/policies/{}", policy.id),
+        &[("authorization", &auth)],
+        Some(json!({
+            "is_recurring": true,
+            "renewal_period_days": 30
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "flipping a policy to recurring on Creator tier must 402"
+    );
+
+    // Upgrade and try again.
+    upgrade_to_pro(&state).await;
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/policies/{}", policy.id),
+        &[("authorization", &auth)],
+        Some(json!({
+            "is_recurring": true,
+            "renewal_period_days": 30,
+            "trial_days": 7
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "Pro tier can flip a policy to recurring"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["is_recurring"], true);
+    assert_eq!(body["renewal_period_days"], 30);
+    assert_eq!(body["trial_days"], 7);
+
+    // Idempotency: a second PATCH that LEAVES is_recurring true should
+    // succeed and not re-fire the tier gate. Drop back to Creator and
+    // PATCH a tangential field — must still work.
+    *state.self_tier.write().await = Tier::Unlicensed {
+        reason: "downgraded".into(),
+    };
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/policies/{}", policy.id),
+        &[("authorization", &auth)],
+        Some(json!({ "name": "Renamed Default" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "name-only patch on a recurring policy must not re-fire the tier gate"
+    );
+}

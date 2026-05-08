@@ -1373,6 +1373,53 @@ The request will be refused if there are licenses or invoices tied to it — use
       if (cb) cb.checked = true
     }, 0)
 
+    // -- Recurring subscription (Pro tier) --
+    const RENEWAL_PRESETS = [
+      { value: '30',  label: 'Monthly (30 days)' },
+      { value: '90',  label: 'Quarterly (90 days)' },
+      { value: '180', label: 'Semi-annual (180 days)' },
+      { value: '365', label: 'Annual (365 days)' },
+      { value: 'custom', label: 'Custom (in days)' },
+    ]
+    const isRecurringInit = !!pol.is_recurring
+    const renewalDaysInit = pol.renewal_period_days || 30
+    const matchedRenewal = RENEWAL_PRESETS.find(
+      (p) => p.value === String(renewalDaysInit) && p.value !== 'custom'
+    )
+    const initialRenewalPreset = matchedRenewal ? matchedRenewal.value : 'custom'
+    const recurField = formCheckbox('e_pol_is_recurring', 'This policy is a recurring subscription')
+    const renewalPresetField = formSelect('e_pol_renewal_preset', 'Renewal cadence', RENEWAL_PRESETS, { value: initialRenewalPreset })
+    const renewalCustomField = formInput('e_pol_renewal_days', 'Custom (days)', {
+      type: 'number', value: String(renewalDaysInit),
+    })
+    const gracePeriodField = formInput('e_pol_grace_period_days', 'Grace period after renewal (days)', {
+      type: 'number', value: String(pol.grace_period_days == null ? 7 : pol.grace_period_days),
+    })
+    const trialDaysField = formInput('e_pol_trial_days', 'Free trial (days)', {
+      type: 'number', value: String(pol.trial_days || 0),
+    })
+    if (isRecurringInit) setTimeout(() => {
+      const cb = card.querySelector('[name=e_pol_is_recurring]')
+      if (cb) cb.checked = true
+      syncRecurringEdit()
+    }, 0)
+
+    function syncRecurringEdit() {
+      const on = !!card.querySelector('[name=e_pol_is_recurring]').checked
+      const presetEl = card.querySelector('[name=e_pol_renewal_preset]')
+      const customEl = card.querySelector('[name=e_pol_renewal_days]')
+      const graceEl = card.querySelector('[name=e_pol_grace_period_days]')
+      const trialEl = card.querySelector('[name=e_pol_trial_days]')
+      ;[presetEl, graceEl, trialEl].forEach((e) => {
+        if (e) { e.disabled = !on; e.style.opacity = on ? '1' : '0.5' }
+      })
+      if (customEl) {
+        const customOn = on && presetEl && presetEl.value === 'custom'
+        customEl.disabled = !customOn
+        customEl.style.opacity = customOn ? '1' : '0.5'
+      }
+    }
+
     const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px;' }, '')
     const card = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
@@ -1392,6 +1439,15 @@ The request will be refused if there are licenses or invoices tied to it — use
       el('div', { class: 'row-2' }, [graceField, machinesField]),
       entField,
       el('div', { class: 'row-2' }, [highlightField, trialField]),
+      // Recurring subscription block
+      el('div', {
+        style: 'margin-top:14px; padding-top:12px; border-top:1px dashed var(--border-1)',
+      }, [
+        el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'Recurring subscription (Pro)'),
+        recurField,
+        el('div', { class: 'row-2', style: 'margin-top:8px' }, [renewalPresetField, renewalCustomField]),
+        el('div', { class: 'row-2' }, [gracePeriodField, trialDaysField]),
+      ]),
       status,
       el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
         el('button', { class: 'btn primary', onclick: async function () {
@@ -1417,6 +1473,18 @@ The request will be refused if there are licenses or invoices tied to it — use
             else delete newMetadata.highlight
             const priceRaw = card.querySelector('[name=e_pol_price]').value.trim()
             const price_sats_override = priceRaw === '' ? null : Math.max(0, parseInt(priceRaw, 10) || 0)
+            // Recurring subscription — send the fields whenever the operator
+            // touched any of them so update_policy can validate the post-update
+            // shape consistently. Easiest invariant: always send all four.
+            const isRecurring = card.querySelector('[name=e_pol_is_recurring]').checked
+            const renewalPreset = card.querySelector('[name=e_pol_renewal_preset]').value
+            const renewalCustom = parseInt(card.querySelector('[name=e_pol_renewal_days]').value, 10) || 0
+            const renewalDays = renewalPreset === 'custom'
+              ? renewalCustom
+              : parseInt(renewalPreset, 10)
+            const gracePeriodDays = parseInt(card.querySelector('[name=e_pol_grace_period_days]').value, 10)
+            const trialDays = parseInt(card.querySelector('[name=e_pol_trial_days]').value, 10) || 0
+
             const body = {
               name: card.querySelector('[name=e_pol_name]').value.trim(),
               duration_seconds,
@@ -1426,6 +1494,10 @@ The request will be refused if there are licenses or invoices tied to it — use
               entitlements: ents,
               metadata: newMetadata,
               price_sats_override,
+              is_recurring: isRecurring,
+              renewal_period_days: isRecurring ? renewalDays : (pol.renewal_period_days || 0),
+              grace_period_days: isNaN(gracePeriodDays) ? 7 : gracePeriodDays,
+              trial_days: trialDays,
             }
             await api('/v1/admin/policies/' + pol.id, { method: 'PATCH', body })
             overlay.remove()
@@ -1441,6 +1513,14 @@ The request will be refused if there are licenses or invoices tied to it — use
     overlay.appendChild(card)
     overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
     document.body.appendChild(overlay)
+
+    // Wire the recurring section's enable/disable sync now that the card
+    // is in the DOM and inputs are queryable.
+    const recurEl = card.querySelector('[name=e_pol_is_recurring]')
+    const renewalPresetEl = card.querySelector('[name=e_pol_renewal_preset]')
+    if (recurEl) recurEl.addEventListener('change', syncRecurringEdit)
+    if (renewalPresetEl) renewalPresetEl.addEventListener('change', syncRecurringEdit)
+    syncRecurringEdit()
   }
 
   // -------- Policies --------
@@ -1540,6 +1620,39 @@ The request will be refused if there are licenses or invoices tied to it — use
           formCheckbox('is_trial', 'Trial flag (sets TRIAL bit on the signed license)'),
         ]),
 
+        // ---------- Recurring subscription (Pro tier) ----------
+        el('div', {
+          style: 'margin:18px 0 12px; padding-top:14px; border-top:1px dashed var(--border-1)',
+        }, [
+          el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'Recurring subscription (Pro)'),
+          el('p', { class: 'hint', style: 'margin:0 0 10px' },
+            'Bill the buyer on a repeating cycle (monthly, annual, etc.). The renewal worker creates a fresh BTCPay/Zaprite invoice every period; if the buyer doesn\'t pay within the grace window, the license lapses automatically. Pro tier required.'),
+          formCheckbox('is_recurring', 'This policy is a recurring subscription'),
+          el('div', { class: 'row-2', style: 'margin-top:10px' }, [
+            formSelect('renewal_preset', 'Renewal cadence', [
+              { value: '30',  label: 'Monthly (30 days)' },
+              { value: '90',  label: 'Quarterly (90 days)' },
+              { value: '180', label: 'Semi-annual (180 days)' },
+              { value: '365', label: 'Annual (365 days)' },
+              { value: 'custom', label: 'Custom (in days)' },
+            ], { value: '30' }),
+            formInput('renewal_period_days', 'Custom (days)', {
+              type: 'number', value: '30',
+              hint: 'Used only when "Custom" is selected. Min 1, max ~1825 (5 years).',
+            }),
+          ]),
+          el('div', { class: 'row-2' }, [
+            formInput('grace_period_days', 'Grace period after renewal (days)', {
+              type: 'number', value: '7',
+              hint: 'How long the license stays valid past the renewal date if the buyer hasn\'t paid yet. After this, the subscription transitions to "lapsed". Default 7.',
+            }),
+            formInput('trial_days', 'Free trial (days)', {
+              type: 'number', value: '0',
+              hint: 'Optional. 0 = no trial. The first invoice is still issued (for $0/1 sat) so buyer email + license flow are consistent; the renewal worker charges the real price after the trial period.',
+            }),
+          ]),
+        ]),
+
         // ---------- Tip recipient (optional) ----------
         el('div', {
           style: 'margin:18px 0 12px; padding-top:14px; border-top:1px dashed var(--border-1)',
@@ -1620,6 +1733,24 @@ The request will be refused if there are licenses or invoices tied to it — use
               body.tip_pct_bps = tipPctBps
               if (tipLabel) body.tip_label = tipLabel
             }
+            // Recurring subscription — only attach when the operator
+            // ticked the box, so non-recurring policies stay clean.
+            const isRecurring = create.querySelector('[name=is_recurring]').checked
+            if (isRecurring) {
+              const renewalPresetEl = create.querySelector('[name=renewal_preset]')
+              const renewalCustomEl = create.querySelector('[name=renewal_period_days]')
+              const renewalPreset = renewalPresetEl.value
+              const renewalCustomDays = parseInt(renewalCustomEl.value, 10) || 0
+              const renewalDays = renewalPreset === 'custom'
+                ? renewalCustomDays
+                : parseInt(renewalPreset, 10)
+              const graceDays = parseInt(create.querySelector('[name=grace_period_days]').value, 10)
+              const trialDays = parseInt(create.querySelector('[name=trial_days]').value, 10) || 0
+              body.is_recurring = true
+              body.renewal_period_days = renewalDays
+              body.grace_period_days = isNaN(graceDays) ? 7 : graceDays
+              body.trial_days = trialDays
+            }
             await api('/v1/admin/policies', { method: 'POST', body })
             status.replaceWith(ok('Created. Reloading…'))
             setTimeout(routes.policies, 600)
@@ -1646,6 +1777,29 @@ The request will be refused if there are licenses or invoices tied to it — use
     }
     presetEl.addEventListener('change', syncDurationCustom)
     syncDurationCustom()
+
+    // Recurring section: gray everything out unless the box is ticked,
+    // and gray the custom-days input unless "Custom" is selected. Keeps
+    // the form visually honest about what will actually be submitted.
+    const recurEl = create.querySelector('[name=is_recurring]')
+    const renewalPresetEl = create.querySelector('[name=renewal_preset]')
+    const renewalCustomEl = create.querySelector('[name=renewal_period_days]')
+    const graceEl = create.querySelector('[name=grace_period_days]')
+    const trialEl = create.querySelector('[name=trial_days]')
+    function syncRecurring() {
+      const on = recurEl.checked
+      ;[renewalPresetEl, graceEl, trialEl].forEach((e) => {
+        if (e) { e.disabled = !on; e.style.opacity = on ? '1' : '0.5' }
+      })
+      if (renewalCustomEl) {
+        const customOn = on && renewalPresetEl.value === 'custom'
+        renewalCustomEl.disabled = !customOn
+        renewalCustomEl.style.opacity = customOn ? '1' : '0.5'
+      }
+    }
+    recurEl.addEventListener('change', syncRecurring)
+    renewalPresetEl.addEventListener('change', syncRecurring)
+    syncRecurring()
 
     // When the product changes, prefill the price-override field with that
     // product's base price. The operator can still edit afterward; this just
@@ -1683,9 +1837,20 @@ The request will be refused if there are licenses or invoices tied to it — use
           el('td', null, pol.duration_seconds === 0 ? 'perpetual' : pol.duration_seconds + 's'),
           el('td', null, pol.grace_seconds + 's'),
           el('td', null, pol.max_machines === 0 ? '∞' : String(pol.max_machines)),
-          el('td', null, pol.is_trial
-            ? el('span', { class: 'badge b-warning' }, 'trial')
-            : el('span', { class: 'muted' }, '–')),
+          el('td', null,
+            // Stack trial + recurring badges in one cell. Both can be set
+            // independently (a recurring policy can also have a trial bit).
+            pol.is_trial || pol.is_recurring
+              ? el('span', { style: 'display:inline-flex; gap:4px; flex-wrap:wrap' }, [
+                  pol.is_trial ? el('span', { class: 'badge b-warning' }, 'trial') : null,
+                  pol.is_recurring
+                    ? el('span', {
+                        class: 'badge b-gold',
+                        title: 'Renews every ' + (pol.renewal_period_days || 0) + ' days',
+                      }, 'every ' + (pol.renewal_period_days || 0) + 'd')
+                    : null,
+                ].filter(Boolean))
+              : el('span', { class: 'muted' }, '–')),
           el('td', { class: 'muted' }, (pol.entitlements || []).join(', ') || '–'),
           el('td', null, el('span', { class: 'muted' }, String(byPolicy[pol.id] || 0))),
           el('td', null, activePill(pol.active)),

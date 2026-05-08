@@ -212,6 +212,26 @@ pub async fn enforce_policy_cap(state: &AppState, product_id: &str) -> AppResult
     Ok(())
 }
 
+/// Refuse to mark a policy as recurring unless the operator's self-tier
+/// carries the `recurring_billing` entitlement. Pro and Patron tiers
+/// have it; Creator does not. Called from both create-policy and
+/// update-policy paths so operators can't sneak past by patching a
+/// non-recurring policy to recurring after creation.
+pub async fn enforce_recurring_feature(state: &AppState) -> AppResult<()> {
+    let tier = current(state).await;
+    if tier.has("recurring_billing") {
+        return Ok(());
+    }
+    Err(AppError::PaymentRequired {
+        message: format!(
+            "Recurring subscriptions require Pro or Patron. You're on {}. \
+             Upgrade to enable monthly/annual billing.",
+            tier.display_name
+        ),
+        upgrade_url: UPGRADE_URL_PRO.to_string(),
+    })
+}
+
 /// Refuse a new discount code if the operator is at the Creator-tier
 /// active-codes cap and lacks `unlimited_codes`. Counts only ACTIVE
 /// codes — operators can disable old codes to free up slots, which is

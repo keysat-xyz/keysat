@@ -763,7 +763,32 @@ const POLICY_COLS: &str = "id, product_id, name, slug, duration_seconds, grace_s
                            tip_recipient, tip_pct_bps, tip_label,
                            max_machines, is_trial, price_sats_override,
                            entitlements_json, metadata_json, active, public,
+                           is_recurring, renewal_period_days, grace_period_days, trial_days,
                            created_at, updated_at";
+
+/// Bundles the recurring-subscription knobs so we don't keep growing
+/// `create_policy`'s positional argument list. Pass `RecurringConfig::off()`
+/// for one-off policies. Validation (positive renewal period, sane trial
+/// length) lives in the API layer; the repo just persists.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecurringConfig {
+    pub is_recurring: bool,
+    pub renewal_period_days: i64,
+    /// Defaults to 7 days when omitted (matches migration 0011 default).
+    pub grace_period_days: i64,
+    pub trial_days: i64,
+}
+
+impl RecurringConfig {
+    pub fn off() -> Self {
+        Self {
+            is_recurring: false,
+            renewal_period_days: 0,
+            grace_period_days: 7,
+            trial_days: 0,
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_policy(
@@ -781,6 +806,7 @@ pub async fn create_policy(
     tip_recipient: Option<&str>,
     tip_pct_bps: i64,
     tip_label: Option<&str>,
+    recurring: RecurringConfig,
 ) -> AppResult<Policy> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -792,8 +818,10 @@ pub async fn create_policy(
         "INSERT INTO policies
            (id, product_id, name, slug, duration_seconds, grace_seconds, max_machines,
             is_trial, price_sats_override, entitlements_json, metadata_json, active, public,
-            tip_recipient, tip_pct_bps, tip_label, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?)",
+            tip_recipient, tip_pct_bps, tip_label,
+            is_recurring, renewal_period_days, grace_period_days, trial_days,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(product_id)
@@ -809,6 +837,10 @@ pub async fn create_policy(
     .bind(tip_recipient)
     .bind(tip_pct)
     .bind(tip_label)
+    .bind(recurring.is_recurring as i64)
+    .bind(recurring.renewal_period_days)
+    .bind(recurring.grace_period_days)
+    .bind(recurring.trial_days)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -882,6 +914,17 @@ pub async fn list_public_policies_by_product(
 /// have hard-coded into integration docs or buy URLs. Tip-related fields
 /// have their own admin endpoint (`set_policy_tip_config`) since they
 /// have their own validation rules (basis points, paired recipient/pct).
+/// Patch-style updates for the recurring-subscription knobs. Each field is
+/// `Option<…>` — `None` means "leave alone", `Some(v)` means "set". Bundled
+/// to keep `update_policy`'s signature manageable.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RecurringUpdate {
+    pub is_recurring: Option<bool>,
+    pub renewal_period_days: Option<i64>,
+    pub grace_period_days: Option<i64>,
+    pub trial_days: Option<i64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn update_policy(
     pool: &SqlitePool,
@@ -894,6 +937,7 @@ pub async fn update_policy(
     price_sats_override: Option<Option<i64>>,
     entitlements: Option<&[String]>,
     metadata: Option<&serde_json::Value>,
+    recurring: RecurringUpdate,
 ) -> AppResult<Policy> {
     let mut sets: Vec<&str> = Vec::new();
     if name.is_some() {
@@ -919,6 +963,18 @@ pub async fn update_policy(
     }
     if metadata.is_some() {
         sets.push("metadata_json = ?");
+    }
+    if recurring.is_recurring.is_some() {
+        sets.push("is_recurring = ?");
+    }
+    if recurring.renewal_period_days.is_some() {
+        sets.push("renewal_period_days = ?");
+    }
+    if recurring.grace_period_days.is_some() {
+        sets.push("grace_period_days = ?");
+    }
+    if recurring.trial_days.is_some() {
+        sets.push("trial_days = ?");
     }
     if sets.is_empty() {
         return get_policy_by_id(pool, id)
@@ -956,6 +1012,18 @@ pub async fn update_policy(
     if let Some(m) = metadata {
         meta_json = serde_json::to_string(m).unwrap_or_else(|_| "{}".into());
         q = q.bind(&meta_json);
+    }
+    if let Some(v) = recurring.is_recurring {
+        q = q.bind(v as i64);
+    }
+    if let Some(v) = recurring.renewal_period_days {
+        q = q.bind(v);
+    }
+    if let Some(v) = recurring.grace_period_days {
+        q = q.bind(v);
+    }
+    if let Some(v) = recurring.trial_days {
+        q = q.bind(v);
     }
     q = q.bind(&now).bind(id);
     let rows = q.execute(pool).await?.rows_affected();
@@ -1006,6 +1074,12 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
     let active_int: i64 = row.get("active");
     let is_trial_int: i64 = row.get("is_trial");
     let public_int: i64 = row.try_get("public").unwrap_or(1);
+    // Recurring fields land in migration 0011 — fall back to defaults so
+    // older databases (pre-0011, theoretically possible) don't crash here.
+    let is_recurring_int: i64 = row.try_get("is_recurring").unwrap_or(0);
+    let renewal_period_days: i64 = row.try_get("renewal_period_days").unwrap_or(0);
+    let grace_period_days: i64 = row.try_get("grace_period_days").unwrap_or(7);
+    let trial_days: i64 = row.try_get("trial_days").unwrap_or(0);
     Policy {
         id: row.get("id"),
         product_id: row.get("product_id"),
@@ -1023,6 +1097,10 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
         tip_recipient: row.get("tip_recipient"),
         tip_pct_bps: row.get("tip_pct_bps"),
         tip_label: row.get("tip_label"),
+        is_recurring: is_recurring_int != 0,
+        renewal_period_days,
+        grace_period_days,
+        trial_days,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

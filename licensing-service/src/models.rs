@@ -166,9 +166,31 @@ pub struct Policy {
     /// Defaults to true; migration 0007 adds this column.
     #[serde(default = "default_true")]
     pub public: bool,
+    /// Recurring subscription cadence (migration 0011). When `is_recurring`
+    /// is true, the renewal worker will create a fresh invoice every
+    /// `renewal_period_days` and the buy page renders the price as
+    /// "every N days" / "monthly".
+    #[serde(default)]
+    pub is_recurring: bool,
+    /// Days between renewal cycles. Ignored when `is_recurring = false`.
+    /// Common values: 30 (monthly), 365 (annual).
+    #[serde(default)]
+    pub renewal_period_days: i64,
+    /// Days the subscription stays in `past_due` before transitioning to
+    /// `lapsed`. Migration default is 7.
+    #[serde(default = "default_grace_period_days")]
+    pub grace_period_days: i64,
+    /// Free-trial length at first cycle. 0 = no trial. The first invoice
+    /// is still issued (for $0 / 1-sat) so the buyer email + license
+    /// flow is consistent; renewal worker charges the real price after
+    /// `trial_days`.
+    #[serde(default)]
+    pub trial_days: i64,
     pub created_at: String,
     pub updated_at: String,
 }
+
+fn default_grace_period_days() -> i64 { 7 }
 
 fn default_true() -> bool { true }
 

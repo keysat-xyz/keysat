@@ -595,13 +595,27 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     }}
     // Reflect new base price in the cert card. For fiat-priced
     // products the unit cell ("sats" → "USD" / "EUR") also swaps.
+    // Recurring tiers: append a cadence suffix to the unit so the
+    // headline price reads "$25 / mo" not just "$25".
     const t = TIERS[slug];
     const fmt = formatTierPrice(t);
     currentBaseFmt = fmt.amount;
     priceStrike.style.display = 'none';
     priceTag.style.display = 'none';
     const unitEl = document.querySelector('.unit');
-    if (unitEl) unitEl.textContent = fmt.unit;
+    let unitText = fmt.unit;
+    if (t.is_recurring) {{
+      const days = t.renewal_period_days || 0;
+      const suffix = days === 7 ? ' / wk'
+        : days === 30 ? ' / mo'
+        : days === 90 ? ' / qtr'
+        : days === 180 ? ' / 6mo'
+        : days === 365 ? ' / yr'
+        : days > 0 ? (' / ' + days + 'd')
+        : '';
+      unitText = fmt.unit + suffix;
+    }}
+    if (unitEl) unitEl.textContent = unitText;
     if (priceLabel) priceLabel.textContent = 'Price · ' + t.name;
     // Free tier: render "FREE", swap CTA to "Redeem license" so the
     // buyer never sees "Pay with Bitcoin" for a 0-amount product.
@@ -963,15 +977,55 @@ fn render_tier_picker(
             } else {
                 String::new()
             };
+            // Recurring-subscription cadence rendering:
+            //   - Tier card shows "Renews every N days" / "monthly" / "annually" beneath duration.
+            //   - The price unit gets a "/mo" / "/yr" / "/Nd" suffix so the headline price
+            //     reads as a subscription rate, not a one-time cost.
+            //   - First-cycle trial banner shows when trial_days > 0.
+            let (cadence_suffix, recurring_meta, trial_banner) = if p.is_recurring {
+                let days = p.renewal_period_days.max(0);
+                let (suffix, label) = match days {
+                    7 => ("/wk", "Renews weekly".to_string()),
+                    30 => ("/mo", "Renews monthly".to_string()),
+                    90 => ("/qtr", "Renews quarterly".to_string()),
+                    180 => ("/6mo", "Renews semi-annually".to_string()),
+                    365 => ("/yr", "Renews annually".to_string()),
+                    other => (
+                        // Static lifetime suffix for non-canonical cadences
+                        // (use Box::leak only for predictable known values;
+                        // fall back to plain "" + custom meta text).
+                        "",
+                        format!("Renews every {other} days"),
+                    ),
+                };
+                let trial_banner = if p.trial_days > 0 {
+                    format!(
+                        "<div class=\"tier-meta\" style=\"color:var(--gold-700); font-weight:600\">{} day free trial</div>",
+                        p.trial_days
+                    )
+                } else {
+                    String::new()
+                };
+                (
+                    suffix,
+                    format!("<div class=\"tier-meta\">{}</div>", html_escape(&label)),
+                    trial_banner,
+                )
+            } else {
+                ("", String::new(), String::new())
+            };
             format!(
-                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}<div class="tier-name">{name}</div><div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}</span></div>{dur_html}{trial_meta}{description_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}<div class="tier-name">{name}</div><div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,
                 slug = slug_attr,
                 popular_pill = popular_pill,
                 name = name,
                 price_fmt = price_fmt,
                 price_unit = price_unit,
+                cadence_suffix = cadence_suffix,
                 dur_html = dur_html,
+                recurring_meta = recurring_meta,
+                trial_banner = trial_banner,
                 trial_meta = trial_meta,
                 description_html = description_html,
                 entitlements_html = entitlements_html,
@@ -1017,6 +1071,9 @@ fn build_tiers_json(
                 "price_sats": price_sats_value,
                 "price_currency": product.price_currency,
                 "price_value": price_value,
+                "is_recurring": p.is_recurring,
+                "renewal_period_days": p.renewal_period_days,
+                "trial_days": p.trial_days,
             }),
         );
     }

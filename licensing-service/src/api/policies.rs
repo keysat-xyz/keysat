@@ -52,10 +52,69 @@ pub struct CreatePolicyReq {
     /// Free-form label for the tip recipient (audit/UI).
     #[serde(default)]
     pub tip_label: Option<String>,
+    /// Recurring-subscription cadence (migration 0011). When `is_recurring`
+    /// is true, the renewal worker re-invoices every `renewal_period_days`.
+    /// Pro-tier feature.
+    #[serde(default)]
+    pub is_recurring: bool,
+    #[serde(default)]
+    pub renewal_period_days: i64,
+    /// Days the subscription stays in `past_due` before lapsing. Defaults
+    /// to 7 (matches migration default) when omitted on a recurring policy.
+    #[serde(default)]
+    pub grace_period_days: Option<i64>,
+    /// Optional free-trial length at the first cycle. 0 = no trial.
+    #[serde(default)]
+    pub trial_days: i64,
 }
 
 fn default_max_machines() -> i64 {
     1
+}
+
+/// Centralised validation for the recurring-subscription knobs. Called
+/// from both create + update paths so the rules stay in one place. We
+/// reject internally inconsistent combos (recurring=true with period=0,
+/// trial>renewal period, etc.) so the renewal worker never has to
+/// defensively normalize bad rows.
+fn validate_recurring(
+    is_recurring: bool,
+    renewal_period_days: i64,
+    grace_period_days: i64,
+    trial_days: i64,
+) -> AppResult<()> {
+    if !is_recurring {
+        // Non-recurring policy: ignore the other knobs (they may be
+        // carried in legacy callers).
+        return Ok(());
+    }
+    if renewal_period_days <= 0 {
+        return Err(AppError::BadRequest(
+            "renewal_period_days must be > 0 when is_recurring=true".into(),
+        ));
+    }
+    if renewal_period_days > 366 * 5 {
+        return Err(AppError::BadRequest(
+            "renewal_period_days unreasonably large (>5 years)".into(),
+        ));
+    }
+    if grace_period_days < 0 {
+        return Err(AppError::BadRequest("grace_period_days must be >= 0".into()));
+    }
+    if grace_period_days > 90 {
+        return Err(AppError::BadRequest(
+            "grace_period_days capped at 90 — operators wanting longer should disable lapsing manually".into(),
+        ));
+    }
+    if trial_days < 0 {
+        return Err(AppError::BadRequest("trial_days must be >= 0".into()));
+    }
+    if trial_days > renewal_period_days {
+        return Err(AppError::BadRequest(format!(
+            "trial_days ({trial_days}) cannot exceed renewal_period_days ({renewal_period_days})"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn create(
@@ -104,6 +163,28 @@ pub async fn create(
         ));
     }
     let tip_label = req.tip_label.as_deref().filter(|s| !s.trim().is_empty());
+
+    // Recurring config: fall back to migration default (7 days grace) when
+    // operator omits the field. Validation rejects inconsistent combos.
+    let grace_period_days = req.grace_period_days.unwrap_or(7);
+    validate_recurring(
+        req.is_recurring,
+        req.renewal_period_days,
+        grace_period_days,
+        req.trial_days,
+    )?;
+    // Pro-tier gate: only Pro/Patron can create recurring policies. Free
+    // and Creator tiers see a 402 with an upgrade URL.
+    if req.is_recurring {
+        crate::api::tier::enforce_recurring_feature(&state).await?;
+    }
+    let recurring = repo::RecurringConfig {
+        is_recurring: req.is_recurring,
+        renewal_period_days: req.renewal_period_days,
+        grace_period_days,
+        trial_days: req.trial_days,
+    };
+
     let policy = repo::create_policy(
         &state.db,
         &product.id,
@@ -119,6 +200,7 @@ pub async fn create(
         tip_recipient,
         req.tip_pct_bps,
         tip_label,
+        recurring,
     )
     .await?;
     let _ = repo::insert_audit(
@@ -341,6 +423,17 @@ pub struct UpdatePolicyReq {
     pub entitlements: Option<Vec<String>>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Recurring-subscription knobs. Each is optional (`None` = "leave
+    /// untouched"). Validation rejects internally inconsistent combos
+    /// (e.g. flipping is_recurring=true while leaving renewal_period_days=0).
+    #[serde(default)]
+    pub is_recurring: Option<bool>,
+    #[serde(default)]
+    pub renewal_period_days: Option<i64>,
+    #[serde(default)]
+    pub grace_period_days: Option<i64>,
+    #[serde(default)]
+    pub trial_days: Option<i64>,
 }
 
 fn deser_double_option_i64<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
@@ -375,6 +468,41 @@ pub async fn update(
         }
     }
 
+    // Validate recurring-subscription knobs *if* any are being touched. We
+    // need to load the current row to fill in untouched fields so the
+    // validator sees the post-update shape.
+    if req.is_recurring.is_some()
+        || req.renewal_period_days.is_some()
+        || req.grace_period_days.is_some()
+        || req.trial_days.is_some()
+    {
+        let current = repo::get_policy_by_id(&state.db, &id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("policy '{id}'")))?;
+        let next_is_recurring = req.is_recurring.unwrap_or(current.is_recurring);
+        let next_renewal = req
+            .renewal_period_days
+            .unwrap_or(current.renewal_period_days);
+        let next_grace = req.grace_period_days.unwrap_or(current.grace_period_days);
+        let next_trial = req.trial_days.unwrap_or(current.trial_days);
+        validate_recurring(next_is_recurring, next_renewal, next_grace, next_trial)?;
+        // Pro-tier gate: refuse to flip a policy to recurring on a
+        // tier without `recurring_billing`. We only check on a positive
+        // transition (false → true) — patches that leave is_recurring
+        // alone or turn it OFF are fine for everyone.
+        let was_recurring = current.is_recurring;
+        if !was_recurring && next_is_recurring {
+            crate::api::tier::enforce_recurring_feature(&state).await?;
+        }
+    }
+
+    let recurring_update = repo::RecurringUpdate {
+        is_recurring: req.is_recurring,
+        renewal_period_days: req.renewal_period_days,
+        grace_period_days: req.grace_period_days,
+        trial_days: req.trial_days,
+    };
+
     let updated = repo::update_policy(
         &state.db,
         &id,
@@ -386,6 +514,7 @@ pub async fn update(
         req.price_sats_override,
         req.entitlements.as_deref(),
         req.metadata.as_ref(),
+        recurring_update,
     )
     .await?;
     let _ = repo::insert_audit(
@@ -403,6 +532,10 @@ pub async fn update(
             "max_machines": req.max_machines,
             "price_sats_override": req.price_sats_override,
             "entitlements": req.entitlements,
+            "is_recurring": req.is_recurring,
+            "renewal_period_days": req.renewal_period_days,
+            "grace_period_days": req.grace_period_days,
+            "trial_days": req.trial_days,
         }),
     )
     .await;
@@ -492,6 +625,11 @@ pub async fn list_public_policies(
                 "is_trial": p.is_trial,
                 "entitlements": p.entitlements,
                 "highlighted": highlighted,
+                // Recurring-subscription cadence — buy page renders
+                // "Renews every N days" / "$X/month" when is_recurring=true.
+                "is_recurring": p.is_recurring,
+                "renewal_period_days": p.renewal_period_days,
+                "trial_days": p.trial_days,
             })
         })
         .collect();

@@ -16,6 +16,7 @@
 //!
 //! State machine recap (full diagram in the design doc):
 //!
+//! ```text
 //!     ┌─────────┐  cycle ends   ┌──────────┐
 //!     │ active  │ ────────────▶ │ past_due │
 //!     └─────────┘               └──────────┘
@@ -26,6 +27,7 @@
 //!                                ┌────────┐
 //!                                │ lapsed │
 //!                                └────────┘
+//! ```
 //!
 //! Cancellation can flip from `active` or `past_due` → `cancelled`
 //! at any point (admin or buyer-initiated). Cancelled subs stop
