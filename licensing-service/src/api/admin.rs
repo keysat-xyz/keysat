@@ -386,6 +386,14 @@ pub async fn delete_product(
 
 /// Patch mutable fields on a product. Slug is NOT editable — it's part
 /// of the public buy URL.
+///
+/// Two pricing forms accepted, mirroring the create endpoint:
+/// - Legacy: `price_sats` alone (treated as a SAT-currency update).
+/// - Typed:  `price_currency` + `price_value`. Either both or neither.
+///   Sending a different currency than the product's current one
+///   IS allowed — operators can convert a SAT product to USD pricing
+///   in place. The daemon doesn't auto-recompute the sat-equivalent
+///   for past invoices; future invoices use the new currency.
 #[derive(Debug, Deserialize)]
 pub struct UpdateProductReq {
     #[serde(default)]
@@ -394,6 +402,10 @@ pub struct UpdateProductReq {
     pub description: Option<String>,
     #[serde(default)]
     pub price_sats: Option<i64>,
+    #[serde(default)]
+    pub price_currency: Option<String>,
+    #[serde(default)]
+    pub price_value: Option<i64>,
 }
 
 pub async fn update_product(
@@ -404,17 +416,65 @@ pub async fn update_product(
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_admin(&state, &headers)?;
     let (ip, ua) = request_context(&headers);
-    if let Some(p) = req.price_sats {
-        if p < 0 {
-            return Err(AppError::BadRequest("price_sats must be >= 0".into()));
+
+    // Resolve the pricing patch into (currency, value, sats) tuple
+    // before passing to the repo. This mirrors the create-side
+    // `resolve_price` validation so the same accept-both-forms
+    // semantics apply on PATCH.
+    let pricing_patch: Option<(String, i64)> = match (
+        req.price_currency.as_deref(),
+        req.price_value,
+        req.price_sats,
+    ) {
+        // Typed form
+        (Some(cur), Some(value), maybe_legacy) => {
+            let cur = cur.to_uppercase();
+            if !ACCEPTED_CURRENCIES.iter().any(|c| *c == cur) {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported price_currency '{cur}'; accepted: {}",
+                    ACCEPTED_CURRENCIES.join(", ")
+                )));
+            }
+            if value < 0 {
+                return Err(AppError::BadRequest("price_value must be >= 0".into()));
+            }
+            if let Some(legacy) = maybe_legacy {
+                if cur != "SAT" || legacy != value {
+                    return Err(AppError::BadRequest(
+                        "send price_currency + price_value, OR price_sats alone — \
+                         not both with mismatched values".into(),
+                    ));
+                }
+            }
+            Some((cur, value))
         }
-    }
-    let updated = repo::update_product(
+        // Legacy SAT-only.
+        (None, None, Some(sats)) => {
+            if sats < 0 {
+                return Err(AppError::BadRequest("price_sats must be >= 0".into()));
+            }
+            Some(("SAT".to_string(), sats))
+        }
+        (Some(_), None, _) => {
+            return Err(AppError::BadRequest(
+                "price_currency was supplied but price_value is missing".into(),
+            ));
+        }
+        (None, Some(_), _) => {
+            return Err(AppError::BadRequest(
+                "price_value was supplied but price_currency is missing".into(),
+            ));
+        }
+        // No pricing change — nothing to validate.
+        (None, None, None) => None,
+    };
+
+    let updated = repo::update_product_with_currency(
         &state.db,
         &id,
         req.name.as_deref(),
         req.description.as_deref(),
-        req.price_sats,
+        pricing_patch.as_ref().map(|(c, v)| (c.as_str(), *v)),
     )
     .await?;
     let _ = repo::insert_audit(

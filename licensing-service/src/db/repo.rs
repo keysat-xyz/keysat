@@ -162,13 +162,37 @@ pub async fn set_product_active(pool: &SqlitePool, id: &str, active: bool) -> Ap
 /// Patch mutable fields on a product. `slug` and `id` are intentionally
 /// not editable — slug is part of the public buy URL, and changing it
 /// would break links operators have shared. Each Option is "Some →
-/// update, None → leave alone."
+/// update, None → leave alone." Pricing patch goes through
+/// `update_product_with_currency`; this is the legacy SAT-only entry.
 pub async fn update_product(
     pool: &SqlitePool,
     id: &str,
     name: Option<&str>,
     description: Option<&str>,
     price_sats: Option<i64>,
+) -> AppResult<Product> {
+    update_product_with_currency(
+        pool,
+        id,
+        name,
+        description,
+        price_sats.map(|s| ("SAT", s)),
+    )
+    .await
+}
+
+/// Currency-aware update_product. The pricing patch is `(currency, value)`;
+/// `value` is in the smallest indivisible unit of `currency` (sats for
+/// SAT, cents for USD/EUR). For SAT-currency updates `price_sats` is
+/// also written (keeping the legacy column in sync). For fiat updates
+/// `price_sats` is set to 0 — the next invoice creation will populate
+/// it via the rate fetcher.
+pub async fn update_product_with_currency(
+    pool: &SqlitePool,
+    id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    pricing_patch: Option<(&str, i64)>,
 ) -> AppResult<Product> {
     let mut sets: Vec<&str> = Vec::new();
     if name.is_some() {
@@ -177,12 +201,12 @@ pub async fn update_product(
     if description.is_some() {
         sets.push("description = ?");
     }
-    if price_sats.is_some() {
-        // Dual-write so SAT-currency products keep `price_value`
-        // in sync. Fiat-priced products will use a separate
-        // `update_product_currency_value` (lands with the admin
-        // UI for fiat pricing).
+    // Pricing patch writes to all three columns (price_sats,
+    // price_currency, price_value) so the row is internally
+    // consistent regardless of which currency the operator picks.
+    if pricing_patch.is_some() {
         sets.push("price_sats = ?");
+        sets.push("price_currency = ?");
         sets.push("price_value = ?");
     }
     if sets.is_empty() {
@@ -200,9 +224,14 @@ pub async fn update_product(
     if let Some(v) = description {
         q = q.bind(v);
     }
-    if let Some(v) = price_sats {
-        q = q.bind(v);
-        q = q.bind(v); // for the paired price_value placeholder
+    if let Some((currency, value)) = pricing_patch {
+        // For SAT, price_sats == price_value; for fiat, price_sats
+        // is reset to 0 (gets populated by rate fetcher at next
+        // invoice creation).
+        let initial_sats = if currency == "SAT" { value } else { 0 };
+        q = q.bind(initial_sats);
+        q = q.bind(currency);
+        q = q.bind(value);
     }
     q = q.bind(&now).bind(id);
     let rows = q.execute(pool).await?.rows_affected();

@@ -1087,8 +1087,9 @@ The request will be refused if there are licenses or invoices tied to it — use
 
   // -------- Products --------
   // Edit-product modal. Opens when the operator clicks Edit on a product
-  // row. Mutable: name, description, price_sats. Slug is intentionally not
-  // editable (it's part of the public buy URL — changing breaks bookmarks).
+  // row. Mutable: name, description, price (currency + value). Slug is
+  // intentionally not editable (it's part of the public buy URL —
+  // changing it would break bookmarks).
   function openEditProduct(p) {
     const overlay = el('div', {
       style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
@@ -1096,7 +1097,41 @@ The request will be refused if there are licenses or invoices tied to it — use
     })
     const nameField = formInput('e_p_name', 'Display name', { value: p.name || '', required: true })
     const descField = formInput('e_p_description', 'Description', { textarea: true, value: p.description || '' })
-    const priceField = formInput('e_p_price', 'Price (sats)', { type: 'number', value: String(p.price_sats || 0), required: true })
+
+    // Currency-aware price inputs. For SAT-currency products, show
+    // the integer sat amount. For USD/EUR, render the cents value
+    // back to a decimal main-unit string ($49.00) and accept
+    // decimals on save.
+    const initialCurrency = (p.price_currency || 'SAT').toUpperCase()
+    const initialDisplay = initialCurrency === 'SAT'
+      ? String(p.price_value || p.price_sats || 0)
+      : ((p.price_value || 0) / 100).toFixed(2)
+
+    const curPicker = el('select', { class: 'input', name: 'e_p_currency' }, [
+      el('option', { value: 'SAT' }, 'sats'),
+      el('option', { value: 'USD' }, 'USD ($)'),
+      el('option', { value: 'EUR' }, 'EUR (€)'),
+    ])
+    curPicker.value = initialCurrency
+    const priceInput = el('input', {
+      class: 'input', name: 'e_p_price', type: 'number',
+      step: initialCurrency === 'SAT' ? '1' : '0.01',
+      min: '0', value: initialDisplay, required: 'required',
+    })
+    curPicker.addEventListener('change', () => {
+      priceInput.step = curPicker.value === 'SAT' ? '1' : '0.01'
+      // Don't auto-clobber the value — let the operator decide if
+      // the displayed number still makes sense in the new unit.
+      // Show a hint instead.
+      hint.textContent = curPicker.value === 'SAT'
+        ? 'sats — whole numbers only.'
+        : 'Decimal entry, e.g. 49.00. Converted to BTC at each invoice using the daemon\'s rate fetcher.'
+    })
+    const hint = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px' },
+      initialCurrency === 'SAT'
+        ? 'sats — whole numbers only.'
+        : 'Decimal entry, e.g. 49.00. Converted to BTC at each invoice using the daemon\'s rate fetcher.')
+
     const status = el('div', { class: 'muted', style: 'margin-top:6px; font-size:12.5px;' }, '')
     const card = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
@@ -1109,16 +1144,22 @@ The request will be refused if there are licenses or invoices tied to it — use
         'Slug is not editable — it is part of your public /buy/' + p.slug + ' URL. Disable + create a new product if you need to rename.'),
       nameField,
       descField,
-      priceField,
+      el('label', { style: 'display:block; font-weight:600; font-size:13px; margin:12px 0 4px' }, 'Price'),
+      el('div', { style: 'display:flex; gap:8px; align-items:flex-start' }, [priceInput, curPicker]),
+      hint,
       status,
       el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
         el('button', { class: 'btn primary', onclick: async function () {
           status.textContent = 'Saving…'
           try {
+            const currency = curPicker.value
+            const rawValue = parseFloat(priceInput.value) || 0
+            const priceValue = currency === 'SAT' ? Math.round(rawValue) : Math.round(rawValue * 100)
             const body = {
               name: card.querySelector('[name=e_p_name]').value.trim(),
               description: card.querySelector('[name=e_p_description]').value || '',
-              price_sats: Math.max(0, parseInt(card.querySelector('[name=e_p_price]').value, 10) || 0),
+              price_currency: currency,
+              price_value: Math.max(0, priceValue),
             }
             await api('/v1/admin/products/' + p.id, { method: 'PATCH', body })
             overlay.remove()
