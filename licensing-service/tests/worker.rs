@@ -69,6 +69,7 @@ async fn make_state() -> (AppState, NamedTempFile) {
         self_tier: Arc::new(RwLock::new(Tier::Unlicensed {
             reason: "test".into(),
         })),
+        rates: keysat::rates::RateCache::new(),
     };
     (state, tmp)
 }

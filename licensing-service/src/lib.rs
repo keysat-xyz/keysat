@@ -18,6 +18,7 @@ pub mod license_self;
 pub mod models;
 pub mod payment;
 pub mod rate_limit;
+pub mod rates;
 pub mod reconcile;
 pub mod tipping;
 pub mod webhooks;

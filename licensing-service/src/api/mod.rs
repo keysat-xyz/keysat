@@ -71,6 +71,7 @@ pub mod tier;
 pub mod validate;
 pub mod community;
 pub mod db_info;
+pub mod rates_admin;
 pub mod recover;
 pub mod webhook;
 pub mod webhook_deliveries;
@@ -103,6 +104,10 @@ pub struct AppState {
     /// Keysat-licenses-Keysat tier. Read at boot, swapped when the
     /// operator activates a fresh license via the admin endpoint.
     pub self_tier: Arc<RwLock<crate::license_self::Tier>>,
+    /// BTC/fiat rate cache for multi-currency products. See
+    /// src/rates.rs. Process-global so cached rates aren't refetched
+    /// per-request.
+    pub rates: Arc<crate::rates::RateCache>,
 }
 
 impl AppState {
@@ -325,6 +330,12 @@ pub fn router(state: AppState) -> Router {
         // Database health snapshot — operator-facing sanity check
         // against the catastrophic-loss risk; see db_info.rs.
         .route("/v1/admin/db-info", get(db_info::get))
+        // BTC/fiat rate cache — operator-facing view of what the
+        // daemon would quote for fiat-priced products. See
+        // src/rates.rs for the source chain (Kraken → Coinbase
+        // → CoinGecko) and TTL caching semantics.
+        .route("/v1/admin/rates", get(rates_admin::get))
+        .route("/v1/admin/rates/refresh", post(rates_admin::refresh))
         // Opt-in community analytics. Off by default; toggling on
         // requires the operator to confirm a collector URL.
         .route(

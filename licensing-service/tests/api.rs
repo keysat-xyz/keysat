@@ -113,6 +113,7 @@ async fn make_test_state() -> (AppState, NamedTempFile) {
         self_tier: Arc::new(RwLock::new(Tier::Unlicensed {
             reason: "test fixture".into(),
         })),
+        rates: keysat::rates::RateCache::new(),
     };
     (state, tmp)
 }
@@ -1137,6 +1138,83 @@ async fn recover_returns_license_key_for_matching_pair() {
     .await
     .unwrap();
     assert_eq!(audit_count, 1, "recovery must write an audit row");
+}
+
+/// Rate fetcher: manual pin in settings table overrides the source
+/// chain. Locks in the test-mode + maintenance-window contract that
+/// other phases (invoice rate recording, buy-page rendering) rely on.
+#[tokio::test]
+async fn rate_cache_honors_manual_pin_from_settings() {
+    let (state, _tmp) = make_test_state().await;
+
+    // Pin USD at $65,000 / BTC. The fetcher MUST return this value
+    // without hitting any external API.
+    sqlx::query("INSERT INTO settings(key, value, updated_at) VALUES('manual_rate_pin_USD', '65000', ?)")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let rate = keysat::rates::get_rate(&state, "USD")
+        .await
+        .expect("manual pin should resolve without network");
+    assert_eq!(rate.units_per_btc, 65000.0);
+    assert_eq!(rate.source, "manual_pin");
+
+    // Convert $49.00 (4900 cents) to sats. At $65k/BTC:
+    // sats = 4900 * 1_000_000 / 65000 = 75,384.6 → 75,385.
+    let conv = keysat::rates::convert_to_sats(&state, "USD", 4900)
+        .await
+        .expect("convert");
+    assert_eq!(conv.sats, 75_385, "rounding tie-break: 75384.615 rounds to 75385");
+    assert_eq!(
+        conv.rate_centibps,
+        Some(650_000_000),
+        "rate stored as units×10000: 65000 × 10000"
+    );
+
+    // SAT-currency conversions are identity (no rate involved).
+    let sat_conv = keysat::rates::convert_to_sats(&state, "SAT", 50_000)
+        .await
+        .unwrap();
+    assert_eq!(sat_conv.sats, 50_000);
+    assert!(sat_conv.rate_centibps.is_none());
+}
+
+/// Admin endpoint visibility: GET /v1/admin/rates returns whatever
+/// is currently cached, including manual pins. Operators can verify
+/// the daemon's current quote against external sources before
+/// trusting fiat-priced invoice flows.
+#[tokio::test]
+async fn admin_rates_endpoint_reflects_manual_pin() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    sqlx::query("INSERT INTO settings(key, value, updated_at) VALUES('manual_rate_pin_USD', '60000', ?)")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // Trigger a rate read so the cache populates.
+    let _ = keysat::rates::get_rate(&state, "USD").await.unwrap();
+
+    let req = build_request(
+        "GET",
+        "/v1/admin/rates",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let rates = body["rates"].as_array().expect("rates array");
+    let usd = rates
+        .iter()
+        .find(|r| r["currency"] == "USD")
+        .expect("USD entry should be present");
+    assert_eq!(usd["units_per_btc"], 60_000.0);
+    assert_eq!(usd["source"], "manual_pin");
 }
 
 /// Multi-currency product creation. The admin endpoint accepts both

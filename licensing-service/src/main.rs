@@ -77,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         payment: Arc::new(tokio::sync::RwLock::new(provider)),
         config: Arc::new(cfg.clone()),
         self_tier,
+        rates: keysat::rates::RateCache::new(),
     };
 
     // Spawn background loops before handing state to the router.
