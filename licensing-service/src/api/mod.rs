@@ -69,6 +69,8 @@ pub mod self_license;
 pub mod session_layer;
 pub mod tier;
 pub mod validate;
+pub mod db_info;
+pub mod recover;
 pub mod webhook;
 pub mod webhook_deliveries;
 pub mod webhook_endpoints;
@@ -191,6 +193,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/purchase/:invoice_id", get(purchase::status))
         .route("/v1/redeem", post(redeem::redeem))
         .route("/v1/validate", post(validate::validate))
+        // Buyer self-service recovery (lost key → re-derive from
+        // settled invoice + buyer email).
+        .route("/recover", get(recover::page))
+        .route("/v1/recover", post(recover::recover))
         // Client-facing machine endpoints.
         .route("/v1/machines/activate", post(machines::activate))
         .route("/v1/machines/heartbeat", post(machines::heartbeat))
@@ -315,6 +321,9 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/webhook-deliveries/:id/retry",
             post(webhook_deliveries::retry),
         )
+        // Database health snapshot — operator-facing sanity check
+        // against the catastrophic-loss risk; see db_info.rs.
+        .route("/v1/admin/db-info", get(db_info::get))
         // Discount / referral codes.
         .route(
             "/v1/admin/discount-codes",

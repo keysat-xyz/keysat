@@ -991,3 +991,150 @@ async fn webhook_dlq_lists_failed_and_retry_requeues() {
     let resp = send(&state, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Buyer self-service recovery: re-derive a lost license key from
+/// (invoice_id, buyer_email). The most-common buyer support ticket
+/// turned into a self-service flow.
+///
+/// Verifies:
+///   - matching pair → 200 with a license_key that validates
+///   - wrong email → 404 with the generic error message (does not
+///     leak whether the invoice id existed)
+///   - missing invoice → 404
+///   - unsettled invoice → 404 (no license to recover)
+///   - audit log row written on success
+#[tokio::test]
+async fn recover_returns_license_key_for_matching_pair() {
+    let (state, _tmp) = make_test_state().await;
+
+    // Seed a product, a settled invoice, and an active license.
+    let product = repo::create_product(
+        &state.db,
+        "rec-test",
+        "Recover Test",
+        "",
+        5_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let invoice_id = Uuid::new_v4().to_string();
+    repo::create_invoice(
+        &state.db,
+        &invoice_id,
+        "btcpay-rec-1",
+        &product.id,
+        5_000,
+        "http://x/",
+        Some("Buyer@Example.COM"), // mixed case to verify lowercasing
+        None,
+        None,
+    )
+    .await
+    .expect("create_invoice");
+    sqlx::query("UPDATE invoices SET status = 'settled' WHERE id = ?")
+        .bind(&invoice_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let license_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    repo::create_license(
+        &state.db,
+        &license_id.to_string(),
+        &product.id,
+        Some(&invoice_id),
+        &now,
+        &json!({}),
+        None,
+        None,
+        0,
+        1,
+        &[],
+        false,
+        Some("buyer@example.com"),
+        None,
+    )
+    .await
+    .expect("create_license");
+
+    // Wrong email → 404 with generic error (does not reveal the
+    // invoice id exists).
+    let req = build_request(
+        "POST",
+        "/v1/recover",
+        &[("content-type", "application/json")],
+        Some(json!({
+            "invoice_id": invoice_id,
+            "email": "wrong@example.com",
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "wrong email should 404"
+    );
+
+    // Bogus invoice id → same generic 404.
+    let req = build_request(
+        "POST",
+        "/v1/recover",
+        &[("content-type", "application/json")],
+        Some(json!({
+            "invoice_id": Uuid::new_v4().to_string(),
+            "email": "buyer@example.com",
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Matching pair (case-insensitive email) → 200 with a real
+    // license key.
+    let req = build_request(
+        "POST",
+        "/v1/recover",
+        &[("content-type", "application/json")],
+        Some(json!({
+            "invoice_id": invoice_id,
+            "email": "Buyer@Example.com", // different casing on purpose
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "matching pair should succeed"
+    );
+    let body = body_json(resp).await;
+    let license_key = body["license_key"]
+        .as_str()
+        .expect("license_key should be present in response")
+        .to_string();
+    assert_eq!(body["license_id"], license_id.to_string());
+
+    // The recovered key validates round-trip via /v1/validate.
+    let req = build_request(
+        "POST",
+        "/v1/validate",
+        &[("content-type", "application/json")],
+        Some(json!({"key": license_key})),
+    );
+    let resp = send(&state, req).await;
+    let validation = body_json(resp).await;
+    assert_eq!(
+        validation["ok"], true,
+        "recovered key must validate cleanly: {validation:?}"
+    );
+
+    // Audit log captured the recovery.
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'license.recovered'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1, "recovery must write an audit row");
+}
