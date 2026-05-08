@@ -191,11 +191,13 @@ const RECOVER_PAGE_HTML: &str = r##"<!DOCTYPE html>
   h1 { margin: 0 0 8px; font-family: "Archivo", Georgia, serif; font-weight: 600; font-size: 24px; }
   p.intro { margin: 0 0 24px; color: #5a6178; line-height: 1.5; }
   label { display: block; font-size: 14px; font-weight: 600; margin: 16px 0 6px; }
+  /* font-size: 16px on inputs prevents iOS Safari from zooming in
+     when the user taps a field (it auto-zooms for anything <16px). */
   input { width: 100%; padding: 10px 12px; box-sizing: border-box;
-          border: 1px solid #c5b994; border-radius: 6px; font-size: 15px;
+          border: 1px solid #c5b994; border-radius: 6px; font-size: 16px;
           font-family: "JetBrains Mono", Menlo, monospace; }
   button { margin-top: 20px; width: 100%; padding: 12px; background: #1a2238;
-           color: #f6f1e7; border: 0; border-radius: 6px; font-size: 15px;
+           color: #f6f1e7; border: 0; border-radius: 6px; font-size: 16px;
            font-weight: 600; cursor: pointer; }
   button:disabled { opacity: 0.6; cursor: wait; }
   pre { margin: 16px 0 0; padding: 12px; background: #1a2238; color: #f6f1e7;
@@ -203,6 +205,15 @@ const RECOVER_PAGE_HTML: &str = r##"<!DOCTYPE html>
         white-space: pre-wrap; }
   .err { color: #b03020; margin-top: 12px; font-size: 14px; }
   .ok { color: #1a6b3a; margin-top: 12px; font-size: 14px; font-weight: 600; }
+  /* Tighten on narrow phones — the desktop 48px outer padding +
+     32px card padding eats the viewport on 360px screens. */
+  @media (max-width: 480px) {
+    body { padding: 24px 12px; }
+    main { padding: 22px 18px; border-radius: 10px; }
+    h1 { font-size: 21px; }
+    label { font-size: 13px; }
+    button { padding: 14px; }
+  }
 </style>
 </head>
 <body>

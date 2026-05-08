@@ -186,7 +186,11 @@ body {{
 }}
 .eyebrow::before {{ content:''; display:inline-block; width:28px; height:1px; background:var(--gold-500); }}
 h1 {{
-  font-family:var(--font-display); font-weight:500; font-size:42px;
+  font-family:var(--font-display); font-weight:500;
+  /* Fluid type — scales smoothly from ~28px on phones to 42px on
+     desktop without an extra breakpoint. min/max guard the
+     edges so it never gets too small or too large. */
+  font-size:clamp(28px, 7vw, 42px);
   line-height:1.05; letter-spacing:-0.022em; color:var(--navy-950);
   margin:0 0 12px;
 }}
@@ -249,6 +253,24 @@ h1 {{
 .tiers-4 {{ grid-template-columns:repeat(2, 1fr); }}
 @media (max-width:560px) {{
   .tiers-2, .tiers-3, .tiers-4 {{ grid-template-columns:1fr; }}
+}}
+/* Phone-sized viewports: tighten outer rhythm so the cert + form
+   fit without a long preamble of whitespace. The desktop layout
+   has 48px top margin and 32px cert padding, both of which feel
+   wasteful on a 360-390px wide screen. */
+@media (max-width:480px) {{
+  .topbar {{ padding:12px 16px; }}
+  .topbar .inner {{ font-size:13px; letter-spacing:0.22em; gap:8px; }}
+  .topbar .operator {{ font-size:11px; }}
+  .wrap {{ margin:24px auto; padding:0 16px; }}
+  .cert {{ padding:24px 22px 22px; }}
+  .price {{ font-size:30px; }}
+  .description {{ font-size:15px; margin:0 0 24px; }}
+  .tier {{ padding:18px 16px; }}
+  .tier.selected {{ padding:17px 15px; }}
+  .tier-name {{ font-size:17px; }}
+  .tier-price {{ font-size:24px; }}
+  .field input {{ font-size:16px; }}  /* prevent iOS zoom-on-focus */
 }}
 .tier {{
   position:relative;

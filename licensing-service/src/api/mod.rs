@@ -660,6 +660,18 @@ footer.kfooter {{
 }}
 footer.kfooter a {{ color:var(--ink-500); text-decoration:none; }}
 footer.kfooter a:hover {{ color:var(--navy-900); }}
+/* Mobile breakpoint — desktop-rhythm padding crowds 360-390px screens. */
+@media (max-width:480px) {{
+  .topbar {{ padding:12px 16px; }}
+  .topbar .inner {{ font-size:13px; letter-spacing:0.22em; gap:8px; }}
+  .topbar .operator {{ font-size:11px; }}
+  .wrap {{ margin:24px auto; padding:0 16px; }}
+  h1 {{ font-size:clamp(26px, 7vw, 38px); }}
+  .lede {{ font-size:15px; margin:0 0 22px; }}
+  .pending-card, .license-success, .error-card {{ padding:22px 20px 20px; }}
+  .pending-card h2 {{ font-size:20px; }}
+  footer.kfooter {{ margin-top:32px; padding:14px; }}
+}}
 </style>
 </head>
 <body>
