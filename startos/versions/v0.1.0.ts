@@ -9,8 +9,22 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const v0_1_0 = VersionInfo.of({
-  version: '0.1.0:44',
+  version: '0.1.0:45',
   releaseNotes: [
+    `Alpha-iteration revision 45 of v0.1.0 — Buyer self-service license recovery and a database-health admin endpoint. Two operator-facing additions that close real friction points the v0.2 plan called out.`,
+    ``,
+    `**Buyer self-service recovery.** Until now, the recovery flow for "I lost my license key" was "DM the operator with your invoice id and we re-send" — operator-time scaling badly. v0.1.0:45 ships \`POST /v1/recover\` and a server-rendered \`GET /recover\` HTML form. A buyer enters their invoice id (handed to them at checkout) and the email they paid with; if both match a settled invoice in the daemon's database, the same signed license key is re-derived and returned. No support ticket, no operator involvement.`,
+    ``,
+    `Security shape: case-insensitive email comparison. Generic 404 on any mismatch — does NOT distinguish "invoice not found" from "wrong email" so an attacker can't brute-force email addresses against a known invoice id. Per-IP rate limit at 10 requests/minute. Each recovery is audit-logged as \`license.recovered\` with the email's SHA-256 hash so the log doesn't store PII. The HTML form has no JS framework dependency, no cookies — designed for a customer who's just had a catastrophic failure of their primary computer.`,
+    ``,
+    `Operators can point customers at \`https://your-keysat.example/recover\` from their thank-you emails or in-app license-management screens.`,
+    ``,
+    `**GET /v1/admin/db-info.** Cheap insurance against the catastrophic-loss risk on \`/data/keysat.db\`. Reports the file's path + on-disk size, the most-recent-write timestamp (max across audit_log, invoices, licenses), and operator-meaningful row counts (products, policies, total + active licenses, total + settled invoices, active machines, discount codes, audit log entries). Doesn't report when StartOS last backed it up — the daemon has no visibility into the host's snapshot subsystem. What it gives is a "I expected ~50 licenses and I see ~50 licenses; the file is N MB; the last write was 6 hours ago" sanity check before any of those numbers go wrong unnoticed.`,
+    ``,
+    `**Test count: 31** (added one integration test exercising the full recovery flow including the round-trip "recovered key validates via /v1/validate" assertion).`,
+    ``,
+    `**Upgrade path.** v0.1.0:44 → v0.1.0:45 is a straight drop-in. No new migrations, no schema changes, no behaviour changes for existing endpoints.`,
+    ``,
     `Alpha-iteration revision 44 of v0.1.0 — DLQ visible in the admin UI, payment-provider trait migration completes, worker behaviour pinned by tests, and the daemon's wire-format parser is now cross-checked against the shared SDK vectors. Test count: 30 (was 23). Operator-visible: failed webhook deliveries now show up in the dashboard with one-click retry.`,
     ``,
     `**Webhook DLQ in the dashboard.** The admin endpoints from :43 (\`GET /v1/admin/webhook-deliveries\`, \`POST /v1/admin/webhook-deliveries/:id/retry\`) were operator-actionable via curl but invisible in the UI. The Webhooks page now has a "Delivery history" section directly below the registered endpoints, defaulting to the "Failed (DLQ)" filter so the problem case is what you see first. Each row shows created-at, event type, status badge, attempt count, last status code, and the last error inline beneath the status badge — no separate "details" view to chase. Non-delivered rows get a Retry button that re-queues via the existing endpoint; the worker picks it up on its next 5s tick.`,
