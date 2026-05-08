@@ -199,11 +199,15 @@ async fn run_tip(
         }
     };
 
-    // Pay it via the operator's BTCPay Lightning node.
-    let btcpay = match state.btcpay_client().await {
-        Ok(c) => c,
+    // Pay it via the active provider's LN node. Provider-agnostic;
+    // BTCPay implements `pay_lightning_invoice` today, future
+    // providers either implement it (Zaprite via Strike?) or fall
+    // through to the trait default which returns a "not supported"
+    // error that we record as a failed tip.
+    let provider = match state.payment_provider().await {
+        Ok(p) => p,
         Err(e) => {
-            let detail = format!("BTCPay client unavailable: {e:?}");
+            let detail = format!("payment provider unavailable: {e:?}");
             repo::record_tip_attempt(
                 &state.db,
                 license_id,
@@ -222,17 +226,13 @@ async fn run_tip(
         }
     };
 
-    match btcpay.pay_lightning_invoice(&invoice).await {
-        Ok(payment) => {
-            let payment_hash = payment
-                .get("paymentHash")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+    match provider.pay_lightning_invoice(&invoice).await {
+        Ok(receipt) => {
             tracing::info!(
                 license = %license_id,
                 recipient = %recipient,
                 amount_sats = tip_sats,
-                payment_hash = ?payment_hash,
+                payment_hash = ?receipt.payment_hash,
                 "tip sent"
             );
             repo::record_tip_attempt(
@@ -244,8 +244,12 @@ async fn run_tip(
                 pct,
                 label.as_deref(),
                 "sent",
-                Some(&format!("paid via BTCPay LN node ({} sats)", tip_sats)),
-                payment_hash.as_deref(),
+                Some(&format!(
+                    "paid via {} LN node ({} sats)",
+                    provider.kind().as_str(),
+                    tip_sats
+                )),
+                receipt.payment_hash.as_deref(),
             )
             .await
             .ok();

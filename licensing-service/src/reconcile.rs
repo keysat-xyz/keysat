@@ -41,8 +41,12 @@ pub fn spawn(state: AppState) {
 }
 
 async fn tick(state: &AppState) -> anyhow::Result<()> {
-    let btcpay = match state.btcpay_client().await {
-        Ok(c) => c,
+    // Provider-agnostic. Each provider's impl handles the
+    // provider-specific status-string normalization (BTCPay's
+    // "Settled"/"Complete"/"Expired"/"Invalid" → ProviderInvoiceStatus
+    // enum); this loop just operates on the typed result.
+    let provider = match state.payment_provider().await {
+        Ok(p) => p,
         Err(_) => return Ok(()), // not configured yet — skip silently
     };
 
@@ -56,21 +60,17 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     tracing::debug!(count = pending.len(), "reconciling pending invoices");
 
     for inv in pending {
-        match btcpay.get_invoice(&inv.btcpay_invoice_id).await {
-            Ok(raw) => {
-                let status_str = raw
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let normalized = match status_str.as_str() {
-                    "Settled" | "Complete" => Some("settled"),
-                    "Expired" => Some("expired"),
-                    "Invalid" => Some("invalid"),
-                    // still in flight
-                    _ => None,
+        match provider.get_invoice_status(&inv.btcpay_invoice_id).await {
+            Ok(status) => {
+                use crate::payment::ProviderInvoiceStatus::*;
+                let new_status = match status {
+                    Settled => "settled",
+                    Expired => "expired",
+                    Invalid => "invalid",
+                    // Pending stays pending; Refunded is a v0.3 surface
+                    // that the webhook handler also short-circuits on.
+                    Pending | Refunded => continue,
                 };
-                let Some(new_status) = normalized else { continue };
 
                 if new_status == inv.status.as_str() {
                     continue; // no-op

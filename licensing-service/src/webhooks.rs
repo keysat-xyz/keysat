@@ -91,7 +91,11 @@ pub fn spawn_delivery_worker(state: AppState) {
     });
 }
 
-async fn tick(state: &AppState) -> anyhow::Result<()> {
+/// Process up to 25 due deliveries: HMAC-sign, POST, mark each
+/// success/failure. Public so integration tests can drive the worker
+/// synchronously (the spawned background task in
+/// `spawn_delivery_worker` simply calls this every 5s).
+pub async fn tick(state: &AppState) -> anyhow::Result<()> {
     let due = repo::list_ready_deliveries(&state.db, 25)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
