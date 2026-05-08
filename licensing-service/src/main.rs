@@ -6,7 +6,9 @@
 //! changes between targets.
 
 use anyhow::Context;
-use keysat::{api, btcpay, config, crypto, db, license_self, payment, reconcile, webhooks};
+use keysat::{
+    analytics, api, btcpay, config, crypto, db, license_self, payment, reconcile, webhooks,
+};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -80,6 +82,10 @@ async fn main() -> anyhow::Result<()> {
     // Spawn background loops before handing state to the router.
     reconcile::spawn(state.clone());
     webhooks::spawn_delivery_worker(state.clone());
+    // Opt-in community analytics — every tick checks the toggle
+    // and short-circuits if disabled (default), so spawning is safe
+    // unconditionally.
+    analytics::spawn(state.clone());
 
     // Hourly session reaper — drops sessions whose expires_at < now.
     {

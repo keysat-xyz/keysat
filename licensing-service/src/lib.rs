@@ -7,6 +7,7 @@
 //! background tasks. Tests bypass that wrapper and construct `AppState`
 //! programmatically.
 
+pub mod analytics;
 pub mod api;
 pub mod btcpay;
 pub mod config;

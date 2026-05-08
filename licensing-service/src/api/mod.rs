@@ -69,6 +69,7 @@ pub mod self_license;
 pub mod session_layer;
 pub mod tier;
 pub mod validate;
+pub mod community;
 pub mod db_info;
 pub mod recover;
 pub mod webhook;
@@ -324,6 +325,16 @@ pub fn router(state: AppState) -> Router {
         // Database health snapshot — operator-facing sanity check
         // against the catastrophic-loss risk; see db_info.rs.
         .route("/v1/admin/db-info", get(db_info::get))
+        // Opt-in community analytics. Off by default; toggling on
+        // requires the operator to confirm a collector URL.
+        .route(
+            "/v1/admin/community-analytics",
+            get(community::get).post(community::set),
+        )
+        .route(
+            "/v1/admin/community-analytics/reset",
+            post(community::reset),
+        )
         // Discount / referral codes.
         .route(
             "/v1/admin/discount-codes",

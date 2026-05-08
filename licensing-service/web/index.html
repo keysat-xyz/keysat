@@ -892,6 +892,12 @@ The request will be refused if there are licenses or invoices tied to it — use
       sBtc.querySelector('.value').textContent = '?'
     }
 
+    // Community analytics opt-in card. Off by default; spelled out
+    // exactly what gets sent so the operator's choice is informed.
+    const analyticsCard = el('div', { class: 'card' })
+    target.appendChild(analyticsCard)
+    renderAnalyticsCard(analyticsCard)
+
     // Public key fetch — pulls PEM from /v1/issuer/public-key (no auth
     // required) and displays a short preview. Copy button copies the full
     // PEM, including BEGIN/END headers, ready to paste into source.
@@ -922,6 +928,97 @@ The request will be refused if there are licenses or invoices tied to it — use
       el('div', { class: 'value' }, value),
       sub ? el('div', { class: 'sub' }, sub) : null,
     ])
+  }
+
+  // Renders the "Help improve Keysat" card on Overview. Off by default;
+  // operators see exactly what gets sent before opting in. Toggling on
+  // requires confirming a collector URL — without one, the daemon
+  // doesn't beacon even with the toggle on.
+  async function renderAnalyticsCard(card) {
+    card.innerHTML = ''
+    let s
+    try {
+      s = await api('/v1/admin/community-analytics')
+    } catch (e) {
+      card.appendChild(el('p', { class: 'muted' }, 'Could not load analytics state: ' + e.message))
+      return
+    }
+
+    const headerLeft = el('div', null, [
+      el('h3', { style: 'margin:0 0 4px' }, 'Help improve Keysat'),
+      el('p', { class: 'muted', style: 'margin:0; font-size:14px' },
+        'Send an anonymous daily heartbeat so we can show real adoption numbers on the public dashboard.'),
+    ])
+    const toggle = el('label', {
+      style: 'display:inline-flex; align-items:center; gap:10px; font-weight:600; font-size:14px; cursor:pointer'
+    }, [
+      el('input', { type: 'checkbox', checked: s.enabled ? 'checked' : null }),
+      s.enabled ? 'Enabled' : 'Disabled',
+    ])
+    const toggleInput = toggle.querySelector('input')
+    card.appendChild(el('div', {
+      style: 'display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:16px'
+    }, [headerLeft, toggle]))
+
+    // Collector URL field. Required to actually send anything; the
+    // toggle being on without a URL is "armed but silent".
+    const urlInput = el('input', {
+      class: 'input',
+      type: 'url',
+      placeholder: 'https://keysat.xyz/community/v1/heartbeat (or your own collector)',
+      value: s.collector_url || '',
+      style: 'width:100%; box-sizing:border-box; margin-bottom:8px',
+    })
+    card.appendChild(el('label', { style: 'display:block; font-weight:600; font-size:13px; margin-bottom:4px' }, 'Collector URL'))
+    card.appendChild(urlInput)
+    card.appendChild(el('p', { class: 'muted', style: 'margin:4px 0 16px; font-size:12px' },
+      'Leave blank to opt in but not send (useful while a public collector is being stood up). Once keysat.xyz/community is live, the default URL will populate here on upgrade.'))
+
+    // Privacy disclosure — show the exact JSON shape that would be sent.
+    const disclosure = el('details', { class: 'disclosure' }, [
+      el('summary', null, 'Show me exactly what gets sent'),
+      el('div', { class: 'body' }, [
+        el('p', { class: 'muted', style: 'margin:0 0 12px' },
+          'Counts are floored to the nearest 5 to prevent fingerprinting an operator by exact license count. ' +
+          'Uptime is bucketed (<1d / 1-7d / 1-4w / >4w). The install_uuid is a random UUIDv4 generated on first opt-in — ' +
+          'NOT derived from your operator name, store id, or public URL. You can wipe it any time below.'),
+        el('pre', { style: 'background:#0e1f33; color:#f6f1e7; padding:12px; border-radius:6px; font-size:12px; overflow-x:auto' },
+          JSON.stringify(s.preview_heartbeat, null, 2)),
+        s.install_uuid
+          ? el('p', { class: 'muted', style: 'margin:12px 0 8px; font-size:12px' },
+              'Your install_uuid: ' + s.install_uuid)
+          : null,
+      ].filter(Boolean)),
+    ])
+    card.appendChild(disclosure)
+
+    // Save button.
+    const saveBtn = el('button', { class: 'btn primary', style: 'margin-top:16px; margin-right:8px' }, 'Save')
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true
+      try {
+        await api('/v1/admin/community-analytics', { method: 'POST', body: {
+          enabled: toggleInput.checked,
+          collector_url: urlInput.value.trim() || null,
+        }})
+        renderAnalyticsCard(card)
+      } catch (e) {
+        alert(e.message)
+      } finally {
+        saveBtn.disabled = false
+      }
+    })
+
+    const resetBtn = el('button', { class: 'btn sm secondary', style: 'margin-top:16px' }, 'Reset install_uuid')
+    resetBtn.addEventListener('click', async () => {
+      if (!confirm('This wipes your anonymous install_uuid. Future heartbeats (if you re-enable) will use a fresh UUID. Continue?')) return
+      try {
+        await api('/v1/admin/community-analytics/reset', { method: 'POST' })
+        renderAnalyticsCard(card)
+      } catch (e) { alert(e.message) }
+    })
+    card.appendChild(saveBtn)
+    if (s.install_uuid) card.appendChild(resetBtn)
   }
 
   async function copyPubkey() {

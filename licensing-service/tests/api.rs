@@ -1138,3 +1138,159 @@ async fn recover_returns_license_key_for_matching_pair() {
     .unwrap();
     assert_eq!(audit_count, 1, "recovery must write an audit row");
 }
+
+/// Community analytics: opt-in toggle + privacy contract.
+///
+/// Locks in two invariants:
+///   - Default state is OFF; no install_uuid generated.
+///   - Enabling generates a fresh install_uuid; the heartbeat
+///     preview's counts are floored to the nearest 5 (anti-
+///     fingerprinting); no operator-identifying fields are present.
+///   - Bad collector URL → 400 (must start with http:// or https://).
+#[tokio::test]
+async fn community_analytics_opt_in_and_privacy_contract() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Default state: disabled, no install_uuid yet.
+    let req = build_request(
+        "GET",
+        "/v1/admin/community-analytics",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["enabled"], false, "must default to off");
+    assert!(
+        body["install_uuid"].is_null(),
+        "no UUID should exist before opt-in"
+    );
+    assert!(
+        body["collector_url"].is_null(),
+        "no URL should exist before opt-in"
+    );
+
+    // Bad URL → 400.
+    let req = build_request(
+        "POST",
+        "/v1/admin/community-analytics",
+        &[("authorization", &auth)],
+        Some(json!({"enabled": true, "collector_url": "ftp://wrong"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Enabling without a URL is allowed (armed but silent).
+    let req = build_request(
+        "POST",
+        "/v1/admin/community-analytics",
+        &[("authorization", &auth)],
+        Some(json!({"enabled": true, "collector_url": null})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Now an install_uuid exists.
+    let req = build_request(
+        "GET",
+        "/v1/admin/community-analytics",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    let body = body_json(resp).await;
+    assert_eq!(body["enabled"], true);
+    let uuid = body["install_uuid"]
+        .as_str()
+        .expect("install_uuid should be present after opt-in");
+    assert_eq!(uuid.len(), 36, "install_uuid should be a UUIDv4 string");
+
+    // Privacy contract: the preview heartbeat MUST contain only
+    // anonymized fields. Specifically, no operator_name, no
+    // public_url, no store_id, no api keys, no buyer info.
+    let preview = &body["preview_heartbeat"];
+    let preview_str =
+        serde_json::to_string(preview).expect("preview should serialize");
+    for forbidden in &[
+        "operator_name",
+        "public_url",
+        "store_id",
+        "api_key",
+        "buyer_email",
+        "btcpay_url",
+    ] {
+        assert!(
+            !preview_str.contains(forbidden),
+            "preview heartbeat must not contain '{forbidden}': {preview_str}"
+        );
+    }
+    // Counts must be floored to the nearest 5. Seed 23 active
+    // licenses → counts.active_licenses must be 20.
+    let product = repo::create_product(
+        &state.db,
+        "ana-prod",
+        "Analytics Test",
+        "",
+        100,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    for _ in 0..23 {
+        let lid = Uuid::new_v4().to_string();
+        repo::create_license(
+            &state.db,
+            &lid,
+            &product.id,
+            None,
+            &Utc::now().to_rfc3339(),
+            &json!({}),
+            None,
+            None,
+            0,
+            1,
+            &[],
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let req = build_request(
+        "GET",
+        "/v1/admin/community-analytics",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    let body = body_json(resp).await;
+    let preview = &body["preview_heartbeat"];
+    assert_eq!(
+        preview["counts"]["active_licenses"], 20,
+        "23 licenses must floor to 20 (anti-fingerprinting): {preview:?}"
+    );
+
+    // Reset wipes the UUID.
+    let req = build_request(
+        "POST",
+        "/v1/admin/community-analytics/reset",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let req = build_request(
+        "GET",
+        "/v1/admin/community-analytics",
+        &[("authorization", &auth)],
+        None,
+    );
+    let body = body_json(send(&state, req).await).await;
+    assert!(
+        body["install_uuid"].is_null(),
+        "install_uuid must be wiped after reset: {body:?}"
+    );
+}
