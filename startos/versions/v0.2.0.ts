@@ -58,13 +58,29 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:2 — **Zaprite payment provider lands.** Operators can now choose between BTCPay (Bitcoin-only, you run the BTCPay Server yourself) and Zaprite (Bitcoin + fiat cards via Stripe/Square, brokered by Zaprite, settles to your connected wallets). Switching is Disconnect → Connect via new StartOS Actions ("Connect Zaprite" / "Disconnect Zaprite" / "Check Zaprite connection"). Existing BTCPay-connected operators see zero change unless they explicitly switch.',
+  '',
+  'How it works: paste your Zaprite API key (created at app.zaprite.com → Settings → API) into the Connect Zaprite action. Daemon validates the key, swaps the active provider atomically. Then add a webhook in your Zaprite dashboard pointing at `<your-keysat-url>/v1/zaprite/webhook`.',
+  '',
+  '**Webhook security.** Zaprite does NOT sign webhook deliveries (verified May 2026 against their public OpenAPI + dashboard). Keysat\'s defense is the externalUniqId round-trip: we attach our local invoice UUID at order creation, and the webhook handler trusts the body only insofar as the order id resolves to a local invoice in an expected state. An attacker spoofing a webhook would need to know a UUID we never put on the wire to reach a real local invoice.',
+  '',
+  '**Migration 0011 (dormant) lands the recurring-subscriptions schema** — `subscriptions` + `subscription_invoices` tables, plus `is_recurring`/`renewal_period_days`/`grace_period_days` (default 7)/`trial_days` (default 0) columns on policies. No daemon code uses these yet; phases 2-6 of `RECURRING_SUBSCRIPTIONS_DESIGN.md` ship in follow-up releases. The schema is purely additive and existing policies inherit the safe defaults.',
+  '',
+  '**Migration 0012** adds the `zaprite_config` table (singleton row mirroring `btcpay_config` from migration 0002).',
+  '',
+  '**Limitation called out cleanly:** Zaprite\'s API has no native subscription endpoints — Keysat\'s renewal worker (when it ships) drives the cycle on our side and uses Zaprite\'s `paymentProfileId` + `POST /v1/orders/charge` to charge saved cards each cycle. This is actually a cleaner model than provider-managed subscriptions because Keysat keeps the source of truth on when to bill.',
+  '',
+  '**Test count: 41** (was 39; +2 covering the Zaprite webhook event-parsing contract and the provider kind self-identification, +1 covering migration 0011\'s populated-data backfill contract).',
+  '',
+  '**Upgrade path.** v0.2.0:1 → v0.2.0:2 is a straight drop-in. Two new SQLite migrations (0011, 0012); both are additive only. No behavior change for current operators unless they explicitly run Connect Zaprite.',
+  '',
   '0.2.0:1 — Buy-page discount-code box no longer shows a "FOUNDERS50" placeholder. Empty placeholder now; buyers paste their actual code without a misleading hint.',
   '',
   RELEASE_NOTES,
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:1',
+  version: '0.2.0:2',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
