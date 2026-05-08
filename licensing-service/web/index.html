@@ -392,6 +392,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       <a class="nav active" data-route="overview"><i data-lucide="layout-dashboard"></i>Overview</a>
       <a class="nav" data-route="products"><i data-lucide="package"></i>Products</a>
       <a class="nav" data-route="policies"><i data-lucide="file-badge"></i>Policies</a>
+      <a class="nav" data-route="subscriptions"><i data-lucide="repeat"></i>Subscriptions</a>
       <a class="nav" data-route="codes"><i data-lucide="tag"></i>Discount codes</a>
       <a class="nav" data-route="licenses"><i data-lucide="key-round"></i>Licenses</a>
       <a class="nav" data-route="machines"><i data-lucide="cpu"></i>Machines</a>
@@ -737,6 +738,7 @@ The request will be refused if there are licenses or invoices tied to it — use
     overview:  { title: 'Overview',         crumb: 'Workspace' },
     products:  { title: 'Products',         crumb: 'Workspace · Products' },
     policies:  { title: 'Policies',         crumb: 'Workspace · Policies' },
+    subscriptions: { title: 'Subscriptions', crumb: 'Workspace · Subscriptions' },
     codes:     { title: 'Discount codes',   crumb: 'Workspace · Discount codes' },
     licenses:  { title: 'Licenses',         crumb: 'Workspace · Licenses' },
     machines:  { title: 'Machines',         crumb: 'Workspace · Machines' },
@@ -1899,6 +1901,122 @@ The request will be refused if there are licenses or invoices tied to it — use
         target.appendChild(plainCard([err('Failed to load policies for ' + p.slug + ': ' + e.message)]))
       }
     }
+  }
+
+  // -------- Subscriptions --------
+  routes.subscriptions = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0' },
+        'Recurring subscriptions tied to active licenses. Cancellation here ' +
+        'is non-destructive: the license stays valid through the end of the ' +
+        'current cycle, the renewal worker just stops creating new invoices.'),
+    ]))
+
+    // Status filter pills.
+    const STATUSES = [
+      { value: '',           label: 'All' },
+      { value: 'active',     label: 'Active' },
+      { value: 'past_due',   label: 'Past due' },
+      { value: 'cancelled',  label: 'Cancelled' },
+      { value: 'lapsed',     label: 'Lapsed' },
+    ]
+    let currentFilter = ''
+    const filterRow = el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0' })
+    function renderFilterPills() {
+      filterRow.innerHTML = ''
+      STATUSES.forEach((s) => {
+        const active = s.value === currentFilter
+        const pill = el('button', {
+          class: 'btn sm ' + (active ? 'primary' : 'secondary'),
+          onclick: () => { currentFilter = s.value; renderFilterPills(); load() },
+        }, s.label)
+        filterRow.appendChild(pill)
+      })
+    }
+    renderFilterPills()
+    target.appendChild(filterRow)
+
+    const tableHost = el('div')
+    target.appendChild(tableHost)
+
+    async function load() {
+      tableHost.innerHTML = ''
+      try {
+        const url = '/v1/admin/subscriptions' + (currentFilter ? ('?status=' + currentFilter) : '')
+        const j = await api(url)
+        const subs = j.subscriptions || []
+        if (subs.length === 0) {
+          tableHost.appendChild(plainCard([
+            el('p', { class: 'muted', style: 'margin:0' }, '(no subscriptions match this filter)'),
+          ]))
+          return
+        }
+        const table = el('table', { class: 'table' })
+        const thead = el('thead', null, el('tr', null, [
+          el('th', null, 'License'),
+          el('th', null, 'Cadence'),
+          el('th', null, 'Listed price'),
+          el('th', null, 'Status'),
+          el('th', null, 'Next renewal'),
+          el('th', null, 'Failures'),
+          el('th', null, 'Actions'),
+        ]))
+        const tbody = el('tbody')
+        subs.forEach((s) => {
+          const statusBadge = (function () {
+            const klass = s.status === 'active' ? 'b-success'
+              : s.status === 'past_due' ? 'b-warning'
+              : s.status === 'cancelled' ? 'b-neutral'
+              : s.status === 'lapsed' ? 'b-danger' : 'b-neutral'
+            return el('span', { class: 'badge ' + klass }, s.status)
+          })()
+          const cadence = (s.period_days === 30 ? 'monthly'
+            : s.period_days === 90 ? 'quarterly'
+            : s.period_days === 180 ? 'semi-annual'
+            : s.period_days === 365 ? 'annual'
+            : ('every ' + s.period_days + 'd'))
+          const priceFmt = s.listed_currency === 'SAT'
+            ? (Number(s.listed_value).toLocaleString() + ' sats')
+            : ((s.listed_value / 100).toFixed(2) + ' ' + s.listed_currency)
+          const tr = el('tr', null, [
+            el('td', null, el('code', { class: 'small', title: s.license_id }, s.license_id.slice(0, 8) + '…')),
+            el('td', null, cadence),
+            el('td', null, priceFmt),
+            el('td', null, statusBadge),
+            el('td', { class: 'muted' }, s.next_renewal_at ? s.next_renewal_at.slice(0, 16).replace('T', ' ') : '–'),
+            el('td', null, String(s.consecutive_failures || 0)),
+            el('td', null, (s.status === 'active' || s.status === 'past_due')
+              ? el('button', {
+                  class: 'btn sm danger',
+                  onclick: async () => {
+                    const reason = prompt(
+                      'Cancel this subscription?\n\nThe license stays valid through the end of the current cycle. ' +
+                      'No new invoices will be created.\n\nOptional: enter a reason for the audit log:'
+                    )
+                    if (reason === null) return // user clicked Cancel
+                    try {
+                      await api('/v1/admin/subscriptions/' + s.id + '/cancel', {
+                        method: 'POST',
+                        body: { reason: reason || null },
+                      })
+                      load()
+                    } catch (e) { alert(e.message) }
+                  },
+                }, 'Cancel')
+              : el('span', { class: 'muted', style: 'font-size:12px' }, '–')),
+          ])
+          tbody.appendChild(tr)
+        })
+        table.appendChild(thead)
+        table.appendChild(tbody)
+        tableHost.appendChild(table)
+      } catch (e) {
+        tableHost.appendChild(plainCard([err('Failed to load subscriptions: ' + e.message)]))
+      }
+    }
+    load()
   }
 
   // -------- Discount codes --------
