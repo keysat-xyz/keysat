@@ -58,6 +58,12 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:3 — **Durable payment-provider switching.** Fixes a gap from v0.2.0:2 where Connect Zaprite swapped the in-memory provider but BTCPay silently re-took active on the next daemon restart. Both providers\' configurations can now coexist, with a persisted preference flag determining which one is active. New "Activate BTCPay" / "Activate Zaprite" StartOS Actions let operators flip between configured providers in one click without re-running Connect. Disconnect on either provider clears the preference only if it pointed at the disconnected one — symmetric handling preserves operator intent.',
+  '',
+  'New endpoints: `GET /v1/admin/payment-provider/status` (both configs\' state + active preference in one call), `POST /v1/admin/payment-provider/activate` (flip active without re-authorizing). The boot-time loader now reads the persisted preference, so what an operator activates today is what loads tomorrow regardless of which config rows happen to be in the DB.',
+  '',
+  'Test count: 42 (added `payment_provider_preference_round_trip` covering the full lifecycle).',
+  '',
   '0.2.0:2 — **Zaprite payment provider lands.** Operators can now choose between BTCPay (Bitcoin-only, you run the BTCPay Server yourself) and Zaprite (Bitcoin + fiat cards via Stripe/Square, brokered by Zaprite, settles to your connected wallets). Switching is Disconnect → Connect via new StartOS Actions ("Connect Zaprite" / "Disconnect Zaprite" / "Check Zaprite connection"). Existing BTCPay-connected operators see zero change unless they explicitly switch.',
   '',
   'How it works: paste your Zaprite API key (created at app.zaprite.com → Settings → API) into the Connect Zaprite action. Daemon validates the key, swaps the active provider atomically. Then add a webhook in your Zaprite dashboard pointing at `<your-keysat-url>/v1/zaprite/webhook`.',
@@ -80,7 +86,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:2',
+  version: '0.2.0:3',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
