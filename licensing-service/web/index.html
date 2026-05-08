@@ -2089,6 +2089,95 @@ The request will be refused if there are licenses or invoices tied to it — use
     } catch (e) {
       target.appendChild(plainCard([err(e.message)]))
     }
+
+    // ----- Delivery history -----
+    //
+    // Outbound deliveries get retried with exponential backoff up to
+    // 10 attempts; after that they're "dead-lettered" — sat in the
+    // DB unreachable. The new admin endpoint (v0.1.0:43) exposes them
+    // so operators can investigate and manually re-queue.
+    const status = el('select', { class: 'input', style: 'min-width:10rem' }, [
+      el('option', { value: 'all' }, 'All'),
+      el('option', { value: 'pending' }, 'Pending (in retry queue)'),
+      el('option', { value: 'delivered' }, 'Delivered'),
+      el('option', { value: 'failed', selected: 'selected' }, 'Failed (DLQ)'),
+    ])
+    const reload = el('button', { class: 'btn sm secondary', onclick: () => loadDeliveries() }, 'Reload')
+    const deliveriesContainer = el('div')
+
+    async function loadDeliveries () {
+      deliveriesContainer.innerHTML = ''
+      deliveriesContainer.appendChild(el('p', { class: 'muted' }, 'Loading…'))
+      try {
+        const params = new URLSearchParams({ status: status.value, limit: '100' })
+        const j = await api('/v1/admin/webhook-deliveries?' + params.toString())
+        const ds = j.deliveries || []
+        deliveriesContainer.innerHTML = ''
+
+        if (ds.length === 0) {
+          const empty = status.value === 'failed'
+            ? 'No failed deliveries — all webhooks are landing or in flight.'
+            : 'No deliveries match this filter.'
+          deliveriesContainer.appendChild(el('p', { class: 'muted', style: 'margin:8px 0' }, empty))
+          return
+        }
+
+        const rows = ds.map((d) => {
+          // status: delivered (delivered_at set) | failed (no next + attempts > 0) | pending (next set)
+          let pillCls = 'badge b-warning'
+          let pillDot = 'warn'
+          let pillText = 'pending'
+          if (d.delivered_at) {
+            pillCls = 'badge b-success'
+            pillDot = 'ok'
+            pillText = 'delivered'
+          } else if (!d.next_attempt_at && d.attempt_count > 0) {
+            pillCls = 'badge b-danger'
+            pillDot = 'err'
+            pillText = 'failed (DLQ)'
+          }
+          const pill = el('span', { class: pillCls }, [el('span', { class: 'dot ' + pillDot }), pillText])
+          const lastErr = d.last_error
+            ? el('div', { class: 'muted', style: 'font-size:0.85em; margin-top:4px; word-break:break-all' }, d.last_error)
+            : null
+          return el('tr', null, [
+            el('td', { class: 'muted' }, fmtDate(d.created_at)),
+            el('td', null, d.event_type),
+            el('td', null, [pill, lastErr].filter(Boolean)),
+            el('td', { class: 'muted' }, String(d.attempt_count)),
+            el('td', { class: 'muted' }, d.last_status_code ? String(d.last_status_code) : '—'),
+            el('td', null, d.delivered_at
+              ? null
+              : el('button', { class: 'btn sm secondary', onclick: async () => {
+                  try {
+                    await api('/v1/admin/webhook-deliveries/' + d.id + '/retry', { method: 'POST' })
+                    loadDeliveries()
+                  } catch (er) { alert(er.message) }
+                }}, 'Retry')),
+          ])
+        })
+        deliveriesContainer.appendChild(el('table', { class: 'data' }, [
+          el('thead', null, el('tr', null,
+            ['Created', 'Event', 'Status', 'Attempts', 'Last code', '']
+              .map((h) => el('th', null, h))
+          )),
+          el('tbody', null, rows),
+        ]))
+      } catch (e) {
+        deliveriesContainer.innerHTML = ''
+        deliveriesContainer.appendChild(err(e.message))
+      }
+    }
+    status.addEventListener('change', loadDeliveries)
+
+    target.appendChild(plainCard([
+      el('h3', { style: 'margin:0 0 8px' }, 'Delivery history'),
+      el('p', { class: 'muted', style: 'margin:0 0 12px' },
+        'Defaults to "Failed" so the DLQ is visible at a glance. Failed deliveries are dead-lettered after 10 retry attempts (~7h backoff window). "Retry" re-queues the delivery for the worker on its next 5s tick.'),
+      el('div', { style: 'display:flex; gap:8px; align-items:center; margin-bottom:12px' }, [status, reload]),
+      deliveriesContainer,
+    ]))
+    loadDeliveries()
   }
 
   // -------- Audit log --------
