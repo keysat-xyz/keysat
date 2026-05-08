@@ -58,16 +58,27 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // --- payment provider (may be None until operator connects) ---
-    let provider: Option<Arc<dyn payment::PaymentProvider>> =
-        load_btcpay_provider(&pool, &cfg).await.map(|p| {
+    // Resolution order: BTCPay first (the original / default), then
+    // Zaprite. If both are configured, BTCPay wins — operators with
+    // both connected get sat-priced flows through BTCPay; the
+    // future v0.3 multi-provider routing will let policies pick
+    // which provider handles which payment rail.
+    let provider: Option<Arc<dyn payment::PaymentProvider>> = {
+        if let Some(p) = load_btcpay_provider(&pool, &cfg).await {
             let arc: Arc<dyn payment::PaymentProvider> = Arc::new(p);
-            arc
-        });
+            Some(arc)
+        } else if let Some(p) = load_zaprite_provider(&pool).await {
+            let arc: Arc<dyn payment::PaymentProvider> = Arc::new(p);
+            Some(arc)
+        } else {
+            None
+        }
+    };
     match &provider {
         Some(p) => tracing::info!(provider = p.kind().as_str(), "payment provider connected"),
         None => tracing::warn!(
             "no payment provider yet configured — purchases will return 503 until the \
-             operator completes the 'Connect BTCPay' flow"
+             operator completes the 'Connect BTCPay' or 'Connect Zaprite' flow"
         ),
     }
 
@@ -191,6 +202,21 @@ async fn load_btcpay_provider(
             payment::btcpay::BtcpayProvider::new(client, secret.to_string())
                 .with_public_base(cfg.btcpay_public_url.clone()),
         );
+    }
+    None
+}
+
+/// Load a ZapriteProvider from the DB, if the operator has previously
+/// completed the Connect Zaprite flow. No env-var fallback because
+/// Zaprite is brand new in this codebase — operators who want it
+/// configure it via the admin UI / StartOS Action, not env vars.
+async fn load_zaprite_provider(
+    pool: &sqlx::SqlitePool,
+) -> Option<payment::zaprite::ZapriteProvider> {
+    if let Ok(Some(saved)) = payment::zaprite::config::load(pool).await {
+        let client =
+            payment::zaprite::ZapriteClient::new(&saved.base_url, &saved.api_key);
+        return Some(payment::zaprite::ZapriteProvider::new(client));
     }
     None
 }

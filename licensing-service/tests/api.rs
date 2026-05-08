@@ -1204,6 +1204,117 @@ async fn paid_purchase_in_usd_records_listed_currency_and_rate() {
     assert_eq!(row.4, 98_000);
 }
 
+/// Zaprite webhook authentication contract.
+///
+/// Zaprite doesn't sign webhooks (verified May 2026 — no HMAC,
+/// no JWT, no header-based signature). The defense Keysat uses is
+/// the externalUniqId round-trip: we set our local invoice UUID
+/// as the order's externalUniqId at creation, and the webhook
+/// handler trusts the body only insofar as we can match the
+/// Zaprite order id back to a local invoice we created.
+///
+/// This test pins the validate_webhook impl's parsing contract:
+///   - extracts the order id from `data.id` (Zaprite's payload shape)
+///   - maps event types to ProviderWebhookEvent variants
+///   - rejects payloads missing an order id
+#[tokio::test]
+async fn zaprite_webhook_event_parsing() {
+    use keysat::payment::{
+        zaprite::{ZapriteClient, ZapriteProvider},
+        PaymentProvider, ProviderWebhookEvent,
+    };
+
+    // We don't talk to Zaprite for this test — just exercise the
+    // pure-parsing branch of validate_webhook. Construct a client
+    // with bogus credentials; never used here.
+    let provider = ZapriteProvider::new(ZapriteClient::new(
+        "https://api.zaprite.test",
+        "test-key-not-used",
+    ));
+    let headers = axum::http::HeaderMap::new();
+
+    // order.paid → InvoiceSettled
+    let body = br#"{"event":"order.paid","data":{"id":"zap-order-1"}}"#;
+    let event = provider.validate_webhook(&headers, body).expect("parse");
+    match event {
+        ProviderWebhookEvent::InvoiceSettled { provider_invoice_id } => {
+            assert_eq!(provider_invoice_id, "zap-order-1");
+        }
+        other => panic!("expected InvoiceSettled, got {other:?}"),
+    }
+
+    // order.complete + order.overpaid → also Settled (operator gets paid)
+    for kind in &["order.complete", "order.overpaid"] {
+        let body = format!(r#"{{"event":"{kind}","data":{{"id":"x"}}}}"#);
+        let event = provider
+            .validate_webhook(&headers, body.as_bytes())
+            .expect("parse");
+        assert!(
+            matches!(event, ProviderWebhookEvent::InvoiceSettled { .. }),
+            "{kind} should map to Settled"
+        );
+    }
+
+    // order.expired → InvoiceExpired
+    let body = br#"{"event":"order.expired","data":{"id":"zap-order-2"}}"#;
+    let event = provider.validate_webhook(&headers, body).expect("parse");
+    assert!(matches!(
+        event,
+        ProviderWebhookEvent::InvoiceExpired { .. }
+    ));
+
+    // order.refunded → InvoiceRefunded
+    let body = br#"{"event":"order.refunded","data":{"id":"zap-order-3"}}"#;
+    let event = provider.validate_webhook(&headers, body).expect("parse");
+    assert!(matches!(
+        event,
+        ProviderWebhookEvent::InvoiceRefunded { .. }
+    ));
+
+    // Unknown event type → Other (forward-compat for new event
+    // kinds Zaprite ships in the future)
+    let body = br#"{"event":"order.partially_refunded","data":{"id":"zap-order-4"}}"#;
+    let event = provider.validate_webhook(&headers, body).expect("parse");
+    match event {
+        ProviderWebhookEvent::Other { kind, provider_invoice_id } => {
+            assert_eq!(kind, "order.partially_refunded");
+            assert_eq!(provider_invoice_id.as_deref(), Some("zap-order-4"));
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+
+    // Missing order id → reject. An attacker can't trigger any
+    // local state change without telling us which order to act on.
+    let body = br#"{"event":"order.paid","data":{}}"#;
+    let result = provider.validate_webhook(&headers, body);
+    assert!(
+        result.is_err(),
+        "payload without order id must be rejected"
+    );
+
+    // Malformed JSON → reject.
+    let body = b"not json at all";
+    let result = provider.validate_webhook(&headers, body);
+    assert!(result.is_err());
+}
+
+/// Zaprite provider self-identifies as `ProviderKind::Zaprite`.
+/// Trivial but pins the kind() return for the call sites that
+/// switch on provider identity (e.g., audit log strings).
+#[tokio::test]
+async fn zaprite_provider_kind() {
+    use keysat::payment::{
+        zaprite::{ZapriteClient, ZapriteProvider},
+        PaymentProvider, ProviderKind,
+    };
+    let p = ZapriteProvider::new(ZapriteClient::new(
+        "https://api.zaprite.test",
+        "test-key",
+    ));
+    assert_eq!(p.kind(), ProviderKind::Zaprite);
+    assert_eq!(p.kind().as_str(), "zaprite");
+}
+
 /// Rate fetcher: manual pin in settings table overrides the source
 /// chain. Locks in the test-mode + maintenance-window contract that
 /// other phases (invoice rate recording, buy-page rendering) rely on.

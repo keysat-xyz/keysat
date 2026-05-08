@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 
 pub mod btcpay;
+pub mod zaprite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

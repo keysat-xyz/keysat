@@ -73,6 +73,7 @@ pub mod community;
 pub mod db_info;
 pub mod rates_admin;
 pub mod recover;
+pub mod zaprite_authorize;
 pub mod webhook;
 pub mod webhook_deliveries;
 pub mod webhook_endpoints;
@@ -228,6 +229,28 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/btcpay/payment-methods",
             get(btcpay_authorize::payment_methods),
         )
+        // Zaprite — alternative payment provider with native fiat-card
+        // support. The connect flow is much simpler than BTCPay's because
+        // Zaprite doesn't have an OAuth-style consent endpoint; the
+        // operator pastes an API key from their Zaprite dashboard.
+        .route(
+            "/v1/admin/zaprite/connect",
+            post(zaprite_authorize::connect),
+        )
+        .route(
+            "/v1/admin/zaprite/disconnect",
+            post(zaprite_authorize::disconnect),
+        )
+        .route(
+            "/v1/admin/zaprite/status",
+            get(zaprite_authorize::status),
+        )
+        // Zaprite webhook landing — operator points Zaprite's
+        // webhook setting at this URL. Same handler as
+        // /v1/btcpay/webhook because the underlying validate_webhook
+        // is on the trait surface and the active provider self-
+        // identifies its event shape.
+        .route("/v1/zaprite/webhook", post(webhook::handle))
         .route("/v1/admin/products", post(admin::create_product))
         .route(
             "/v1/admin/products/:id",

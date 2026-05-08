@@ -21,6 +21,7 @@
 import { sdk } from '../sdk'
 import { activateLicense, showLicenseStatus } from './activateLicense'
 import { btcpayStatus, configureBtcpay, disconnectBtcpay } from './configureBtcpay'
+import { configureZaprite, disconnectZaprite, zapriteStatus } from './configureZaprite'
 import { setOperatorName } from './setOperatorName'
 import { setWebUiPassword } from './setWebUiPassword'
 import { showCredentials } from './showCredentials'
@@ -29,10 +30,14 @@ export const actions = sdk.Actions.of()
   // General
   .addAction(setOperatorName)
   .addAction(setWebUiPassword)
-  // BTCPay setup
+  // BTCPay setup (Bitcoin-only payments via your own BTCPay Server)
   .addAction(configureBtcpay)
   .addAction(btcpayStatus)
   .addAction(disconnectBtcpay)
+  // Zaprite setup (Bitcoin + fiat-card payments via Zaprite's broker)
+  .addAction(configureZaprite)
+  .addAction(zapriteStatus)
+  .addAction(disconnectZaprite)
   // Keysat self-license (Keysat-licenses-Keysat)
   .addAction(activateLicense)
   .addAction(showLicenseStatus)
