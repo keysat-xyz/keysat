@@ -1140,6 +1140,70 @@ async fn recover_returns_license_key_for_matching_pair() {
     assert_eq!(audit_count, 1, "recovery must write an audit row");
 }
 
+/// USD-priced paid purchase records the listed currency, value, and
+/// exchange rate on the invoice row. Uses a manual rate pin so the
+/// test is network-free and the conversion is exactly verifiable.
+#[tokio::test]
+async fn paid_purchase_in_usd_records_listed_currency_and_rate() {
+    let (state, _tmp) = make_test_state_with_mock_provider().await;
+
+    // Pin USD at $50,000 / BTC. $49.00 (4900 cents) → 9800 sats:
+    //   sats = 4900 * 1_000_000 / 50000 = 98000... wait
+    //   4900 * 1_000_000 = 4_900_000_000
+    //   4_900_000_000 / 50_000 = 98_000
+    sqlx::query("INSERT INTO settings(key, value, updated_at) VALUES('manual_rate_pin_USD', '50000', ?)")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // USD-priced product via the typed admin endpoint.
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "usd-app",
+            "name": "USD App",
+            "price_currency": "USD",
+            "price_value": 4900,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Initiate purchase. Should call create_invoice with the rate
+    // recorded.
+    let req = build_request(
+        "POST",
+        "/v1/purchase",
+        &[("content-type", "application/json")],
+        Some(json!({"product": "usd-app"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["amount_sats"], 98_000,
+        "$49.00 at $50k/BTC = 98,000 sats — got {body:?}"
+    );
+
+    // The invoice row carries the audit trail.
+    let row: (Option<String>, Option<i64>, Option<i64>, Option<String>, i64) = sqlx::query_as(
+        "SELECT listed_currency, listed_value, exchange_rate_centibps, \
+         exchange_rate_source, amount_sats FROM invoices WHERE btcpay_invoice_id = 'mock-inv-1'"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_deref(), Some("USD"));
+    assert_eq!(row.1, Some(4900));
+    assert_eq!(row.2, Some(500_000_000), "rate × 10000: 50000 × 10000");
+    assert_eq!(row.3.as_deref(), Some("manual_pin"));
+    assert_eq!(row.4, 98_000);
+}
+
 /// Rate fetcher: manual pin in settings table overrides the source
 /// chain. Locks in the test-mode + maintenance-window contract that
 /// other phases (invoice rate recording, buy-page rendering) rely on.

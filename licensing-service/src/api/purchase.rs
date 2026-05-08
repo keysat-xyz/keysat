@@ -108,11 +108,45 @@ pub async fn start(
         None
     };
 
-    // Effective base price: policy override if set, else product price.
-    let base_price = chosen_policy
-        .as_ref()
-        .and_then(|p| p.price_sats_override)
-        .unwrap_or(product.price_sats);
+    // Effective base price in sats. For SAT-priced products this is
+    // straightforward (policy override or product.price_sats). For
+    // fiat-priced products (USD, EUR), we convert the listed value
+    // to sats here using the daemon's rate fetcher — the rate gets
+    // recorded on the invoice row below for audit. The CONTRACT to
+    // the buyer is sat-denominated either way; the listed currency
+    // is just the operator's display preference.
+    //
+    // We capture the listed (currency, value) and the rate-source
+    // tuple so the invoice row carries the full audit trail.
+    let mut listed_currency: Option<String> = None;
+    let mut listed_value: Option<i64> = None;
+    let mut exchange_rate_centibps: Option<i64> = None;
+    let mut exchange_rate_source: Option<String> = None;
+
+    let base_price: i64 = if product.price_currency == "SAT" {
+        chosen_policy
+            .as_ref()
+            .and_then(|p| p.price_sats_override)
+            .unwrap_or(product.price_sats)
+    } else {
+        // Fiat-priced. Use the policy override (in the same currency
+        // as the product) if set, otherwise the product's listed
+        // value. v0.3 will introduce per-policy currency overrides;
+        // for now policies inherit the product's currency.
+        let listed = chosen_policy
+            .as_ref()
+            .and_then(|p| p.price_sats_override) // legacy column; may carry override in fiat units after admin UI lands
+            .unwrap_or(product.price_value);
+        let conversion =
+            crate::rates::convert_to_sats(&state, &product.price_currency, listed)
+                .await
+                .map_err(|e| AppError::Upstream(format!("rate fetch failed: {e:#}")))?;
+        listed_currency = Some(product.price_currency.clone());
+        listed_value = Some(listed);
+        exchange_rate_centibps = conversion.rate_centibps;
+        exchange_rate_source = Some(conversion.source);
+        conversion.sats
+    };
 
     // Resolve and validate the discount code if one was supplied. The
     // ordering here matters: we must atomically reserve a counter slot
@@ -336,7 +370,7 @@ pub async fn start(
     // Use internal_id we pre-generated (and baked into the BTCPay
     // redirect_url) as the local row id so /v1/purchase/<id> and
     // /thank-you?invoice_id=<id> all resolve to the same row.
-    let invoice = match repo::create_invoice(
+    let invoice = match repo::create_invoice_with_currency(
         &state.db,
         &internal_id,
         &created.provider_invoice_id,
@@ -346,6 +380,10 @@ pub async fn start(
         req.buyer_email.as_deref(),
         req.buyer_note.as_deref(),
         chosen_policy.as_ref().map(|p| p.id.as_str()),
+        listed_currency.as_deref(),
+        listed_value,
+        exchange_rate_centibps,
+        exchange_rate_source.as_deref(),
     )
     .await
     {

@@ -258,12 +258,54 @@ pub async fn create_invoice(
     buyer_note: Option<&str>,
     policy_id: Option<&str>,
 ) -> AppResult<Invoice> {
+    create_invoice_with_currency(
+        pool,
+        id,
+        btcpay_invoice_id,
+        product_id,
+        amount_sats,
+        checkout_url,
+        buyer_email,
+        buyer_note,
+        policy_id,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Currency-aware invoice creation. For SAT-priced products, the
+/// listed_/exchange_ args are all `None` (sat-priced flows have no
+/// rate to record). For fiat-priced products, the caller passes the
+/// listed currency + value (what the buyer SAW) and the rate
+/// (centibps + source) used to convert to BTC. amount_sats is
+/// always the BTC amount the buyer is actually billed.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_invoice_with_currency(
+    pool: &SqlitePool,
+    id: &str,
+    btcpay_invoice_id: &str,
+    product_id: &str,
+    amount_sats: i64,
+    checkout_url: &str,
+    buyer_email: Option<&str>,
+    buyer_note: Option<&str>,
+    policy_id: Option<&str>,
+    listed_currency: Option<&str>,
+    listed_value: Option<i64>,
+    exchange_rate_centibps: Option<i64>,
+    exchange_rate_source: Option<&str>,
+) -> AppResult<Invoice> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO invoices
          (id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-          amount_sats, checkout_url, policy_id, created_at, updated_at)
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
+          amount_sats, checkout_url, policy_id,
+          listed_currency, listed_value, exchange_rate_centibps, exchange_rate_source,
+          created_at, updated_at)
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(btcpay_invoice_id)
@@ -273,6 +315,10 @@ pub async fn create_invoice(
     .bind(amount_sats)
     .bind(checkout_url)
     .bind(policy_id)
+    .bind(listed_currency)
+    .bind(listed_value)
+    .bind(exchange_rate_centibps)
+    .bind(exchange_rate_source)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -1715,6 +1761,45 @@ pub async fn create_discount_code(
     referrer_label: Option<&str>,
     description: &str,
 ) -> AppResult<DiscountCode> {
+    create_discount_code_with_currency(
+        pool,
+        code,
+        kind,
+        amount,
+        "SAT",
+        max_uses,
+        expires_at,
+        applies_to_product_id,
+        applies_to_policy_id,
+        referrer_label,
+        description,
+    )
+    .await
+}
+
+/// Currency-aware discount code creation. `discount_currency` is
+/// 'SAT' (default), 'USD', or 'EUR' — interpretation depends on
+/// `kind`:
+///   - 'percent': basis points, currency-agnostic (recorded for audit).
+///   - 'fixed_sats': amount is in the smallest unit of currency
+///                   (sats for SAT, cents for USD/EUR). Name is
+///                   stale post-Phase 6 but kept for back-compat.
+///   - 'set_price': amount is in the smallest unit of currency.
+///   - 'free_license': amount + currency irrelevant.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_discount_code_with_currency(
+    pool: &SqlitePool,
+    code: &str,
+    kind: &str,
+    amount: i64,
+    discount_currency: &str,
+    max_uses: Option<i64>,
+    expires_at: Option<&str>,
+    applies_to_product_id: Option<&str>,
+    applies_to_policy_id: Option<&str>,
+    referrer_label: Option<&str>,
+    description: &str,
+) -> AppResult<DiscountCode> {
     if !matches!(
         kind,
         "percent" | "fixed_sats" | "set_price" | "free_license"
@@ -1767,15 +1852,16 @@ pub async fn create_discount_code(
     let stored_amount = if kind == "free_license" { 0 } else { amount };
     sqlx::query(
         "INSERT INTO discount_codes
-         (id, code, kind, amount, max_uses, used_count, expires_at,
+         (id, code, kind, amount, discount_currency, max_uses, used_count, expires_at,
           applies_to_product_id, applies_to_policy_id, referrer_label,
           description, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&id)
     .bind(&normalized)
     .bind(kind)
     .bind(stored_amount)
+    .bind(discount_currency)
     .bind(max_uses)
     .bind(expires_at)
     .bind(applies_to_product_id)

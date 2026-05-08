@@ -24,6 +24,12 @@ pub struct CreateDiscountCodeReq {
     pub kind: String,
     /// Basis points if kind == 'percent' (0..=10000); sats if kind == 'fixed_sats'.
     pub amount: i64,
+    /// Currency for the `amount` field when `kind` is `fixed_sats`
+    /// or `set_price`. 'SAT' (default), 'USD', or 'EUR'.
+    /// Currency-agnostic for `kind = 'percent'` — basis points apply
+    /// to whatever currency the product is priced in.
+    #[serde(default)]
+    pub discount_currency: Option<String>,
     #[serde(default)]
     pub max_uses: Option<i64>,
     /// ISO-8601 RFC3339 UTC timestamp.
@@ -80,11 +86,31 @@ pub async fn create(
         None
     };
 
-    let code = repo::create_discount_code(
+    // Validate + normalize discount_currency. Accept SAT (default),
+    // USD, EUR. For 'percent' codes the currency is irrelevant (basis
+    // points are unitless) but we still record it so a future audit
+    // can answer "what did the operator INTEND when they created this
+    // code" — operators sometimes use a percent code with a fiat
+    // mental model.
+    let discount_currency = match req.discount_currency.as_deref() {
+        None | Some("") => "SAT".to_string(),
+        Some(c) => {
+            let c = c.to_uppercase();
+            if !matches!(c.as_str(), "SAT" | "USD" | "EUR") {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported discount_currency '{c}'; accepted: SAT, USD, EUR"
+                )));
+            }
+            c
+        }
+    };
+
+    let code = repo::create_discount_code_with_currency(
         &state.db,
         &req.code,
         &req.kind,
         req.amount,
+        &discount_currency,
         req.max_uses,
         req.expires_at.as_deref(),
         product_id.as_deref(),

@@ -88,11 +88,33 @@ pub async fn render(
     .or_else(|| public_policies.first().cloned());
 
     // The price displayed in the cert card on initial render.
-    let displayed_price = initial_policy
+    // For SAT-currency products this is straightforward — show
+    // the sat amount. For USD/EUR-priced products we render the
+    // listed amount (e.g. "$49.00") with the unit cell switched
+    // to the currency code instead of "sats". The tier picker
+    // (when multiple policies are public) currently still
+    // formats per-tier prices as sats; that's a v0.3 polish
+    // when we plumb the rate fetcher into the JS render path.
+    let is_fiat = product.price_currency != "SAT";
+    let displayed_price_sats = initial_policy
         .as_ref()
         .and_then(|p| p.price_sats_override)
         .unwrap_or(product.price_sats);
-    let price_sats_fmt = format_thousands(displayed_price);
+    let (price_sats_fmt, price_unit_label) = if is_fiat {
+        // price_value is in cents (USD/EUR). Render as e.g. "49.00"
+        // for $49.00 — the symbol/code goes in the unit cell.
+        let cents = product.price_value;
+        let formatted = format!("{}.{:02}", cents / 100, (cents.abs() % 100));
+        let unit = match product.price_currency.as_str() {
+            "USD" => "USD".to_string(),
+            "EUR" => "EUR".to_string(),
+            other => other.to_string(),
+        };
+        (formatted, unit)
+    } else {
+        (format_thousands(displayed_price_sats), "sats".to_string())
+    };
+    let _ = displayed_price_sats; // unused on the fiat path
     let initial_policy_slug = initial_policy
         .as_ref()
         .map(|p| p.slug.clone())
@@ -440,7 +462,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     <div class="price-label" id="price-label">Price</div>
     <div class="price" id="price-display">
       <span id="price-strike-line" class="price-strike" style="display:none"></span>
-      <span id="price-current">{price_sats_fmt}</span><span class="unit">sats</span>
+      <span id="price-current">{price_sats_fmt}</span><span class="unit">{price_unit_label}</span>
       <span id="price-discount-tag" class="price-discount-tag" style="display:none"></span>
     </div>
   </div>
@@ -819,6 +841,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
         product_slug = product_slug,
         product_description = product_description,
         price_sats_fmt = price_sats_fmt,
+        price_unit_label = price_unit_label,
         tiers_html = tiers_html,
         slug_json = serde_json::to_string(&product.slug).unwrap_or_else(|_| "\"\"".into()),
         tiers_json = tiers_json,
