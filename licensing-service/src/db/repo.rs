@@ -91,6 +91,59 @@ pub async fn create_product(
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("created product not found")))
 }
 
+/// Currency-aware product creation. Behaviorally equivalent to
+/// `create_product` for SAT currency (price_sats == price_value);
+/// for fiat currencies, price_sats is initially 0 and gets
+/// populated at invoice creation time when the rate fetcher
+/// converts to BTC.
+pub async fn create_product_with_currency(
+    pool: &SqlitePool,
+    slug: &str,
+    name: &str,
+    description: &str,
+    price_currency: &str,
+    price_value: i64,
+    metadata: &serde_json::Value,
+) -> AppResult<Product> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let metadata_json = serde_json::to_string(metadata)
+        .map_err(|e| AppError::BadRequest(format!("invalid metadata JSON: {e}")))?;
+
+    // For SAT currency, price_sats and price_value are identical
+    // numbers (sats). For USD/EUR, price_sats is 0 until the first
+    // invoice creation populates it via the rate fetcher.
+    let initial_price_sats = if price_currency == "SAT" { price_value } else { 0 };
+
+    sqlx::query(
+        "INSERT INTO products (id, slug, name, description, price_sats, \
+         price_currency, price_value, active, metadata_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(slug)
+    .bind(name)
+    .bind(description)
+    .bind(initial_price_sats)
+    .bind(price_currency)
+    .bind(price_value)
+    .bind(&metadata_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            AppError::Conflict(format!("product slug '{slug}' already exists"))
+        }
+        other => AppError::Database(other),
+    })?;
+
+    get_product_by_id(pool, &id)
+        .await?
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("created product not found")))
+}
+
 pub async fn set_product_active(pool: &SqlitePool, id: &str, active: bool) -> AppResult<()> {
     let now = Utc::now().to_rfc3339();
     let rows = sqlx::query("UPDATE products SET active = ?, updated_at = ? WHERE id = ?")

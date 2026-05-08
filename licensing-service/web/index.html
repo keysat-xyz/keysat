@@ -1021,6 +1021,29 @@ The request will be refused if there are licenses or invoices tied to it — use
     if (s.install_uuid) card.appendChild(resetBtn)
   }
 
+  // Render a product's price for table cells. Picks the right
+  // unit + format based on price_currency. SAT-priced shows
+  // "50,000 sats"; USD-priced shows "$49.00 ≈ 75k sats" if the
+  // sat amount has been pinned (after first invoice), or just
+  // "$49.00" if not yet quoted.
+  function formatProductPrice(p) {
+    const currency = (p.price_currency || 'SAT').toUpperCase()
+    if (currency === 'SAT') {
+      return (p.price_sats || p.price_value || 0).toLocaleString() + ' sats'
+    }
+    const symbol = currency === 'USD' ? '$' : currency === 'EUR' ? '€' : ''
+    const amount = (p.price_value || 0) / 100  // cents → main unit
+    const main = symbol + amount.toFixed(2) + (symbol ? '' : ' ' + currency)
+    if (p.price_sats && p.price_sats > 0) {
+      // Sat amount has been pinned by a prior invoice; show as a hint.
+      const sats = p.price_sats >= 1000
+        ? Math.round(p.price_sats / 1000) + 'k'
+        : String(p.price_sats)
+      return el('span', null, [main, el('span', { class: 'muted', style: 'font-size:11px; margin-left:6px' }, '≈ ' + sats + ' sats')])
+    }
+    return main
+  }
+
   async function copyPubkey() {
     const span = document.getElementById('pubkey-preview')
     const k = span.dataset.full
@@ -1088,34 +1111,81 @@ The request will be refused if there are licenses or invoices tied to it — use
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
-    // Create form
+    // Create form. Currency picker swaps the price-input units in
+    // place: SAT → integer sats, USD/EUR → dollar/euro amount which
+    // we convert to cents on the way out (the backend stores
+    // smallest-unit-of-currency).
+    const currencyPicker = el('select', { class: 'input' }, [
+      el('option', { value: 'SAT' }, 'sats'),
+      el('option', { value: 'USD' }, 'USD ($)'),
+      el('option', { value: 'EUR' }, 'EUR (€)'),
+    ])
+    const priceInput = el('input', {
+      class: 'input', name: 'price_input', type: 'number',
+      step: '1', min: '0', value: '50000', required: 'required',
+    })
+    const priceHint = el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px' },
+      'sats — whole numbers only.')
+    currencyPicker.addEventListener('change', () => {
+      if (currencyPicker.value === 'SAT') {
+        priceInput.step = '1'
+        priceInput.value = '50000'
+        priceHint.textContent = 'sats — whole numbers only.'
+      } else {
+        priceInput.step = '0.01'
+        priceInput.value = '49.00'
+        priceHint.textContent =
+          currencyPicker.value === 'USD'
+            ? 'Dollars — converted to BTC at invoice creation. Buyer pays the locked-in BTC amount.'
+            : 'Euros — converted to BTC at invoice creation. Buyer pays the locked-in BTC amount.'
+      }
+    })
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new product'),
       el('div', { class: 'body' }, [
         formInput('slug', 'Slug', { required: true, hint: 'lowercase, hyphens, e.g. "bitcoin-ticker-pro"' }),
         formInput('name', 'Display name', { required: true }),
         formInput('description', 'Description', { textarea: true }),
-        formInput('price_sats', 'Price (sats)', { type: 'number', required: true, value: '50000' }),
-        el('button', { class: 'btn primary', onclick: async function () {
-          const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
-          create.querySelector('.body').appendChild(status)
-          try {
-            await api('/v1/admin/products', { method: 'POST', body: {
-              slug: create.querySelector('[name=slug]').value.trim(),
-              name: create.querySelector('[name=name]').value.trim(),
-              description: create.querySelector('[name=description]').value || '',
-              price_sats: parseInt(create.querySelector('[name=price_sats]').value, 10),
-              metadata: {},
-            }})
-            status.replaceWith(ok('Created. Reloading…'))
-            setTimeout(routes.products, 600)
-          } catch (e) {
-            // Tier-cap 402 → upgrade modal; everything else → inline status pill.
-            if (handleTierCap(e)) status.remove()
-            else status.replaceWith(err(e.message))
-          }
-        }}, 'Create product'),
-      ]),
+        el('label', { style: 'display:block; font-weight:600; font-size:13px; margin:12px 0 4px' }, 'Price'),
+        el('div', { style: 'display:flex; gap:8px; align-items:flex-start' }, [
+          priceInput,
+          currencyPicker,
+        ]),
+        priceHint,
+        el('button', { class: 'btn primary', style: 'margin-top:16px' }, 'Create product').addEventListener
+          ? null : null, // dummy; the real button is below for clarity
+        (() => {
+          const btn = el('button', { class: 'btn primary', style: 'margin-top:16px' }, 'Create product')
+          btn.addEventListener('click', async () => {
+            const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
+            create.querySelector('.body').appendChild(status)
+            try {
+              const currency = currencyPicker.value
+              const rawValue = parseFloat(priceInput.value)
+              if (!Number.isFinite(rawValue) || rawValue <= 0) {
+                throw new Error('Price must be a positive number.')
+              }
+              // SAT/BTC are sat-denominated already; USD/EUR are
+              // entered as decimal amounts and converted to cents.
+              const priceValue = currency === 'SAT' ? Math.round(rawValue) : Math.round(rawValue * 100)
+              await api('/v1/admin/products', { method: 'POST', body: {
+                slug: create.querySelector('[name=slug]').value.trim(),
+                name: create.querySelector('[name=name]').value.trim(),
+                description: create.querySelector('[name=description]').value || '',
+                price_currency: currency,
+                price_value: priceValue,
+                metadata: {},
+              }})
+              status.replaceWith(ok('Created. Reloading…'))
+              setTimeout(routes.products, 600)
+            } catch (e) {
+              if (handleTierCap(e)) status.remove()
+              else status.replaceWith(err(e.message))
+            }
+          })
+          return btn
+        })(),
+      ].filter(Boolean)),
     ])
     target.appendChild(plainCard([
       el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'About'),
@@ -1134,7 +1204,7 @@ The request will be refused if there are licenses or invoices tied to it — use
       const rows = products.map((p) => el('tr', null, [
         el('td', null, el('code', null, p.slug)),
         el('td', { style: 'font-weight:600; color:var(--navy-950)' }, p.name),
-        el('td', null, (p.price_sats || 0).toLocaleString() + ' sats'),
+        el('td', null, formatProductPrice(p)),
         el('td', null, el('span', { class: 'muted' }, String(byProduct[p.id] || 0))),
         el('td', null, activePill(p.active)),
         el('td', { class: 'muted' }, fmtDate(p.created_at)),

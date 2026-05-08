@@ -1139,6 +1139,140 @@ async fn recover_returns_license_key_for_matching_pair() {
     assert_eq!(audit_count, 1, "recovery must write an audit row");
 }
 
+/// Multi-currency product creation. The admin endpoint accepts both
+/// the legacy SAT-only form (`price_sats: N`) and the new typed form
+/// (`price_currency + price_value`). Verifies:
+///   - legacy form still works, produces a SAT-currency row
+///   - typed SAT form works, dual-writes price_sats correctly
+///   - typed USD form works, leaves price_sats=0 (filled at invoice time)
+///   - unknown currency code → 400
+///   - inconsistent legacy + typed values → 400 (catches half-migrated clients)
+///   - typed without value → 400; value without currency → 400
+#[tokio::test]
+async fn admin_create_product_accepts_legacy_and_typed_currency_forms() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Legacy SAT form.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({"slug": "legacy", "name": "Legacy", "price_sats": 50000})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["price_sats"], 50_000);
+    assert_eq!(body["price_currency"], "SAT");
+    assert_eq!(body["price_value"], 50_000);
+
+    // Typed SAT form.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "typed-sat",
+            "name": "Typed SAT",
+            "price_currency": "SAT",
+            "price_value": 75000,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["price_sats"], 75_000);
+    assert_eq!(body["price_currency"], "SAT");
+    assert_eq!(body["price_value"], 75_000);
+
+    // Typed USD form: $49.00 = 4900 cents. price_sats stays 0 until
+    // the first invoice triggers a rate lookup.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "typed-usd",
+            "name": "Typed USD",
+            "price_currency": "USD",
+            "price_value": 4900,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["price_currency"], "USD");
+    assert_eq!(body["price_value"], 4900);
+    assert_eq!(
+        body["price_sats"], 0,
+        "USD products should have price_sats=0 until first invoice rate-converts them"
+    );
+
+    // Bad currency.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "bad-currency",
+            "name": "Bad",
+            "price_currency": "GBP",
+            "price_value": 100,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Inconsistent legacy + typed (catches half-migrated clients).
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "inconsistent",
+            "name": "Inconsistent",
+            "price_sats": 50000,
+            "price_currency": "USD",
+            "price_value": 4900,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "mismatched legacy + typed pricing should 400"
+    );
+
+    // Half-form: currency without value.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "half-1",
+            "name": "Half 1",
+            "price_currency": "USD",
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Half-form: value without currency.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "half-2",
+            "name": "Half 2",
+            "price_value": 4900,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Community analytics: opt-in toggle + privacy contract.
 ///
 /// Locks in two invariants:

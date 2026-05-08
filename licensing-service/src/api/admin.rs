@@ -74,9 +74,87 @@ pub struct CreateProductReq {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub price_sats: i64,
+    /// Legacy SAT-only price. Optional now; if `price_currency` +
+    /// `price_value` are supplied, they take precedence. Old SDK
+    /// callers and the existing admin UI keep using this field
+    /// without changes.
+    #[serde(default)]
+    pub price_sats: Option<i64>,
+    /// New canonical currency. 'SAT' (default), 'USD', or 'EUR'.
+    /// 'BTC' is intentionally not yet a separate currency code —
+    /// pricing in BTC is just SAT pricing with a different display.
+    /// Future v0.3+ may add it as a display alias.
+    #[serde(default)]
+    pub price_currency: Option<String>,
+    /// Price in the smallest indivisible unit of `price_currency`:
+    /// sats for SAT, cents for USD/EUR. Required when
+    /// `price_currency` is supplied; ignored otherwise.
+    #[serde(default)]
+    pub price_value: Option<i64>,
     #[serde(default)]
     pub metadata: Value,
+}
+
+/// Currencies the admin endpoints accept. Whitelist enforced here so
+/// a typo or future code error can't write a product with a bogus
+/// currency tag that the daemon doesn't know how to convert.
+const ACCEPTED_CURRENCIES: &[&str] = &["SAT", "USD", "EUR"];
+
+/// Validate + normalize the request's price representation. Returns
+/// `(currency, value_in_smallest_unit)`. Errors with 400 on:
+///   - both `price_sats` and `price_currency` missing
+///   - non-positive value
+///   - unknown currency code
+///   - both forms supplied with mismatched values (catches half-
+///     migrated clients that send stale `price_sats` alongside a
+///     fresh `price_value`)
+fn resolve_price(req: &CreateProductReq) -> AppResult<(String, i64)> {
+    match (req.price_currency.as_deref(), req.price_value, req.price_sats) {
+        // Typed form — preferred.
+        (Some(cur), Some(value), maybe_legacy) => {
+            let cur = cur.to_uppercase();
+            if !ACCEPTED_CURRENCIES.iter().any(|c| *c == cur) {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported price_currency '{cur}'; accepted: {}",
+                    ACCEPTED_CURRENCIES.join(", ")
+                )));
+            }
+            if value <= 0 {
+                return Err(AppError::BadRequest("price_value must be positive".into()));
+            }
+            // If the legacy field was ALSO sent, only accept it if
+            // the currency is SAT and the numbers match. Anything
+            // else means the client sent inconsistent state.
+            if let Some(legacy) = maybe_legacy {
+                if cur != "SAT" || legacy != value {
+                    return Err(AppError::BadRequest(
+                        "send price_currency + price_value, OR price_sats alone — \
+                         not both with mismatched values".into(),
+                    ));
+                }
+            }
+            Ok((cur, value))
+        }
+        // Legacy form — back-compat.
+        (None, None, Some(sats)) => {
+            if sats <= 0 {
+                return Err(AppError::BadRequest("price_sats must be positive".into()));
+            }
+            Ok(("SAT".to_string(), sats))
+        }
+        // Currency without value — incomplete.
+        (Some(_), None, _) => Err(AppError::BadRequest(
+            "price_currency was supplied but price_value is missing".into(),
+        )),
+        // Value without currency — ambiguous.
+        (None, Some(_), _) => Err(AppError::BadRequest(
+            "price_value was supplied but price_currency is missing".into(),
+        )),
+        // Nothing.
+        (None, None, None) => Err(AppError::BadRequest(
+            "must supply either price_sats (legacy) or price_currency + price_value".into(),
+        )),
+    }
 }
 
 pub async fn create_product(
@@ -88,20 +166,26 @@ pub async fn create_product(
     let (ip, ua) = request_context(&headers);
     // Tier-cap gate: Creator caps at 5 products. 402 if over.
     crate::api::tier::enforce_product_cap(&state).await?;
-    if req.price_sats <= 0 {
-        return Err(AppError::BadRequest("price_sats must be positive".into()));
-    }
+
+    // Resolve the typed-currency form and the legacy form into a
+    // single (currency, value) pair before hitting the repo. New
+    // callers send price_currency + price_value; legacy callers
+    // send price_sats alone; sending both is allowed only if the
+    // currency is SAT and the values match (catches mismatched
+    // updates from a half-migrated client).
+    let (price_currency, price_value) = resolve_price(&req)?;
     let metadata = if req.metadata.is_null() {
         json!({})
     } else {
         req.metadata
     };
-    let product = repo::create_product(
+    let product = repo::create_product_with_currency(
         &state.db,
         &req.slug,
         &req.name,
         &req.description,
-        req.price_sats,
+        &price_currency,
+        price_value,
         &metadata,
     )
     .await?;
