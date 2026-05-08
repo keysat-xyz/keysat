@@ -103,6 +103,11 @@ mime_guess = "2"
 # us NamedTempFile so the OS cleans up if a test panics mid-run.
 tempfile = "3"
 
+# tower in main deps is feature-minimal (only what axum needs). Tests use
+# `ServiceExt::oneshot` to drive the router without bringing up an HTTP
+# listener — that lives behind the `util` feature.
+tower = { version = "0.4", features = ["util"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

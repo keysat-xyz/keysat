@@ -1,29 +1,12 @@
 //! Entry point. Wires config → logging → DB → keypair → HTTP server.
-
-mod api;
-mod btcpay;
-mod config;
-mod crypto;
-mod db;
-mod error;
-mod license_self;
-mod models;
-mod payment;
-mod rate_limit;
-mod reconcile;
-mod tipping;
-mod webhooks;
-
-/// Hex-encoded SHA-256 of a string — used everywhere we need a deterministic
-/// id from a raw value (machine fingerprints, admin key hashes).
-pub fn hex_sha256(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
+//!
+//! The actual modules (api, btcpay, db, etc.) live in `src/lib.rs` so that
+//! integration tests under `tests/` can also reach them. Both the binary
+//! and the library compile from the same source files; nothing here
+//! changes between targets.
 
 use anyhow::Context;
+use keysat::{api, btcpay, config, crypto, db, license_self, payment, reconcile, webhooks};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
