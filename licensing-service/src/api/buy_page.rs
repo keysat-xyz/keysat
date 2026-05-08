@@ -548,6 +548,20 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 
   function fmtSats(n) {{ return Number(n).toLocaleString('en-US'); }}
 
+  // Render a tier's price in its native currency. SAT → "50,000"
+  // (sats unit handled by the surrounding markup); USD/EUR → "49.00"
+  // with the symbol baked into the unit cell. For fiat the
+  // price_value is in cents (smallest indivisible unit), so we
+  // divide by 100 for display.
+  function formatTierPrice(tier) {{
+    const cur = (tier.price_currency || 'SAT').toUpperCase();
+    if (cur === 'SAT') {{
+      return {{ amount: fmtSats(tier.price_sats), unit: 'sats', isFree: tier.price_sats === 0 }};
+    }}
+    const main = (tier.price_value || 0) / 100;
+    return {{ amount: main.toFixed(2), unit: cur, isFree: main === 0 }};
+  }}
+
   // Wire up tier-card clicks.
   document.querySelectorAll('.tier').forEach(function(card) {{
     card.addEventListener('click', function(e) {{
@@ -579,16 +593,21 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       setStatus(null);
       setPaidButton();
     }}
-    // Reflect new base price in the cert card.
+    // Reflect new base price in the cert card. For fiat-priced
+    // products the unit cell ("sats" → "USD" / "EUR") also swaps.
     const t = TIERS[slug];
-    currentBaseFmt = fmtSats(t.price_sats);
+    const fmt = formatTierPrice(t);
+    currentBaseFmt = fmt.amount;
     priceStrike.style.display = 'none';
     priceTag.style.display = 'none';
+    const unitEl = document.querySelector('.unit');
+    if (unitEl) unitEl.textContent = fmt.unit;
     if (priceLabel) priceLabel.textContent = 'Price · ' + t.name;
     // Free tier: render "FREE", swap CTA to "Redeem license" so the
-    // buyer never sees "Pay with Bitcoin" for a 0-sat product.
-    if (t.price_sats === 0) {{
+    // buyer never sees "Pay with Bitcoin" for a 0-amount product.
+    if (fmt.isFree) {{
       priceCurrent.textContent = 'FREE';
+      if (unitEl) unitEl.textContent = '';
       setRedeemButton();
     }} else {{
       priceCurrent.textContent = currentBaseFmt;
@@ -873,8 +892,17 @@ fn render_tier_picker(
         .map(|p| {
             let name = html_escape(&p.name);
             let slug_attr = html_escape(&p.slug);
-            let price = p.price_sats_override.unwrap_or(product.price_sats);
-            let price_fmt = format_thousands(price);
+            // For SAT-currency products, the override is in sats; for
+            // fiat-priced products it's in cents (USD/EUR). The price
+            // unit cell renders in the right denomination either way.
+            let (price_fmt, price_unit) = if product.price_currency == "SAT" {
+                let price = p.price_sats_override.unwrap_or(product.price_sats);
+                (format_thousands(price), "sats".to_string())
+            } else {
+                let cents = p.price_sats_override.unwrap_or(product.price_value);
+                let main = format!("{}.{:02}", cents / 100, (cents.abs() % 100));
+                (main, product.price_currency.clone())
+            };
             let description = p
                 .metadata
                 .get("description")
@@ -936,12 +964,13 @@ fn render_tier_picker(
                 String::new()
             };
             format!(
-                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}<div class="tier-name">{name}</div><div class="tier-price">{price_fmt}<span class="tier-price-unit">sats</span></div>{dur_html}{trial_meta}{description_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}<div class="tier-name">{name}</div><div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}</span></div>{dur_html}{trial_meta}{description_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,
                 slug = slug_attr,
                 popular_pill = popular_pill,
                 name = name,
                 price_fmt = price_fmt,
+                price_unit = price_unit,
                 dur_html = dur_html,
                 trial_meta = trial_meta,
                 description_html = description_html,
@@ -963,14 +992,31 @@ fn build_tiers_json(
     policies: &[crate::models::Policy],
     product: &crate::models::Product,
 ) -> String {
+    // Each tier carries enough info for the JS to render its price
+    // in the right unit. For SAT-currency products, `price_sats`
+    // (legacy field) and `price_value` are equal; for fiat-priced
+    // products, `price_sats` is a stale snapshot or 0 and the JS
+    // uses (price_currency, price_value) as the source of truth.
+    //
+    // Per-policy currency override (price_currency_override) is
+    // wired in for v0.3 — for now policies inherit the product's
+    // currency. The JS handles both cases via fallback to the
+    // product-level fields embedded in the page.
     let mut map = serde_json::Map::new();
     for p in policies {
-        let price = p.price_sats_override.unwrap_or(product.price_sats);
+        let price_sats_value = p.price_sats_override.unwrap_or(product.price_sats);
+        // For fiat-priced products with a sat override on the
+        // policy, that override is in the product's currency unit
+        // (cents for USD/EUR). Most operators leave the override
+        // unset; the inheritance path covers the common case.
+        let price_value = p.price_sats_override.unwrap_or(product.price_value);
         map.insert(
             p.slug.clone(),
             serde_json::json!({
                 "name": p.name,
-                "price_sats": price,
+                "price_sats": price_sats_value,
+                "price_currency": product.price_currency,
+                "price_value": price_value,
             }),
         );
     }

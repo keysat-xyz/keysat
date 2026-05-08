@@ -892,11 +892,13 @@ The request will be refused if there are licenses or invoices tied to it — use
       sBtc.querySelector('.value').textContent = '?'
     }
 
-    // Community analytics opt-in card. Off by default; spelled out
-    // exactly what gets sent so the operator's choice is informed.
-    const analyticsCard = el('div', { class: 'card' })
-    target.appendChild(analyticsCard)
-    renderAnalyticsCard(analyticsCard)
+    // Community analytics opt-in. Off by default. Compact strip so it
+    // doesn't compete with the operator's actual workspace cards. The
+    // "what's sent" disclosure expands inline; details deliberately
+    // tucked behind a click so the default view stays calm.
+    const analyticsStrip = el('div', { style: 'margin-top:24px' })
+    target.appendChild(analyticsStrip)
+    renderAnalyticsCard(analyticsStrip)
 
     // Public key fetch — pulls PEM from /v1/issuer/public-key (no auth
     // required) and displays a short preview. Copy button copies the full
@@ -930,95 +932,122 @@ The request will be refused if there are licenses or invoices tied to it — use
     ])
   }
 
-  // Renders the "Help improve Keysat" card on Overview. Off by default;
-  // operators see exactly what gets sent before opting in. Toggling on
-  // requires confirming a collector URL — without one, the daemon
-  // doesn't beacon even with the toggle on.
-  async function renderAnalyticsCard(card) {
-    card.innerHTML = ''
+  // Renders the compact community-analytics opt-in strip on Overview.
+  // Off by default. Auto-saves the toggle on click — no separate Save
+  // button. Details are tucked into an inline disclosure so the
+  // default view stays calm and doesn't compete with the operator's
+  // workspace cards.
+  async function renderAnalyticsCard(host) {
+    host.innerHTML = ''
     let s
     try {
       s = await api('/v1/admin/community-analytics')
     } catch (e) {
-      card.appendChild(el('p', { class: 'muted' }, 'Could not load analytics state: ' + e.message))
+      host.appendChild(el('p', { class: 'muted', style: 'font-size:12px' },
+        'Could not load analytics state: ' + e.message))
       return
     }
 
-    const headerLeft = el('div', null, [
-      el('h3', { style: 'margin:0 0 4px' }, 'Help improve Keysat'),
-      el('p', { class: 'muted', style: 'margin:0; font-size:14px' },
-        'Send an anonymous daily heartbeat so we can show real adoption numbers on the public dashboard.'),
-    ])
-    const toggle = el('label', {
-      style: 'display:inline-flex; align-items:center; gap:10px; font-weight:600; font-size:14px; cursor:pointer'
+    // The single line that's visible by default. Native checkbox so
+    // the affordance reads as "click to opt in", not as a fancy
+    // toggle that needs a Save click after.
+    const checkbox = el('input', {
+      type: 'checkbox',
+      style: 'cursor:pointer',
+    })
+    if (s.enabled) checkbox.checked = true
+    const detailsLink = el('a', {
+      href: '#',
+      class: 'muted',
+      style: 'font-size:12px; margin-left:6px',
+    }, 'what gets sent?')
+    const oneLine = el('label', {
+      style: 'display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--ink-500); cursor:pointer'
     }, [
-      el('input', { type: 'checkbox', checked: s.enabled ? 'checked' : null }),
-      s.enabled ? 'Enabled' : 'Disabled',
+      checkbox,
+      el('span', null, 'Send anonymous usage stats so we can show real adoption numbers on the public dashboard.'),
     ])
-    const toggleInput = toggle.querySelector('input')
-    card.appendChild(el('div', {
-      style: 'display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:16px'
-    }, [headerLeft, toggle]))
 
-    // Collector URL field. Required to actually send anything; the
-    // toggle being on without a URL is "armed but silent".
+    const inlineRow = el('div', {
+      style: 'display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding:10px 14px; background:#fbf6e9; border:1px dashed #d6cdb8; border-radius:6px'
+    }, [
+      el('div', null, [oneLine, detailsLink]),
+    ])
+    host.appendChild(inlineRow)
+
+    // Expanded details (collector URL, JSON preview, reset). Hidden
+    // by default; toggled by the "what gets sent?" link.
+    const details = el('div', {
+      style: 'display:none; margin-top:10px; padding:14px; background:#fbf6e9; border:1px dashed #d6cdb8; border-radius:6px'
+    })
+    host.appendChild(details)
+    detailsLink.addEventListener('click', (e) => {
+      e.preventDefault()
+      const showing = details.style.display !== 'none'
+      details.style.display = showing ? 'none' : 'block'
+      detailsLink.textContent = showing ? 'what gets sent?' : 'hide details'
+    })
+
+    // Collector URL — small input, optional.
     const urlInput = el('input', {
       class: 'input',
       type: 'url',
-      placeholder: 'https://keysat.xyz/community/v1/heartbeat (or your own collector)',
+      placeholder: 'https://keysat.xyz/community/v1/heartbeat',
       value: s.collector_url || '',
-      style: 'width:100%; box-sizing:border-box; margin-bottom:8px',
+      style: 'width:100%; box-sizing:border-box; font-size:12px; padding:6px 10px',
     })
-    card.appendChild(el('label', { style: 'display:block; font-weight:600; font-size:13px; margin-bottom:4px' }, 'Collector URL'))
-    card.appendChild(urlInput)
-    card.appendChild(el('p', { class: 'muted', style: 'margin:4px 0 16px; font-size:12px' },
-      'Leave blank to opt in but not send (useful while a public collector is being stood up). Once keysat.xyz/community is live, the default URL will populate here on upgrade.'))
+    details.appendChild(el('label', { style: 'display:block; font-size:11px; font-weight:600; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.05em' }, 'Collector URL'))
+    details.appendChild(urlInput)
+    details.appendChild(el('p', { class: 'muted', style: 'margin:4px 0 12px; font-size:11px' },
+      'Leave blank to opt in but not send. Once keysat.xyz/community is live, the default URL will populate on upgrade.'))
 
-    // Privacy disclosure — show the exact JSON shape that would be sent.
-    const disclosure = el('details', { class: 'disclosure' }, [
-      el('summary', null, 'Show me exactly what gets sent'),
-      el('div', { class: 'body' }, [
-        el('p', { class: 'muted', style: 'margin:0 0 12px' },
-          'Counts are floored to the nearest 5 to prevent fingerprinting an operator by exact license count. ' +
-          'Uptime is bucketed (<1d / 1-7d / 1-4w / >4w). The install_uuid is a random UUIDv4 generated on first opt-in — ' +
-          'NOT derived from your operator name, store id, or public URL. You can wipe it any time below.'),
-        el('pre', { style: 'background:#0e1f33; color:#f6f1e7; padding:12px; border-radius:6px; font-size:12px; overflow-x:auto' },
-          JSON.stringify(s.preview_heartbeat, null, 2)),
-        s.install_uuid
-          ? el('p', { class: 'muted', style: 'margin:12px 0 8px; font-size:12px' },
-              'Your install_uuid: ' + s.install_uuid)
-          : null,
-      ].filter(Boolean)),
-    ])
-    card.appendChild(disclosure)
+    // The exact JSON the daemon would POST. Live preview, not a
+    // pretend example — what you see is what would actually be sent.
+    details.appendChild(el('p', { class: 'muted', style: 'margin:0 0 6px; font-size:11px' },
+      'Counts are floored to the nearest 5 (anti-fingerprinting). Uptime is bucketed. install_uuid is a random UUIDv4 generated on first opt-in — NOT derived from operator name, store id, or public URL.'))
+    details.appendChild(el('pre', {
+      style: 'background:#0e1f33; color:#f6f1e7; padding:10px; border-radius:4px; font-size:11px; overflow-x:auto; margin:0 0 8px'
+    }, JSON.stringify(s.preview_heartbeat, null, 2)))
 
-    // Save button.
-    const saveBtn = el('button', { class: 'btn primary', style: 'margin-top:16px; margin-right:8px' }, 'Save')
-    saveBtn.addEventListener('click', async () => {
-      saveBtn.disabled = true
+    if (s.install_uuid) {
+      const resetRow = el('div', { style: 'display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px' }, [
+        el('span', { class: 'muted' }, 'Your install_uuid: ' + s.install_uuid.slice(0, 8) + '…'),
+        el('a', { href: '#', class: 'muted', style: 'font-size:11px' }, 'reset'),
+      ])
+      const resetLink = resetRow.querySelector('a')
+      resetLink.addEventListener('click', async (e) => {
+        e.preventDefault()
+        if (!confirm('Wipe your anonymous install_uuid? Future heartbeats (if you re-enable) will use a fresh one.')) return
+        try {
+          await api('/v1/admin/community-analytics/reset', { method: 'POST' })
+          renderAnalyticsCard(host)
+        } catch (er) { alert(er.message) }
+      })
+      details.appendChild(resetRow)
+    }
+
+    // Auto-save: toggling the checkbox or editing the URL persists
+    // immediately. No Save button; the affordance is "click and it's
+    // done."
+    let saveTimer = null
+    async function persist() {
       try {
         await api('/v1/admin/community-analytics', { method: 'POST', body: {
-          enabled: toggleInput.checked,
+          enabled: checkbox.checked,
           collector_url: urlInput.value.trim() || null,
         }})
-        renderAnalyticsCard(card)
       } catch (e) {
         alert(e.message)
-      } finally {
-        saveBtn.disabled = false
+        // Revert visual state on failure so what the user sees
+        // matches what's persisted.
+        checkbox.checked = !checkbox.checked
       }
+    }
+    checkbox.addEventListener('change', persist)
+    urlInput.addEventListener('input', () => {
+      clearTimeout(saveTimer)
+      saveTimer = setTimeout(persist, 600) // debounce the URL field
     })
-
-    const resetBtn = el('button', { class: 'btn sm secondary', style: 'margin-top:16px' }, 'Reset install_uuid')
-    resetBtn.addEventListener('click', async () => {
-      if (!confirm('This wipes your anonymous install_uuid. Future heartbeats (if you re-enable) will use a fresh UUID. Continue?')) return
-      try {
-        await api('/v1/admin/community-analytics/reset', { method: 'POST' })
-        renderAnalyticsCard(card)
-      } catch (e) { alert(e.message) }
-    })
-    card.appendChild(saveBtn)
-    if (s.install_uuid) card.appendChild(resetBtn)
   }
 
   // Render a product's price for table cells. Picks the right
@@ -1671,11 +1700,13 @@ The request will be refused if there are licenses or invoices tied to it — use
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
-    function amountHint(kind) {
-      if (kind === 'percent') return 'percent off, e.g. 50 = 50%. Range: 1–100.'
-      if (kind === 'fixed_sats') return 'sats subtracted from the base price.'
-      if (kind === 'set_price') return 'flat price the buyer pays in sats (e.g. 5000 = "buy at 5000 sats regardless of base price"). If higher than base, the code provides no benefit.'
+    function amountHint(kind, currency) {
+      if (kind === 'percent') return 'percent off, e.g. 50 = 50%. Range: 1–100. (Currency-agnostic.)'
       if (kind === 'free_license') return 'amount is ignored — buyer pays nothing.'
+      const unit = currency === 'SAT' ? 'sats' : currency === 'USD' ? 'USD' : currency === 'EUR' ? 'EUR' : 'units'
+      const decimals = currency === 'SAT' ? '' : ' (decimals OK, e.g. 9.99)'
+      if (kind === 'fixed_sats') return `${unit} subtracted from the base price${decimals}.`
+      if (kind === 'set_price') return `flat price the buyer pays in ${unit}${decimals}. If higher than base, the code provides no benefit.`
       return ''
     }
 
@@ -1686,14 +1717,22 @@ The request will be refused if there are licenses or invoices tied to it — use
           formInput('code', 'Code', { required: true, hint: 'will be uppercased, e.g. FOUNDERS50' }),
           formSelect('kind', 'Kind', [
             { value: 'percent', label: 'Percent off' },
-            { value: 'fixed_sats', label: 'Fixed sats off' },
-            { value: 'set_price', label: 'Set flat price (in sats)' },
+            { value: 'fixed_sats', label: 'Fixed amount off' },
+            { value: 'set_price', label: 'Set flat price' },
             { value: 'free_license', label: 'Free license (no payment)' },
           ], { required: true, value: 'percent' }),
         ]),
         el('div', { class: 'row-2' }, [
-          formInput('amount', 'Amount', { type: 'number', value: '50', hint: amountHint('percent') }),
+          formInput('amount', 'Amount', { type: 'number', step: '1', value: '50', hint: amountHint('percent', 'SAT') }),
+          formSelect('discount_currency', 'Currency', [
+            { value: 'SAT', label: 'sats' },
+            { value: 'USD', label: 'USD ($)' },
+            { value: 'EUR', label: 'EUR (€)' },
+          ], { value: 'SAT', hint: 'matters for "fixed amount off" and "set flat price" — ignored for percent / free.' }),
+        ]),
+        el('div', { class: 'row-2' }, [
           formInput('max_uses', 'Max uses (0 = unlimited)', { type: 'number', value: '0' }),
+          el('div'), // spacer to keep the row balanced
         ]),
         el('div', { class: 'row-2' }, [
           formInput('expires_at', 'Expires at (RFC3339, optional)', { hint: 'e.g. 2026-12-31T23:59:59Z' }),
@@ -1706,11 +1745,21 @@ The request will be refused if there are licenses or invoices tied to it — use
           create.querySelector('.body').appendChild(status)
           try {
             const kind = create.querySelector('[name=kind]').value
-            let amount = parseInt(create.querySelector('[name=amount]').value, 10) || 0
-            if (kind === 'percent') amount = amount * 100
+            const currency = create.querySelector('[name=discount_currency]').value
+            const rawAmount = parseFloat(create.querySelector('[name=amount]').value) || 0
+            // For percent: stored as basis points (50% → 5000).
+            // For SAT-currency fixed/set: stored as sats (whole number).
+            // For USD/EUR fixed/set: stored as cents (1.00 main unit → 100).
+            // Free license: amount ignored (we send 0).
+            let amount
+            if (kind === 'percent') amount = Math.round(rawAmount * 100)
+            else if (kind === 'free_license') amount = 0
+            else if (currency === 'SAT') amount = Math.round(rawAmount)
+            else amount = Math.round(rawAmount * 100)
             const body = {
               code: create.querySelector('[name=code]').value.trim(),
               kind, amount,
+              discount_currency: currency,
               description: create.querySelector('[name=description]').value || '',
             }
             const mu = parseInt(create.querySelector('[name=max_uses]').value, 10) || 0
@@ -1733,14 +1782,20 @@ The request will be refused if there are licenses or invoices tied to it — use
       ]),
     ])
 
-    // Live-update the amount hint as the operator changes the Kind dropdown.
+    // Live-update the amount hint as the operator changes Kind or
+    // Currency. Also swap the input's `step` so SAT-currency codes
+    // are integer-only and USD/EUR can take decimals.
     const kindSelEl = create.querySelector('[name=kind]')
-    if (kindSelEl) {
-      kindSelEl.addEventListener('change', function () {
-        const hintEl = create.querySelector('[name=amount]').parentElement.querySelector('.hint')
-        if (hintEl) hintEl.textContent = amountHint(kindSelEl.value)
-      })
+    const curSelEl = create.querySelector('[name=discount_currency]')
+    const amtInputEl = create.querySelector('[name=amount]')
+    function updateHint() {
+      const hintEl = amtInputEl.parentElement.querySelector('.hint')
+      if (hintEl) hintEl.textContent = amountHint(kindSelEl.value, curSelEl.value)
+      // Toggle decimal entry — sats are integer, fiat goes to cents.
+      amtInputEl.step = curSelEl.value === 'SAT' ? '1' : '0.01'
     }
+    if (kindSelEl) kindSelEl.addEventListener('change', updateHint)
+    if (curSelEl) curSelEl.addEventListener('change', updateHint)
 
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' },
@@ -1829,10 +1884,26 @@ The request will be refused if there are licenses or invoices tied to it — use
       const j = await api('/v1/admin/discount-codes?include_inactive=true')
       const codes = j.codes || []
       const rows = codes.map((c) => {
+        // Currency-aware rendering. SAT-currency codes show "5,000
+        // sats off"; fiat codes show "$10.00 off" with cents-to-
+        // dollars conversion. Backwards-compat for older rows that
+        // don't carry discount_currency: treat as SAT.
+        const cur = (c.discount_currency || 'SAT').toUpperCase()
+        const fmtFiat = (cents, sym) => sym + (cents / 100).toFixed(2)
         let amountStr = ''
         if (c.kind === 'percent') amountStr = (c.amount / 100) + '%'
-        else if (c.kind === 'fixed_sats') amountStr = c.amount.toLocaleString() + ' sats off'
-        else if (c.kind === 'set_price') amountStr = c.amount.toLocaleString() + ' sats flat'
+        else if (c.kind === 'fixed_sats') {
+          if (cur === 'SAT') amountStr = c.amount.toLocaleString() + ' sats off'
+          else if (cur === 'USD') amountStr = fmtFiat(c.amount, '$') + ' off'
+          else if (cur === 'EUR') amountStr = fmtFiat(c.amount, '€') + ' off'
+          else amountStr = c.amount + ' ' + cur + ' off'
+        }
+        else if (c.kind === 'set_price') {
+          if (cur === 'SAT') amountStr = c.amount.toLocaleString() + ' sats flat'
+          else if (cur === 'USD') amountStr = fmtFiat(c.amount, '$') + ' flat'
+          else if (cur === 'EUR') amountStr = fmtFiat(c.amount, '€') + ' flat'
+          else amountStr = c.amount + ' ' + cur + ' flat'
+        }
         else amountStr = el('span', { class: 'badge b-gold' }, 'free')
         const usage = c.used_count + ' / ' + (c.max_uses == null ? '∞' : c.max_uses)
         return el('tr', null, [
