@@ -8,10 +8,10 @@
 //!      present, then stores it locally.
 
 use crate::api::AppState;
-use crate::btcpay::client::BtcpayClient;
 use crate::crypto::{encode_key, sign_payload, LicensePayload, FLAG_TRIAL, KEY_VERSION_V2};
 use crate::db::repo;
 use crate::error::{AppError, AppResult};
+use crate::payment::{CreateInvoiceParams, Money};
 use axum::{
     extract::{Path, State},
     Json,
@@ -291,59 +291,46 @@ pub async fn start(
         .filter(|s| !s.is_empty())
         .unwrap_or(&default_redirect);
 
-    let metadata = BtcpayClient::invoice_metadata(&product.id, &internal_id);
-    let btcpay = match state.btcpay_client().await {
-        Ok(c) => c,
+    // Step C: provider-agnostic invoice creation. The trait method
+    // handles provider-specific concerns (HMAC-headered request, URL
+    // rewriting from internal hostname to public, metadata enrichment
+    // with `orderId`/`source`) inside its impl, so this code path is
+    // identical for any future provider (Zaprite, etc.). On failure,
+    // release the slot and bail.
+    let provider = match state.payment_provider().await {
+        Ok(p) => p,
         Err(e) => {
-            // Release the reserved slot if we have one — BTCPay isn't ready.
             if let Some(code) = &reservation {
                 let _ = repo::release_code_slot(&state.db, &code.id).await;
             }
             return Err(e);
         }
     };
-
-    // Step C: BTCPay invoice. On failure, release the slot and bail.
-    let created = match btcpay
-        .create_invoice(final_price, metadata, Some(redirect_url))
+    let created = match provider
+        .create_invoice(CreateInvoiceParams {
+            amount: Money::sats(final_price),
+            redirect_url,
+            // We pass `productId` through for any provider that exposes
+            // it on its dashboard / receipt. The trait's enrichment
+            // adds `orderId` (= our internal_id) and `source` so
+            // webhooks can be correlated to the local invoice row.
+            metadata: json!({ "productId": product.id }),
+            external_order_id: &internal_id,
+            buyer_email: req.buyer_email.as_deref(),
+        })
         .await
     {
-        Ok(c) => c,
+        Ok(handle) => handle,
         Err(e) => {
             if let Some(code) = &reservation {
                 let _ = repo::release_code_slot(&state.db, &code.id).await;
             }
             return Err(AppError::Upstream(format!(
-                "BTCPay invoice create failed: {e}"
+                "payment provider create-invoice failed: {e}"
             )));
         }
     };
-
-    // BTCPay returns a checkout URL using whatever URL we called its
-    // API at — for us, the internal Docker hostname (fast). Rewrite
-    // the host to the configured public URL so the buyer actually
-    // gets a link they can open. Falls through unchanged if no public
-    // URL is configured (test/dev only).
-    let checkout_url = match &state.config.btcpay_public_url {
-        Some(public_base) => {
-            let rewritten =
-                crate::payment::btcpay::rewrite_to_public(&created.checkout_link, public_base);
-            tracing::info!(
-                original = %created.checkout_link,
-                rewritten = %rewritten,
-                public_base = %public_base,
-                "purchase: checkout URL rewritten for buyer"
-            );
-            rewritten
-        }
-        None => {
-            tracing::warn!(
-                original = %created.checkout_link,
-                "purchase: checkout URL NOT rewritten — btcpay_public_url is None"
-            );
-            created.checkout_link.clone()
-        }
-    };
+    let checkout_url = created.checkout_url.clone();
 
     // Step D: persist local invoice. On failure, release the slot.
     // Use internal_id we pre-generated (and baked into the BTCPay
@@ -352,7 +339,7 @@ pub async fn start(
     let invoice = match repo::create_invoice(
         &state.db,
         &internal_id,
-        &created.id,
+        &created.provider_invoice_id,
         &product.id,
         final_price,
         &checkout_url,
@@ -394,7 +381,7 @@ pub async fn start(
                  and invalidating local invoice"
             );
             let _ = repo::release_code_slot(&state.db, &code.id).await;
-            let _ = repo::update_invoice_status(&state.db, &created.id, "invalid").await;
+            let _ = repo::update_invoice_status(&state.db, &created.provider_invoice_id, "invalid").await;
             return Err(e);
         }
     }
@@ -403,7 +390,7 @@ pub async fn start(
 
     Ok(Json(StartPurchaseResp {
         invoice_id: invoice.id,
-        btcpay_invoice_id: created.id,
+        btcpay_invoice_id: created.provider_invoice_id,
         checkout_url,
         amount_sats: final_price,
         base_price_sats: base_price,

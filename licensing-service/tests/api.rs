@@ -543,22 +543,78 @@ async fn free_purchase_issues_license_inline() {
     );
 }
 
-// Note on the missing paid-purchase test:
-//
-// `purchase::start` still uses the legacy compat accessor
-// `state.btcpay_client()`, which downcasts the active provider
-// specifically to the concrete `BtcpayProvider` type rather than
-// going through the `PaymentProvider` trait. A `MockPaymentProvider`
-// can't satisfy that downcast — it'd need to BE a `BtcpayProvider`,
-// which requires a working HTTP client.
-//
-// The fix is a small refactor of `purchase::start` to use
-// `state.payment_provider().await?.create_invoice(...)` instead of
-// the compat path. That's already on the v0.3 backlog (see
-// `src/payment/mod.rs` "Why a trait" doc comment). Once it lands, a
-// `paid_purchase_creates_invoice_via_provider` test slots right in.
-// For now we test the webhook handler — which IS already on the
-// trait surface — directly against a fixture invoice.
+/// Paid purchase end-to-end through the trait. v0.1.0:43 migrated
+/// `purchase::start` off the legacy `state.btcpay_client()` compat
+/// accessor onto the abstract `state.payment_provider()` trait
+/// surface, which means a `MockPaymentProvider` can drive the path
+/// without a real BTCPay roundtrip.
+///
+/// Verifies:
+///   - the daemon delegates invoice creation to the provider
+///   - the returned `provider_invoice_id` is stamped onto the local
+///     invoice row's `btcpay_invoice_id` column
+///   - the buyer-facing `checkout_url` is whatever the provider
+///     returned (mock returns a deterministic stub URL; production
+///     BtcpayProvider rewrites the host inside its impl)
+///   - no license is issued at this stage (that's the webhook's job)
+#[tokio::test]
+async fn paid_purchase_creates_invoice_via_provider() {
+    let (state, _tmp) = make_test_state_with_mock_provider().await;
+
+    repo::create_product(
+        &state.db,
+        "paid-test",
+        "Paid Test",
+        "",
+        10_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let req = build_request(
+        "POST",
+        "/v1/purchase",
+        &[],
+        Some(json!({"product": "paid-test"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "paid purchase should succeed against the mock provider"
+    );
+
+    let body = body_json(resp).await;
+    assert_eq!(body["amount_sats"], 10_000);
+    assert_eq!(body["btcpay_invoice_id"], "mock-inv-1");
+    assert!(
+        body["checkout_url"]
+            .as_str()
+            .map_or(false, |s| s.starts_with("http://mock-checkout.test/")),
+        "checkout_url should pass through from the provider: {body:?}"
+    );
+    assert!(
+        body["license_key"].is_null(),
+        "no license should be issued before the settle webhook fires"
+    );
+
+    // Pending invoice row exists with the provider's id stamped on it.
+    let invoice_status: String = sqlx::query_scalar(
+        "SELECT status FROM invoices WHERE btcpay_invoice_id = 'mock-inv-1'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(invoice_status, "pending");
+
+    // No license yet.
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 0);
+}
 
 /// The settle webhook: provider POSTs an InvoiceSettled event, daemon
 /// flips the invoice status and issues a license. Re-POSTing the same
