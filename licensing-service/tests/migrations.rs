@@ -563,6 +563,107 @@ async fn migration_0010_backfills_existing_products_to_sat() {
     assert_db_clean(&pool).await.expect("db clean after 0010");
 }
 
+/// Migration 0011 (subscriptions schema): verifies that adding the
+/// new policies columns + the subscriptions / subscription_invoices
+/// tables doesn't break existing data, and that the new tables
+/// accept rows via FK references back to licenses / policies /
+/// invoices created under the prior schema.
+#[tokio::test]
+async fn migration_0011_adds_subscriptions_without_breaking_existing_data() {
+    let (pool, _tmp) = make_pool().await;
+
+    // Apply everything before 0011, populate realistic state.
+    apply_range(&pool, 0, 10)
+        .await
+        .expect("apply 0001..=0010");
+    seed_realistic_fixtures(&pool)
+        .await
+        .expect("seed pre-0011 fixtures");
+
+    // Apply 0011.
+    apply_range(&pool, 10, 11)
+        .await
+        .expect("apply 0011_subscriptions");
+
+    // New policies columns exist with sensible defaults on existing rows.
+    let (is_recurring, period, grace, trial): (i64, Option<i64>, i64, i64) = sqlx::query_as(
+        "SELECT is_recurring, renewal_period_days, grace_period_days, trial_days \
+         FROM policies WHERE id = 'pol1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(is_recurring, 0, "existing policies must default to non-recurring");
+    assert_eq!(period, None, "renewal_period_days should be NULL on non-recurring rows");
+    assert_eq!(grace, 7, "grace_period_days default should be 7");
+    assert_eq!(trial, 0, "trial_days default should be 0");
+
+    // The new tables exist and accept a subscription tied to the
+    // existing fixture license.
+    let now = "2026-05-08T12:00:00Z";
+    sqlx::query(
+        "INSERT INTO subscriptions(id, license_id, policy_id, product_id, period_days, \
+         listed_currency, listed_value, status, started_at, next_renewal_at, \
+         created_at, updated_at) \
+         VALUES('sub1', 'lic1', 'pol1', 'p1', 30, 'USD', 2500, 'active', ?, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind("2026-06-08T12:00:00Z")
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert subscription with FKs into pre-0011 rows");
+
+    sqlx::query(
+        "INSERT INTO subscription_invoices(id, subscription_id, invoice_id, cycle_number, \
+         cycle_start_at, cycle_end_at, created_at) \
+         VALUES('si1', 'sub1', 'inv1', 1, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind("2026-06-08T12:00:00Z")
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("subscription_invoices accepts rows");
+
+    // Status CHECK constraint enforced.
+    let bad = sqlx::query(
+        "INSERT INTO subscriptions(id, license_id, policy_id, product_id, period_days, \
+         listed_currency, listed_value, status, started_at, created_at, updated_at) \
+         VALUES('sub2', 'lic1', 'pol1', 'p1', 30, 'USD', 2500, 'garbage', ?, ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad.is_err(),
+        "unknown subscription status should be rejected by CHECK"
+    );
+
+    // The cycle_number UNIQUE constraint prevents accidental
+    // double-billing for the same cycle.
+    let dup = sqlx::query(
+        "INSERT INTO subscription_invoices(id, subscription_id, invoice_id, cycle_number, \
+         cycle_start_at, cycle_end_at, created_at) \
+         VALUES('si2', 'sub1', 'inv1', 1, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind("2026-06-08T12:00:00Z")
+    .bind(now)
+    .execute(&pool)
+    .await;
+    assert!(
+        dup.is_err(),
+        "(subscription_id, cycle_number) must be UNIQUE — same cycle twice should fail"
+    );
+
+    // FK + integrity invariants.
+    assert_db_clean(&pool).await.expect("db clean after 0011");
+}
+
 /// Future-proofing. Always seeds fixtures one migration before the end,
 /// then applies the final migration. As new migrations land (0010,
 /// 0011, …), they get vetted against populated data automatically; no
