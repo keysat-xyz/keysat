@@ -53,9 +53,19 @@ const RELEASE_NOTES = [
   '**What\'s next (v0.3).** Zaprite payment provider for card payments. Recurring subscriptions. In-place tier upgrades for end customers. Multi-currency pricing (USD + sats with auto-conversion at invoice creation).',
 ].join('\n')
 
+// Routine wrapper-revision changelog. Newest first; each entry is
+// what changed since the previous downstream-:N. The `:0` notes are
+// in RELEASE_NOTES above (the milestone). Subsequent revisions
+// append here.
+const ROUTINE_NOTES = [
+  '0.2.0:1 — Buy-page discount-code box no longer shows a "FOUNDERS50" placeholder. Empty placeholder now; buyers paste their actual code without a misleading hint.',
+  '',
+  RELEASE_NOTES,
+].join('\n\n')
+
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:0',
-  releaseNotes: { en_US: RELEASE_NOTES },
+  version: '0.2.0:1',
+  releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
   // licensing-service/migrations/ and run at daemon boot regardless

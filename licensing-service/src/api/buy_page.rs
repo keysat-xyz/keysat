@@ -476,7 +476,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     <div class="field">
       <label for="code">Discount code (optional)</label>
       <div class="code-row">
-        <input type="text" id="code" name="code" placeholder="FOUNDERS50" autocomplete="off">
+        <input type="text" id="code" name="code" placeholder="" autocomplete="off">
         <button type="button" class="btn-apply" id="btn-apply">Apply</button>
       </div>
       <div class="code-status" id="code-status" role="status" aria-live="polite"></div>
