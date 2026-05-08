@@ -9,8 +9,25 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const v0_1_0 = VersionInfo.of({
-  version: '0.1.0:47',
+  version: '0.1.0:48',
   releaseNotes: [
+    `Alpha-iteration revision 48 of v0.1.0 — Multi-currency schema foundation. Daemon now stores native currency + value on products, policies, invoices, and discount codes. Behaviour is unchanged for existing operators (everything backfills as 'SAT'). Lands the storage shape so the v0.3 admin UI work for fiat pricing has somewhere to write. The admin SPA, buy page, and discount-code form continue to render sat-only views in this release.`,
+    ``,
+    `Migration 0010 adds:`,
+    `  - products: \`price_currency\` (default 'SAT') + \`price_value\` (backfilled from \`price_sats\` for every existing row)`,
+    `  - policies: \`price_currency_override\` + \`price_value_override\` (NULL on either = "inherit from product")`,
+    `  - invoices: \`listed_currency\`, \`listed_value\`, \`exchange_rate_centibps\`, \`exchange_rate_source\` (all nullable; populated by future fiat-pricing flows)`,
+    `  - discount_codes: \`discount_currency\` (default 'SAT') so 'fixed_sats' and 'set_price' codes can become "\$10 off" or "set price to \$25" against fiat-priced products`,
+    `  - new index \`idx_products_currency\` for future "list products by currency" admin views`,
+    ``,
+    `**Backfill is the contract.** Migration regression test \`migration_0010_backfills_existing_products_to_sat\` seeds three products (free, paid, pricier) and a policy with a sat override BEFORE 0010 runs, applies 0010, and asserts every row ends up with \`price_currency = 'SAT'\` and \`price_value = price_sats\`. Catches any future change that would break the SAT-default-and-mirror contract.`,
+    ``,
+    `Read path: \`Product\` struct gains \`price_currency\` + \`price_value\` fields with serde defaults so older clients keep deserializing correctly. Write path: \`create_product\` and \`update_product\` dual-write \`price_sats\` and \`price_value\` to the same number, with \`price_currency = 'SAT'\`. Fiat-priced product creation goes through a separate \`create_product_with_currency\` helper that lands alongside the admin UI work in a follow-up release.`,
+    ``,
+    `**Test count: 33** (was 32; +1 the 0010 backfill regression test). \`migration_0009_is_idempotent\` is now pinned to 0009 by filename rather than "the last migration" — additive ALTER TABLE migrations like 0010 can't be re-run safely (SQLite has no \`ADD COLUMN IF NOT EXISTS\`), and 0009's whole point was being safely retryable, so the test is now correctly scoped to that.`,
+    ``,
+    `**Upgrade path.** v0.1.0:47 → v0.1.0:48 is a straight drop-in for normal operators. The new SQL migration runs automatically on first boot post-upgrade; backfills in the same transaction. No daemon-restart loop, no admin action required. If you tinkered with \`/data/keysat.db\` directly between releases, run a SQLite \`PRAGMA integrity_check\` before upgrading just to be safe.`,
+    ``,
     `Alpha-iteration revision 47 of v0.1.0 — Opt-in community analytics, plus draft v0.2.0:0 release notes parked for the upcoming milestone cut.`,
     ``,
     `**Opt-in community analytics.** Off by default. Toggle on the admin Overview page sends a daily anonymous heartbeat to a configurable collector URL, with full disclosure of exactly what gets sent (and what doesn't). Closes the last T2 v0.2-plan item.`,
