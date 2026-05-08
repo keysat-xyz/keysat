@@ -666,3 +666,108 @@ async fn webhook_settles_invoice_and_issues_license_idempotently() {
         "redelivered settle webhook MUST NOT duplicate the license"
     );
 }
+
+/// Tier caps: an Unlicensed (or Creator-tier) operator may create up
+/// to `CREATOR_PRODUCT_CAP` products. The Nth+1 attempt returns 402
+/// with `upgrade_url` populated so the admin SPA can render the
+/// "Upgrade to Pro" CTA inline.
+///
+/// Then we swap the daemon's `self_tier` to a Licensed tier with the
+/// `unlimited_products` entitlement (the same entitlement the master
+/// Keysat issues to paying operators) and verify the same N+1 attempt
+/// now succeeds. This is the dynamic-swap behavior that lets operators
+/// activate a new license via the admin API and keep working without a
+/// daemon restart.
+#[tokio::test]
+async fn tier_caps_block_at_creator_limit_and_unlock_after_upgrade() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Reach the cap. CREATOR_PRODUCT_CAP is 5; create exactly five.
+    for i in 0..5 {
+        let req = build_request(
+            "POST",
+            "/v1/admin/products",
+            &[("authorization", &auth)],
+            Some(json!({
+                "slug": format!("p{i}"),
+                "name": format!("Product {i}"),
+                "price_sats": 1_000,
+            })),
+        );
+        let resp = send(&state, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "product {i} should succeed (under cap)"
+        );
+    }
+
+    // Sixth product → 402 with upgrade_url.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "p-over-cap",
+            "name": "Over The Cap",
+            "price_sats": 1_000,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "6th product should be blocked by the Creator-tier cap"
+    );
+    let body = body_json(resp).await;
+    assert!(
+        body["upgrade_url"]
+            .as_str()
+            .map_or(false, |u| u.contains("/buy/keysat")),
+        "402 response should carry an upgrade_url pointing at the master Keysat: {body:?}"
+    );
+
+    // DB should still reflect exactly 5 products — the 6th must not
+    // have leaked through.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM products")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 5);
+
+    // Swap self_tier to a Licensed tier with `unlimited_products`.
+    // Mirrors what `Activate Keysat license` does in the admin UI: the
+    // operator pastes their Keysat-licenses-Keysat key, the daemon
+    // verifies it against the master pubkey, and writes the parsed
+    // entitlements into self_tier under a write lock — no restart.
+    *state.self_tier.write().await = Tier::Licensed {
+        license_id: Uuid::new_v4(),
+        product_id: Uuid::new_v4(),
+        expires_at: 0,
+        entitlements: vec!["self_host".into(), "unlimited_products".into()],
+    };
+
+    // Now the same 6th product attempt succeeds.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "p-after-upgrade",
+            "name": "Pro Tier Now",
+            "price_sats": 1_000,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "after the tier swap, the cap should no longer fire"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM products")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 6, "the previously-blocked product should now exist");
+}
