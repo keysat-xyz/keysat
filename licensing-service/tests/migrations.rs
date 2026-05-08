@@ -397,6 +397,85 @@ async fn migration_0009_is_idempotent() {
     assert_db_clean(&pool).await.expect("db clean after re-apply");
 }
 
+/// Regression for the v0.1.0:48 → :49 incident: the `_sqlx_migrations`
+/// table records a checksum for each applied migration; on every
+/// subsequent boot sqlx verifies the on-disk bytes still match.
+/// Builds across versions can produce subtly different bytes
+/// (trailing newlines, line-endings, build-host normalization) for
+/// the same semantic SQL, which makes sqlx refuse to start with
+/// "migration N was previously applied but has been modified" and
+/// crashes the daemon.
+///
+/// `db::init` works around this by detecting the
+/// `MigrateError::VersionMismatch` for migrations on the
+/// `IDEMPOTENT_MIGRATIONS` allowlist (just `9` for now), clearing the
+/// stale row, and retrying. This test simulates the exact scenario:
+/// poison the recorded checksum for v9, run init, expect success.
+#[tokio::test]
+async fn db_init_self_heals_checksum_mismatch_on_idempotent_migrations() {
+    let (pool, _tmp) = make_pool().await;
+
+    // Step 1: apply all migrations cleanly to populate
+    // _sqlx_migrations with current checksums.
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("first apply");
+
+    // Step 2: poison the recorded checksum for v9. This simulates
+    // the cross-build drift that triggered the production incident.
+    let bogus_checksum: Vec<u8> = (0..48).map(|_| 0xEF).collect(); // Sha384 = 48 bytes
+    let n = sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 9")
+        .bind(&bogus_checksum)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(n, 1, "_sqlx_migrations should have a row for v9");
+
+    // Step 3: confirm sqlx::migrate! ALONE bails — proves the
+    // poisoning works and that without self-heal the daemon would
+    // crash here.
+    let ungated = sqlx::migrate!("./migrations").run(&pool).await;
+    assert!(
+        matches!(
+            ungated,
+            Err(sqlx::migrate::MigrateError::VersionMismatch(9))
+        ),
+        "raw sqlx::migrate! should reject the poisoned row: got {ungated:?}"
+    );
+
+    // Step 4: drop the existing pool and call db::init on the same
+    // file. The self-heal should clear v9's row, re-apply, succeed.
+    let tmp_path = _tmp.path().to_path_buf();
+    drop(pool);
+    drop(_tmp);
+    let healed = keysat::db::init(&tmp_path)
+        .await
+        .expect("db::init should self-heal the poisoned v9 row");
+
+    // Sanity check: v9 is back in _sqlx_migrations with a fresh
+    // (correct) checksum, and v10 is still there from the original
+    // apply.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (9, 10)")
+            .fetch_one(&healed)
+            .await
+            .unwrap();
+    assert_eq!(count, 2, "both 9 and 10 should be recorded after self-heal");
+
+    // The poisoned checksum was replaced with the real one.
+    let new_checksum: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 9")
+            .fetch_one(&healed)
+            .await
+            .unwrap();
+    assert_ne!(
+        new_checksum, bogus_checksum,
+        "self-heal must replace the poisoned checksum with the current one"
+    );
+}
+
 /// Migration 0010 (multi-currency foundation): verifies that the
 /// backfill correctly populates the new `price_currency` and
 /// `price_value` columns against products that existed before the
