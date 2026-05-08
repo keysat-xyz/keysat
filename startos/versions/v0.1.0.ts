@@ -9,8 +9,24 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const v0_1_0 = VersionInfo.of({
-  version: '0.1.0:50',
+  version: '0.1.0:51',
   releaseNotes: [
+    `Alpha-iteration revision 51 of v0.1.0 — Multi-currency feature complete: edit-product currency picker, discount-code currency picker, full fiat rendering on the buy page tier picker. Plus a meaningful UX cleanup for the community-analytics opt-in (compact one-line strip, default OFF, auto-save on toggle, fixes the inverted-checkbox bug). Last polish pass before v0.2.0:0.`,
+    ``,
+    `**Edit-product currency support.** Operators can switch a product between SAT, USD, and EUR pricing in place via the Edit modal — no disable-and-recreate dance. PATCH /v1/admin/products/:id accepts price_currency + price_value alongside the legacy price_sats. Switching to fiat resets price_sats to 0; the next invoice creation populates it via the rate fetcher.`,
+    ``,
+    `**Discount-code currency picker.** Create-code form has a Currency dropdown (SAT default). For 'percent' the currency is recorded for audit but amount remains basis points; for 'fixed_sats' / 'set_price' the currency determines the unit. Decimal entry on USD/EUR ($9.99) converts to cents on the way out. List cells render fiat as "$10.00 off" / "€25.00 flat".`,
+    ``,
+    `**Buy page tier picker fully fiat-aware.** Static tier card HTML respects product.price_currency. JS selectTier() reads (price_currency, price_value) from the embedded TIERS object and swaps both the amount AND the unit cell ("sats" ↔ "USD") when buyers click a different tier.`,
+    ``,
+    `**Compact community-analytics opt-in.** Replaces the prominent card with a one-line strip below the public-key card: native checkbox + single sentence + "what gets sent?" inline disclosure. Auto-saves on toggle. Default remains OFF — right call for Keysat specifically given the sovereignty / no-phone-home positioning. Fixes the inverted-checkbox UX bug.`,
+    ``,
+    `**v0.2.0:0 readiness.** All MULTI_CURRENCY_DESIGN phases 1-6 are now operator-visible end-to-end. v0.2.0 file is drafted at startos/versions/v0.2.0.ts; cutover is a single-line edit to versions/index.ts followed by a normal publish — see CUTTING_V0.2.0.md.`,
+    ``,
+    `Test count unchanged at 38 — pure UI + admin-handler work, behavior covered by existing currency tests from :48 / :49.`,
+    ``,
+    `**Upgrade path.** v0.1.0:50 → v0.1.0:51 is a straight drop-in. No new migrations, no schema changes.`,
+    ``,
     `Alpha-iteration revision 50 of v0.1.0 — **Hotfix.** Auto-recovers from the "migration 9 was previously applied but has been modified" crash-loop that hit operators upgrading through v0.1.0:48 → :49. If you're stuck on that crash-loop right now, upgrading to v0.1.0:50 fixes it automatically — no SSH or sqlite3 dance needed.`,
     ``,
     `**The bug.** sqlx records a SHA-384 of each migration's bytes when it's first applied, then verifies the on-disk bytes still match on every subsequent boot. Builds across versions can produce subtly different bytes for the same semantic SQL (trailing newlines, line endings, build-host normalization). sqlx then refuses to start with "migration N was previously applied but has been modified", crash-looping. Recovery required SSHing in + running \`DELETE FROM _sqlx_migrations WHERE version = 9\` by hand. Two operators in a row hit this on the v0.1.0:48 → :49 upgrade.`,
