@@ -2091,3 +2091,254 @@ async fn edit_policy_to_recurring_respects_tier_gate() {
         "name-only patch on a recurring policy must not re-fire the tier gate"
     );
 }
+
+// ---------------------------------------------------------------------
+// Subscription cancellation (Phase 6)
+//
+// Admin cancel: full trust, just needs the bearer token + the sub id.
+// Buyer cancel: auth via license key in the body. The cancelled state
+// is terminal — license stays valid through end-of-cycle, renewal
+// worker stops creating new invoices, webhook fires.
+// ---------------------------------------------------------------------
+
+/// Helper: seed a license + active subscription tied to it, plus a
+/// product + recurring policy. Returns (license_id, sub_id, key_string)
+/// where `key_string` is the signed license key the buyer would have
+/// in hand (used by the self-service cancel test).
+async fn seed_subscription(state: &AppState) -> (String, String, String) {
+    let product = repo::create_product(
+        &state.db,
+        "sub-cancel-prod",
+        "Cancel Test",
+        "",
+        25_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+    let policy = repo::create_policy(
+        &state.db,
+        &product.id,
+        "Monthly",
+        "monthly",
+        30 * 86_400,
+        0,
+        1,
+        false,
+        None,
+        &[],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig {
+            is_recurring: true,
+            renewal_period_days: 30,
+            grace_period_days: 7,
+            trial_days: 0,
+        },
+    )
+    .await
+    .expect("create_policy");
+
+    let license_id = Uuid::new_v4();
+    let issued_at = Utc::now();
+    repo::create_license(
+        &state.db,
+        &license_id.to_string(),
+        &product.id,
+        None,
+        &issued_at.to_rfc3339(),
+        &json!({}),
+        Some(&policy.id),
+        None,
+        0,
+        1,
+        &[],
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("create_license");
+
+    // Seed a placeholder cycle-1 invoice so the FK on subscription_invoices
+    // is satisfiable — the invoice details don't matter for the cancel
+    // tests, only that a row exists.
+    let invoice_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO invoices(id, btcpay_invoice_id, product_id, amount_sats, \
+         checkout_url, status, created_at, updated_at, listed_currency, \
+         listed_value, policy_id) \
+         VALUES(?, ?, ?, 0, ?, 'pending', ?, ?, 'SAT', 0, ?)",
+    )
+    .bind(&invoice_id)
+    .bind(&format!("test-inv-{}", &invoice_id[..8]))
+    .bind(&product.id)
+    .bind("http://test.invalid/inv")
+    .bind(issued_at.to_rfc3339())
+    .bind(issued_at.to_rfc3339())
+    .bind(&policy.id)
+    .execute(&state.db)
+    .await
+    .expect("seed invoice");
+
+    let sub = keysat::subscriptions::create_subscription(
+        &state.db,
+        &license_id.to_string(),
+        &policy.id,
+        &product.id,
+        30,
+        "SAT",
+        25_000,
+        &invoice_id,
+    )
+    .await
+    .expect("create_subscription");
+
+    // Build a real signed key the buyer-cancel endpoint can verify.
+    let product_uuid = Uuid::parse_str(&product.id).expect("product id is uuid");
+    let payload = LicensePayload {
+        version: 2,
+        flags: 0,
+        product_id: product_uuid,
+        license_id,
+        issued_at: issued_at.timestamp(),
+        expires_at: 0,
+        fingerprint_hash: [0; 32],
+        entitlements: vec![],
+    };
+    let signature = crypto::sign_payload(&state.keypair.signing, &payload);
+    let key_string = crypto::encode_key(&payload, &signature);
+
+    (license_id.to_string(), sub.id, key_string)
+}
+
+#[tokio::test]
+async fn admin_cancel_subscription_happy_path() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let (_license_id, sub_id, _key) = seed_subscription(&state).await;
+
+    // Cancel.
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/subscriptions/{}/cancel", sub_id),
+        &[("authorization", &auth)],
+        Some(json!({"reason": "customer requested"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["status"], "cancelled");
+
+    // DB row reflects the new state + cancelled_at is stamped.
+    let (status, cancelled_at): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, cancelled_at FROM subscriptions WHERE id = ?",
+    )
+    .bind(&sub_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, "cancelled");
+    assert!(cancelled_at.is_some(), "cancelled_at must be stamped");
+
+    // Audit row exists.
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'subscription.cancel' \
+         AND target_id = ?",
+    )
+    .bind(&sub_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "exactly one audit row for the cancel");
+
+    // Idempotency: cancelling a cancelled sub returns ok with the prior state.
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/subscriptions/{}/cancel", sub_id),
+        &[("authorization", &auth)],
+        Some(json!({})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["already"], "cancelled");
+}
+
+#[tokio::test]
+async fn admin_cancel_unknown_subscription_404s() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    let req = build_request(
+        "POST",
+        "/v1/admin/subscriptions/no-such-sub/cancel",
+        &[("authorization", &auth)],
+        Some(json!({})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn buyer_cancel_subscription_via_license_key() {
+    let (state, _tmp) = make_test_state().await;
+    let (_license_id, sub_id, key_string) = seed_subscription(&state).await;
+
+    // Buyer self-cancels by POSTing the signed key. No admin auth.
+    let req = build_request(
+        "POST",
+        "/v1/subscriptions/cancel",
+        &[],
+        Some(json!({
+            "license_key": key_string,
+            "reason": "no longer needed"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "buyer cancel should succeed with a valid key"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["subscription_id"], sub_id);
+
+    // Audit row carries actor=buyer.
+    let actor: Option<String> = sqlx::query_scalar(
+        "SELECT actor_kind FROM audit_log WHERE target_id = ? \
+         AND action = 'subscription.cancel'",
+    )
+    .bind(&sub_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        actor.as_deref(),
+        Some("buyer_license_key"),
+        "audit must record the buyer-key actor kind"
+    );
+}
+
+#[tokio::test]
+async fn buyer_cancel_rejects_garbage_key() {
+    let (state, _tmp) = make_test_state().await;
+    let _ = seed_subscription(&state).await;
+
+    let req = build_request(
+        "POST",
+        "/v1/subscriptions/cancel",
+        &[],
+        Some(json!({"license_key": "not-a-real-key"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "garbage key must be 401, not 404 — don't leak which subs exist"
+    );
+}

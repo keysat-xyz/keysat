@@ -215,6 +215,97 @@ pub async fn find_subscription_for_invoice(
     Ok(row.map(|r| r.get::<String, _>("subscription_id")))
 }
 
+/// Look up a subscription by id.
+pub async fn get_subscription_by_id(
+    pool: &SqlitePool,
+    sub_id: &str,
+) -> Result<Option<Subscription>> {
+    let row = sqlx::query(&format!(
+        "SELECT {SUB_COLS} FROM subscriptions WHERE id = ?"
+    ))
+    .bind(sub_id)
+    .fetch_optional(pool)
+    .await
+    .context("get_subscription_by_id")?;
+    Ok(row.map(row_to_subscription))
+}
+
+/// Look up the subscription tied to a given license_id. There's at
+/// most one (the schema enforces 1:1 via UNIQUE on license_id) — used
+/// by the buyer self-service cancel endpoint, which authenticates via
+/// license key, not subscription id.
+pub async fn get_subscription_by_license_id(
+    pool: &SqlitePool,
+    license_id: &str,
+) -> Result<Option<Subscription>> {
+    let row = sqlx::query(&format!(
+        "SELECT {SUB_COLS} FROM subscriptions WHERE license_id = ?"
+    ))
+    .bind(license_id)
+    .fetch_optional(pool)
+    .await
+    .context("get_subscription_by_license_id")?;
+    Ok(row.map(row_to_subscription))
+}
+
+/// List all subscriptions, optionally filtered by status. Used by the
+/// admin UI's subscriptions tab. Sorted newest-first by started_at.
+pub async fn list_subscriptions(
+    pool: &SqlitePool,
+    status_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Subscription>> {
+    let limit = limit.clamp(1, 1000);
+    let rows = if let Some(s) = status_filter {
+        sqlx::query(&format!(
+            "SELECT {SUB_COLS} FROM subscriptions WHERE status = ? \
+             ORDER BY started_at DESC LIMIT ?"
+        ))
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query(&format!(
+            "SELECT {SUB_COLS} FROM subscriptions \
+             ORDER BY started_at DESC LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+    .context("list_subscriptions query")?;
+    Ok(rows.into_iter().map(row_to_subscription).collect())
+}
+
+/// Mark a subscription as cancelled. The license stays valid through
+/// the end of the current cycle (per design doc — no immediate
+/// revoke); the renewal worker's `WHERE status IN ('active', 'past_due')`
+/// filter ensures cancelled subs simply stop renewing. Idempotent —
+/// re-cancelling an already-cancelled sub is a no-op (returns Ok).
+pub async fn cancel_subscription(
+    pool: &SqlitePool,
+    sub_id: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE subscriptions \
+         SET status = 'cancelled', cancelled_at = ?, updated_at = ? \
+         WHERE id = ? AND status IN ('active', 'past_due')",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(sub_id)
+    .execute(pool)
+    .await
+    .context("cancel_subscription")?
+    .rows_affected();
+    // rows_affected = 0 means the sub was already cancelled, lapsed,
+    // or doesn't exist. Return false so the caller can decide whether
+    // that's a 404 (caller already verified existence) or a no-op.
+    Ok(rows > 0)
+}
+
 /// Atomic creation of a subscription + the first cycle's invoice.
 /// Used at purchase time when an operator's policy has
 /// `is_recurring = 1`. Not invoked by the worker (the worker

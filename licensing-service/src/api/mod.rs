@@ -62,6 +62,7 @@ pub mod machines;
 pub mod policies;
 pub mod products;
 pub mod purchase;
+pub mod subscriptions;
 pub mod buy_page;
 pub mod issuer_key;
 pub mod redeem;
@@ -333,6 +334,20 @@ pub fn router(state: AppState) -> Router {
             get(policies::list_public_policies),
         )
         .route("/v1/admin/tips", get(policies::list_tips))
+        // Subscriptions (recurring billing) — admin list + cancel.
+        .route(
+            "/v1/admin/subscriptions",
+            get(subscriptions::admin_list),
+        )
+        .route(
+            "/v1/admin/subscriptions/:id/cancel",
+            post(subscriptions::admin_cancel),
+        )
+        // Buyer self-service cancel — auth via license key in the body.
+        .route(
+            "/v1/subscriptions/cancel",
+            post(subscriptions::buyer_cancel),
+        )
         // Machines (admin views).
         .route("/v1/admin/machines", get(machines::admin_list))
         .route(
