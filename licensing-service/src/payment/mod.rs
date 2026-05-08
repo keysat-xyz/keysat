@@ -40,6 +40,46 @@ use std::any::Any;
 pub mod btcpay;
 pub mod zaprite;
 
+/// Settings-table key that records which provider the operator
+/// last activated. Used by the boot-time loader to pick which
+/// provider to load when both `btcpay_config` and `zaprite_config`
+/// are populated. Values: `'btcpay'` | `'zaprite'`. Absent means
+/// "use whichever single provider is configured" (back-compat
+/// for installs that pre-date this setting).
+pub const SETTING_ACTIVE_PROVIDER: &str = "active_payment_provider";
+
+/// Convenience getter for the active-provider setting. Returns
+/// `Some(ProviderKind)` if the operator has explicitly chosen
+/// one, `None` if they haven't (caller falls back to the
+/// load-order heuristic).
+pub async fn read_active_provider_preference(
+    pool: &sqlx::SqlitePool,
+) -> Option<ProviderKind> {
+    match crate::db::repo::settings_get(pool, SETTING_ACTIVE_PROVIDER).await {
+        Ok(Some(s)) => match s.as_str() {
+            "btcpay" => Some(ProviderKind::Btcpay),
+            "zaprite" => Some(ProviderKind::Zaprite),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Persist the operator's active-provider preference. Called by
+/// the connect endpoints (Connect BTCPay, Connect Zaprite) and
+/// by the new "Activate <provider>" endpoint that flips between
+/// already-configured providers without re-authorizing.
+pub async fn write_active_provider_preference(
+    pool: &sqlx::SqlitePool,
+    kind: ProviderKind,
+) -> anyhow::Result<()> {
+    let value = kind.as_str();
+    crate::db::repo::settings_set(pool, SETTING_ACTIVE_PROVIDER, Some(value))
+        .await
+        .map_err(|e| anyhow::anyhow!("write active provider preference: {e:#}"))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {

@@ -95,6 +95,15 @@ pub async fn connect(
     state
         .set_payment_provider(Arc::new(provider))
         .await;
+    // Persist the operator's preference so the boot-time loader
+    // picks Zaprite on next restart, even if BTCPay's config row
+    // is also still in the DB.
+    crate::payment::write_active_provider_preference(
+        &state.db,
+        crate::payment::ProviderKind::Zaprite,
+    )
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("write provider preference: {e:#}")))?;
 
     let _ = crate::db::repo::insert_audit(
         &state.db,
@@ -146,6 +155,21 @@ pub async fn disconnect(
         AppError::Internal(anyhow::anyhow!("clear zaprite_config: {e:#}"))
     })?;
     state.clear_payment_provider().await;
+    // If the active-provider preference was Zaprite, clear it.
+    // Don't blindly clear if it was BTCPay — that's a different
+    // operator's choice we shouldn't undo just because they ran
+    // Disconnect Zaprite.
+    if matches!(
+        crate::payment::read_active_provider_preference(&state.db).await,
+        Some(crate::payment::ProviderKind::Zaprite)
+    ) {
+        let _ = crate::db::repo::settings_set(
+            &state.db,
+            crate::payment::SETTING_ACTIVE_PROVIDER,
+            None,
+        )
+        .await;
+    }
 
     let _ = crate::db::repo::insert_audit(
         &state.db,

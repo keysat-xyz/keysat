@@ -71,6 +71,7 @@ pub mod tier;
 pub mod validate;
 pub mod community;
 pub mod db_info;
+pub mod payment_provider;
 pub mod rates_admin;
 pub mod recover;
 pub mod zaprite_authorize;
@@ -244,6 +245,17 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/admin/zaprite/status",
             get(zaprite_authorize::status),
+        )
+        // Provider-agnostic active-payment-provider control.
+        // Operators with both BTCPay and Zaprite configured can flip
+        // the active one without re-running Connect.
+        .route(
+            "/v1/admin/payment-provider/status",
+            get(payment_provider::status),
+        )
+        .route(
+            "/v1/admin/payment-provider/activate",
+            post(payment_provider::activate),
         )
         // Zaprite webhook landing — operator points Zaprite's
         // webhook setting at this URL. Same handler as

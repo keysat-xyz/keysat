@@ -308,6 +308,19 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
             .with_public_base(state.config.btcpay_public_url.clone()),
     );
     state.set_payment_provider(provider).await;
+    // Persist active-provider preference so the boot-time loader
+    // picks BTCPay on next restart even if Zaprite's config row
+    // is also still in the DB. Failure here is non-fatal (BTCPay
+    // is the historical default, so the fallback loader picks it
+    // anyway) but logged.
+    if let Err(e) = crate::payment::write_active_provider_preference(
+        &state.db,
+        crate::payment::ProviderKind::Btcpay,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "failed to record BTCPay as active payment provider");
+    }
 
     tracing::info!(
         store = %store.id,
@@ -391,6 +404,21 @@ pub async fn disconnect(
     // Replace the runtime payment provider so subsequent purchase
     // attempts return BtcpayNotConfigured cleanly.
     state.clear_payment_provider().await;
+
+    // If BTCPay was the recorded active-provider preference, clear
+    // it. Don't blindly clear if it was Zaprite — different operator
+    // intent.
+    if matches!(
+        crate::payment::read_active_provider_preference(&state.db).await,
+        Some(crate::payment::ProviderKind::Btcpay)
+    ) {
+        let _ = crate::db::repo::settings_set(
+            &state.db,
+            crate::payment::SETTING_ACTIVE_PROVIDER,
+            None,
+        )
+        .await;
+    }
 
     let _ = crate::db::repo::insert_audit(
         &state.db,

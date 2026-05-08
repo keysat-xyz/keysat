@@ -1204,6 +1204,143 @@ async fn paid_purchase_in_usd_records_listed_currency_and_rate() {
     assert_eq!(row.4, 98_000);
 }
 
+/// Active-provider preference round-trip. Pins the contract that
+/// `Activate <provider>` flips both the in-memory provider AND the
+/// persisted preference so the next daemon boot picks the same one.
+///
+/// Simulates the operator's lifecycle:
+///   1. Configure both BTCPay and Zaprite (both rows in DB)
+///   2. Activate Zaprite → preference flag = "zaprite"
+///   3. Activate BTCPay → preference flag = "btcpay"
+///   4. Disconnect BTCPay → preference flag cleared (because it
+///      pointed at the wiped config)
+///   5. Disconnect Zaprite while preference was already "btcpay"
+///      → preference NOT cleared (stays at "btcpay" because it
+///      was pointing at a different provider)
+#[tokio::test]
+async fn payment_provider_preference_round_trip() {
+    use keysat::payment::{self, ProviderKind};
+
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Pre-seed both configs as if the operator had run Connect on
+    // each at some point. We bypass the actual Connect endpoints
+    // because they call out to BTCPay / Zaprite to validate the
+    // credentials, which we don't want to do in unit tests.
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO btcpay_config(id, base_url, api_key, store_id, webhook_id, \
+         webhook_secret, connected_at) \
+         VALUES(1, 'http://btcpay.test', 'btcpay-key', 'store-1', 'wh-1', \
+         '0123456789abcdef', ?)",
+    )
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO zaprite_config(id, api_key, base_url, webhook_id, connected_at, updated_at) \
+         VALUES(1, 'zaprite-key', 'https://api.zaprite.test', NULL, ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Step 1: no preference recorded yet.
+    let pref = payment::read_active_provider_preference(&state.db).await;
+    assert_eq!(pref, None);
+
+    // Step 2: GET status surfaces both as configured, no active yet.
+    let req = build_request(
+        "GET",
+        "/v1/admin/payment-provider/status",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["btcpay_configured"], true);
+    assert_eq!(body["zaprite_configured"], true);
+    assert!(body["preferred"].is_null());
+
+    // Step 3: Activate Zaprite. The endpoint reads the saved
+    // zaprite_config to build the provider — the saved key
+    // 'zaprite-key' won't talk to a real API but the activate
+    // path doesn't ping; that's only on Connect.
+    let req = build_request(
+        "POST",
+        "/v1/admin/payment-provider/activate",
+        &[("authorization", &auth)],
+        Some(json!({"provider": "zaprite"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "activate zaprite should succeed when zaprite_config is present"
+    );
+    let pref = payment::read_active_provider_preference(&state.db).await;
+    assert_eq!(pref, Some(ProviderKind::Zaprite));
+
+    // Step 4: Activate BTCPay. Preference flips.
+    let req = build_request(
+        "POST",
+        "/v1/admin/payment-provider/activate",
+        &[("authorization", &auth)],
+        Some(json!({"provider": "btcpay"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let pref = payment::read_active_provider_preference(&state.db).await;
+    assert_eq!(pref, Some(ProviderKind::Btcpay));
+
+    // Step 5: Activate something that's not configured. Should 400.
+    sqlx::query("DELETE FROM zaprite_config WHERE id = 1")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let req = build_request(
+        "POST",
+        "/v1/admin/payment-provider/activate",
+        &[("authorization", &auth)],
+        Some(json!({"provider": "zaprite"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "activating an unconfigured provider must 400 with 'run Connect first'"
+    );
+
+    // Step 6: Bad provider name → 400.
+    let req = build_request(
+        "POST",
+        "/v1/admin/payment-provider/activate",
+        &[("authorization", &auth)],
+        Some(json!({"provider": "stripe"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Step 7: write_active_provider_preference invariant —
+    // explicit setting survives a re-read (durability across the
+    // simulated restart that the boot-time loader cares about).
+    payment::write_active_provider_preference(&state.db, ProviderKind::Btcpay)
+        .await
+        .unwrap();
+    let pref = payment::read_active_provider_preference(&state.db).await;
+    assert_eq!(pref, Some(ProviderKind::Btcpay));
+    payment::write_active_provider_preference(&state.db, ProviderKind::Zaprite)
+        .await
+        .unwrap();
+    let pref = payment::read_active_provider_preference(&state.db).await;
+    assert_eq!(pref, Some(ProviderKind::Zaprite));
+}
+
 /// Zaprite webhook authentication contract.
 ///
 /// Zaprite doesn't sign webhooks (verified May 2026 — no HMAC,

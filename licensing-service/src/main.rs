@@ -58,20 +58,53 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // --- payment provider (may be None until operator connects) ---
-    // Resolution order: BTCPay first (the original / default), then
-    // Zaprite. If both are configured, BTCPay wins — operators with
-    // both connected get sat-priced flows through BTCPay; the
-    // future v0.3 multi-provider routing will let policies pick
-    // which provider handles which payment rail.
-    let provider: Option<Arc<dyn payment::PaymentProvider>> = {
-        if let Some(p) = load_btcpay_provider(&pool, &cfg).await {
-            let arc: Arc<dyn payment::PaymentProvider> = Arc::new(p);
-            Some(arc)
-        } else if let Some(p) = load_zaprite_provider(&pool).await {
-            let arc: Arc<dyn payment::PaymentProvider> = Arc::new(p);
-            Some(arc)
-        } else {
-            None
+    // Resolution order:
+    //   1. operator's explicit preference from the
+    //      active_payment_provider setting (set by the most recent
+    //      Connect or Activate action),
+    //   2. fallback for legacy installs without the setting:
+    //      BTCPay first, Zaprite second. Once we ship v0.3 with the
+    //      multi-provider routing layer this fallback retires.
+    let preferred = payment::read_active_provider_preference(&pool).await;
+    let provider: Option<Arc<dyn payment::PaymentProvider>> = match preferred {
+        Some(payment::ProviderKind::Zaprite) => {
+            // Operator explicitly chose Zaprite. Try Zaprite; if it
+            // can't be loaded (e.g., the row was deleted out from
+            // under the setting), fall through to BTCPay rather
+            // than booting unconfigured.
+            load_zaprite_provider(&pool)
+                .await
+                .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>)
+                .or_else(|| {
+                    tracing::warn!(
+                        "active_payment_provider=zaprite but zaprite_config is missing; \
+                         falling back to BTCPay"
+                    );
+                    None
+                })
+                .or(load_btcpay_provider(&pool, &cfg)
+                    .await
+                    .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>))
+        }
+        Some(payment::ProviderKind::Btcpay) | None => {
+            // Either operator chose BTCPay, or no preference recorded
+            // yet (legacy install). Either way, BTCPay wins if
+            // configured; Zaprite as fallback.
+            load_btcpay_provider(&pool, &cfg)
+                .await
+                .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>)
+                .or_else(|| {
+                    if preferred == Some(payment::ProviderKind::Btcpay) {
+                        tracing::warn!(
+                            "active_payment_provider=btcpay but btcpay_config is missing; \
+                             falling back to Zaprite"
+                        );
+                    }
+                    None
+                })
+                .or(load_zaprite_provider(&pool)
+                    .await
+                    .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>))
         }
     };
     match &provider {
