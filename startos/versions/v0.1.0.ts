@@ -9,8 +9,20 @@
 import { VersionInfo } from '@start9labs/start-sdk'
 
 export const v0_1_0 = VersionInfo.of({
-  version: '0.1.0:45',
+  version: '0.1.0:46',
   releaseNotes: [
+    `Alpha-iteration revision 46 of v0.1.0 — Idempotent BTCPay Connect, plus the Go SDK is now part of the published toolchain.`,
+    ``,
+    `**Idempotent Connect.** "Connect BTCPay" no longer blindly initiates a fresh authorize flow when Keysat is already connected. It now checks \`/v1/admin/btcpay/status\` first; if a connection exists, it returns a clear "already connected" message that points the operator at "Disconnect BTCPay" → "Connect BTCPay" for the re-authorize case. Closes the v0.2-plan T1 item that was the last outstanding BTCPay UX gap. Without this, re-clicking Connect spawned a new webhook subscription on BTCPay's side every time, leaving orphan webhooks BTCPay would keep trying to deliver to.`,
+    ``,
+    `**Go SDK lands.** A pure-Go (stdlib only, no third-party deps) implementation of the LIC1 wire format goes live alongside this release at \`github.com/keysat-xyz/keysat-client-go\`. Verified byte-for-byte against the same \`tests/crosscheck/vector.json\` the Rust, TypeScript, Python SDKs and the daemon itself test against — all four crosscheck fixtures (v1 legacy, v2 trial with entitlements, v2 perpetual unbound, plus end-to-end PEM-load → ParseAndVerify roundtrip) pass. Five independent implementations of the wire format now agree.`,
+    ``,
+    `Go SDK API: \`keysat.ParseKey\`, \`keysat.Verify\`, \`keysat.ParseAndVerify\`, \`keysat.HashFingerprint\`, \`keysat.LoadPublicKeyPEM\` for offline use; \`keysat.Client.Validate\` and \`keysat.Client.PublicKey\` for online checks. Idiomatic Go method receivers on \`LicensePayload\` (\`IsTrial\`, \`IsFingerprintBound\`, \`IsExpiredAt\`, \`HasEntitlement\`).`,
+    ``,
+    `**Daemon binary unchanged.** This is a wrapper-only revision — no Rust source files moved between :45 and :46. Test count remains 31 on the daemon side; the Go SDK's 4 crosscheck tests run independently against \`go test ./...\`.`,
+    ``,
+    `**Upgrade path.** v0.1.0:45 → v0.1.0:46 is a straight drop-in. No new migrations, no schema changes.`,
+    ``,
     `Alpha-iteration revision 45 of v0.1.0 — Buyer self-service license recovery and a database-health admin endpoint. Two operator-facing additions that close real friction points the v0.2 plan called out.`,
     ``,
     `**Buyer self-service recovery.** Until now, the recovery flow for "I lost my license key" was "DM the operator with your invoice id and we re-send" — operator-time scaling badly. v0.1.0:45 ships \`POST /v1/recover\` and a server-rendered \`GET /recover\` HTML form. A buyer enters their invoice id (handed to them at checkout) and the email they paid with; if both match a settled invoice in the daemon's database, the same signed license key is re-derived and returned. No support ticket, no operator involvement.`,

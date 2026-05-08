@@ -33,6 +33,51 @@ export const configureBtcpay = sdk.Action.withoutInput(
   async () => {
     const storeData = await store.read().once()
     if (!storeData) throw new Error('Store not initialized — restart the service.')
+
+    // Idempotency guard: if Keysat is already connected to a BTCPay
+    // store, re-running Connect would spawn a NEW webhook subscription
+    // on BTCPay's side (because the authorize flow always registers
+    // one). That leaves orphan webhooks pointing at this Keysat that
+    // BTCPay will keep trying to deliver to, and confuses
+    // reconciliation. Steer the operator to Disconnect first instead.
+    try {
+      const statusResp = await adminCall(
+        LICENSING_URL,
+        storeData.admin_api_key,
+        '/v1/admin/btcpay/status',
+        { method: 'GET' },
+      )
+      if (statusResp.ok) {
+        const status = (await statusResp.json()) as {
+          connected?: boolean
+          store_id?: string | null
+          base_url?: string | null
+        }
+        if (status.connected) {
+          return {
+            version: '1',
+            title: 'BTCPay already connected',
+            message:
+              `Keysat is already connected to ` +
+              `${status.base_url ?? '(unknown URL)'} ` +
+              `(store ${status.store_id ?? '(unknown id)'}).\n\n` +
+              `To re-authorize (e.g., switch stores or rotate the API key), ` +
+              `run "Disconnect BTCPay" first, then re-run "Connect BTCPay". ` +
+              `Existing license keys, products, and policies are unaffected ` +
+              `by a Disconnect/Connect cycle.\n\n` +
+              `If you're seeing connection problems, "Check BTCPay connection" ` +
+              `also reports wallet / payment-method status that the connect ` +
+              `flow doesn't surface.`,
+            result: null,
+          }
+        }
+      }
+      // Status check failure is non-fatal — fall through to the
+      // authorize flow. Same UX as before.
+    } catch (_) {
+      // Same — non-fatal.
+    }
+
     const resp = await adminCall(
       LICENSING_URL,
       storeData.admin_api_key,
