@@ -254,3 +254,113 @@ impl Mode {
         }
     }
 }
+
+/// Live-refresh the daemon's self-tier from the local `licenses` row.
+///
+/// Why this exists: `check_at_boot` parses the on-disk LIC1 key and
+/// extracts entitlements from the SIGNED PAYLOAD. Those entitlements
+/// are immutable for the life of that key — the operator can't ever
+/// downgrade themselves by editing the DB row, because the daemon
+/// trusts the signature, not the DB.
+///
+/// In practice that means tier upgrades / downgrades / revocations
+/// applied via admin (or eventually, via an upstream master) don't
+/// propagate to a running daemon — even though the daemon is online
+/// and the data is right there in its own DB. This function is the
+/// fix: re-read the licenses row by license_id and use the LIVE
+/// entitlements + revocation status. The on-disk signed key is kept
+/// as proof-of-authenticity (signature still verifies) but the live
+/// DB row is the source of tier truth.
+///
+/// Behavior:
+/// - If the on-disk tier is `Unlicensed`, do nothing — there's no
+///   license_id to look up.
+/// - If the licenses row is missing in the DB (legitimate for a
+///   daemon that's never been online to sync, e.g.), keep the
+///   signed-payload tier as last-known.
+/// - If the row is revoked, demote to `Unlicensed { reason: "revoked" }`.
+/// - Otherwise, replace the entitlements vec with whatever the DB
+///   row currently says.
+///
+/// Run from main.rs at boot (after `check_at_boot`) and on a 1-hour
+/// interval thereafter. Also surfaced as an admin "Refresh
+/// self-license tier" action for operators who want to trigger
+/// immediately after a change instead of waiting for the next tick.
+///
+/// Non-master operators in v0.3+ can extend this to call
+/// `https://licensing.keysat.xyz/v1/validate` instead of (or in
+/// addition to) the local DB. For v0.2.x, local-DB-only — which is
+/// the right thing for the master Keysat (which is selling its own
+/// licenses) and a no-op-but-safe for downstream operators (their
+/// own DB row hasn't been mutated, so live read returns the same
+/// thing as the boot-time signed-payload extraction).
+pub async fn refresh_self_tier_from_db(
+    pool: &sqlx::SqlitePool,
+    current: &Tier,
+) -> Tier {
+    let license_id = match current {
+        Tier::Licensed { license_id, .. } => license_id.to_string(),
+        Tier::Unlicensed { .. } => return current.clone(),
+    };
+
+    let row = match crate::db::repo::get_license_by_id(pool, &license_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            // Unknown to local DB — keep signed-payload tier. Could
+            // happen if the daemon was issued elsewhere and only has
+            // the on-disk key, no row in `licenses`.
+            return current.clone();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "self-tier refresh: DB lookup failed; keeping last-known");
+            return current.clone();
+        }
+    };
+
+    if row.revoked_at.is_some() {
+        let reason = format!(
+            "license revoked at {}",
+            row.revoked_at.as_deref().unwrap_or("?")
+        );
+        tracing::warn!(
+            license_id = %license_id,
+            "self-tier refresh: license is revoked; demoting to Unlicensed"
+        );
+        return Tier::Unlicensed { reason };
+    }
+    if row.suspended_at.is_some() {
+        return Tier::Unlicensed {
+            reason: format!(
+                "license suspended at {}",
+                row.suspended_at.as_deref().unwrap_or("?")
+            ),
+        };
+    }
+
+    // Pull the LIVE entitlements from the DB. These can differ from
+    // the signed payload's entitlements (which were baked at signing
+    // time) if an admin has done a Change Tier on this license.
+    let entitlements = row.entitlements.clone();
+
+    // Same product / license / expiry — only the entitlement set is
+    // live. Cheap rebuild.
+    let product_id = uuid::Uuid::parse_str(&row.product_id).ok();
+    let license_id_uuid = uuid::Uuid::parse_str(&row.id).ok();
+    let expires_at_unix = row
+        .expires_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+
+    if let (Some(product_id), Some(license_id)) = (product_id, license_id_uuid) {
+        Tier::Licensed {
+            license_id,
+            product_id,
+            expires_at: expires_at_unix,
+            entitlements,
+        }
+    } else {
+        current.clone()
+    }
+}

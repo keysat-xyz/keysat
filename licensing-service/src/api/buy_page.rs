@@ -639,9 +639,17 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     }}
     if (unitEl) unitEl.textContent = unitText;
     if (priceLabel) priceLabel.textContent = 'Price · ' + t.name;
-    // Free tier: render "FREE", swap CTA to "Redeem license" so the
-    // buyer never sees "Pay with Bitcoin" for a 0-amount product.
-    if (fmt.isFree) {{
+    // Trial recurring tier: first cycle is free, daemon issues the
+    // license inline. Surface that as a "Start N-day free trial"
+    // CTA instead of "Pay with Bitcoin" so the buyer knows they
+    // aren't charged today. Renewal copy stays in the price unit
+    // suffix ("$25 / mo") so they can still see what happens after.
+    if (t.is_recurring && (t.trial_days || 0) > 0) {{
+      priceCurrent.textContent = 'FREE';
+      if (unitEl) unitEl.textContent = ' for ' + t.trial_days + ' days';
+      setTrialButton(t.trial_days);
+    }} else if (fmt.isFree) {{
+      // Free non-trial tier: "Redeem license".
       priceCurrent.textContent = 'FREE';
       if (unitEl) unitEl.textContent = '';
       setRedeemButton();
@@ -697,6 +705,10 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   }}
   function setRedeemButton() {{
     btnLabel.textContent = 'Redeem license';
+    btnIcon.style.display = 'none';
+  }}
+  function setTrialButton(days) {{
+    btnLabel.textContent = 'Start ' + (days || 7) + '-day free trial';
     btnIcon.style.display = 'none';
   }}
 

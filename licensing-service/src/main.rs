@@ -155,6 +155,39 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Self-tier live refresher — re-reads the daemon's own license
+    // row from the local DB every hour and updates `state.self_tier`
+    // with the live entitlements. Without this, an admin Change Tier
+    // on the daemon's own license never propagates to the running
+    // process (boot-time check trusts the signed payload's
+    // entitlements, which are immutable). See
+    // `license_self::refresh_self_tier_from_db` for the rationale.
+    {
+        // Initial refresh — fires once now so an operator who changed
+        // their tier between two daemon runs sees the new tier before
+        // the first interval tick.
+        let current = state.self_tier.read().await.clone();
+        let next = license_self::refresh_self_tier_from_db(&state.db, &current).await;
+        *state.self_tier.write().await = next;
+
+        // Periodic refresh thereafter.
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Burn the immediate-fire tick so the first real tick is
+            // 1h from spawn (we already ran the initial refresh above).
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let current = state2.self_tier.read().await.clone();
+                let next =
+                    license_self::refresh_self_tier_from_db(&state2.db, &current).await;
+                *state2.self_tier.write().await = next;
+            }
+        });
+    }
+
     let app = api::router(state).layer(TraceLayer::new_for_http());
 
     // --- serve ---

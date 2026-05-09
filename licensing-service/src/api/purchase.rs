@@ -148,6 +148,93 @@ pub async fn start(
         conversion.sats
     };
 
+    // ----- Free-trial shortcut (recurring + trial_days > 0) -----
+    // Before any pricing / discount logic: if the chosen policy is a
+    // recurring subscription with trial_days > 0, the buyer pays
+    // nothing today. We synthesize a settled free invoice, issue the
+    // license inline with expires_at = now + trial_days, and create
+    // the subscription row with next_renewal_at = trial_end so the
+    // renewal worker fires the FIRST paid invoice when the trial
+    // ends. Discount codes are deliberately ignored for trials —
+    // they're already free; layering a discount on a free first
+    // cycle is a no-op that just complicates the audit trail.
+    if let Some(p) = chosen_policy.as_ref() {
+        if p.is_recurring && p.trial_days > 0 {
+            let free_invoice = repo::create_free_invoice(
+                &state.db,
+                &product.id,
+                req.buyer_email.as_deref(),
+                req.buyer_note.as_deref(),
+                Some(p.id.as_str()),
+            )
+            .await?;
+
+            // issue_license_for_invoice handles the recurring branch
+            // (creates the subscription with next_renewal_at = trial_end)
+            // because we now special-case is_recurring + trial_days
+            // inside that function.
+            let license_id = crate::api::webhook::issue_license_for_invoice(
+                &state, &free_invoice,
+            )
+            .await?;
+
+            // Re-derive the signed key.
+            let lic = repo::get_license_by_invoice(&state.db, &free_invoice.id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(anyhow::anyhow!("license vanished after issue"))
+                })?;
+            let flags = if lic.is_trial { FLAG_TRIAL } else { 0 };
+            let expires_at_unix = lic
+                .expires_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.timestamp())
+                .unwrap_or(0);
+            let payload = LicensePayload {
+                version: KEY_VERSION_V2,
+                flags,
+                product_id: uuid::Uuid::parse_str(&lic.product_id)
+                    .map_err(|e| AppError::Internal(anyhow::anyhow!("bad product_id: {e}")))?,
+                license_id: uuid::Uuid::parse_str(&lic.id)
+                    .map_err(|e| AppError::Internal(anyhow::anyhow!("bad license_id: {e}")))?,
+                issued_at: chrono::DateTime::parse_from_rfc3339(&lic.issued_at)
+                    .map(|t| t.timestamp())
+                    .unwrap_or(0),
+                expires_at: expires_at_unix,
+                fingerprint_hash: [0u8; 32],
+                entitlements: lic.entitlements.clone(),
+            };
+            let sig = sign_payload(&state.keypair.signing, &payload);
+            let license_key = encode_key(&payload, &sig);
+
+            let poll_url = format!(
+                "{}/v1/purchase/{}",
+                state.config.public_base_url, free_invoice.id
+            );
+
+            tracing::info!(
+                product_slug = %req.product,
+                policy_slug = %p.slug,
+                trial_days = p.trial_days,
+                license_id = %license_id,
+                "trial license issued — no charge for first cycle"
+            );
+
+            return Ok(Json(StartPurchaseResp {
+                invoice_id: free_invoice.id.clone(),
+                btcpay_invoice_id: free_invoice.btcpay_invoice_id.clone(),
+                checkout_url: String::new(),
+                amount_sats: 0,
+                base_price_sats: base_price,
+                discount_applied_sats: 0,
+                poll_url,
+                license_key: Some(license_key),
+                license_id: Some(license_id),
+            }));
+        }
+    }
+
     // Resolve and validate the discount code if one was supplied. The
     // ordering here matters: we must atomically reserve a counter slot
     // BEFORE we create the BTCPay invoice, so that a code-cap race can't

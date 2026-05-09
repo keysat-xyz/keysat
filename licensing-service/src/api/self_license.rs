@@ -170,3 +170,15 @@ pub async fn activate(
     )
         .into_response())
 }
+
+/// `POST /v1/admin/self-license/refresh` — re-read the daemon's
+/// own license row from the local DB and update `state.self_tier`
+/// with the live entitlements. Useful right after an admin
+/// Change Tier when the operator doesn't want to wait for the
+/// hourly background refresher.
+pub async fn refresh(State(state): State<AppState>) -> Json<TierStatus> {
+    let current = state.self_tier.read().await.clone();
+    let next = license_self::refresh_self_tier_from_db(&state.db, &current).await;
+    *state.self_tier.write().await = next.clone();
+    Json(tier_to_status(&next))
+}

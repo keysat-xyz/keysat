@@ -717,19 +717,46 @@ async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
     .context("UPDATE subscriptions on renewal create")?;
 
     // 9. Webhook event: operator's app gets notified that a
-    //    renewal invoice exists and the buyer needs to pay.
+    //    renewal invoice exists and the buyer needs to pay. The
+    //    operator's webhook receiver renders an email / push /
+    //    in-app notification with `checkout_url` and sends it to
+    //    `buyer_email` (Keysat does not email buyers itself —
+    //    operator-driven communication, same as license issuance).
+    //
+    //    `is_first_paid_cycle` lets operators distinguish "your
+    //    free trial is ending, here's the first real charge" from
+    //    "your monthly renewal is due" — different copy is usually
+    //    appropriate.
+    let buyer_email: Option<String> = sqlx::query_scalar(
+        "SELECT buyer_email FROM licenses WHERE id = ?",
+    )
+    .bind(&sub.license_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let is_first_paid_cycle = next_cycle_num == 2;
+
     crate::webhooks::dispatch(
         state,
         "subscription.renewal_pending",
         &json!({
             "subscription_id": sub.id,
             "license_id": sub.license_id,
+            "product_id": sub.product_id,
+            "policy_id": sub.policy_id,
             "invoice_id": internal_invoice_id,
             "checkout_url": handle.checkout_url,
             "amount_sats": amount_sats,
             "listed_currency": sub.listed_currency,
             "listed_value": sub.listed_value,
             "cycle_number": next_cycle_num,
+            "cycle_start_at": cycle_start.to_rfc3339(),
+            "cycle_end_at": cycle_end.to_rfc3339(),
+            "due_at": cycle_end.to_rfc3339(),
+            "buyer_email": buyer_email,
+            "is_first_paid_cycle": is_first_paid_cycle,
         }),
     )
     .await;

@@ -191,7 +191,18 @@ pub async fn issue_license_for_invoice(
 
     let now = Utc::now();
     let issued_at = now.to_rfc3339();
-    let duration_seconds = policy.as_ref().map(|p| p.duration_seconds).unwrap_or(0);
+    // For recurring policies with a free-trial period, the FIRST license's
+    // expires_at is the trial end, not the policy's duration_seconds. The
+    // renewal worker will extend on settle when the buyer pays the first
+    // real cycle. trial_days = 0 (no trial) falls through to the regular
+    // duration_seconds path.
+    let is_recurring = policy.as_ref().map(|p| p.is_recurring).unwrap_or(false);
+    let trial_days = policy.as_ref().map(|p| p.trial_days).unwrap_or(0);
+    let duration_seconds = if is_recurring && trial_days > 0 {
+        trial_days * 86_400
+    } else {
+        policy.as_ref().map(|p| p.duration_seconds).unwrap_or(0)
+    };
     let expires_at = if duration_seconds == 0 {
         None
     } else {
@@ -199,7 +210,10 @@ pub async fn issue_license_for_invoice(
     };
     let grace_seconds = policy.as_ref().map(|p| p.grace_seconds).unwrap_or(0);
     let max_machines = policy.as_ref().map(|p| p.max_machines).unwrap_or(1);
-    let is_trial = policy.as_ref().map(|p| p.is_trial).unwrap_or(false);
+    // For trial recurring licenses, set the TRIAL flag on the signed
+    // payload too, so SDKs can render "trial — N days remaining".
+    let is_trial =
+        policy.as_ref().map(|p| p.is_trial).unwrap_or(false) || (is_recurring && trial_days > 0);
     let entitlements = policy
         .as_ref()
         .map(|p| p.entitlements.clone())
@@ -233,6 +247,91 @@ pub async fn issue_license_for_invoice(
         policy_id = ?policy.as_ref().map(|p| &p.id),
         "license issued for settled invoice"
     );
+
+    // Recurring policy: create the subscription row that the renewal
+    // worker uses as its source of truth. Uses the invoice's listed
+    // currency + value if available (multi-currency support); falls
+    // back to SAT + invoice.amount_sats for legacy / SAT-only setups.
+    //
+    // First-cycle scheduling:
+    //   - trial_days > 0: next_renewal_at = now + trial_days. When the
+    //     trial ends, the renewal worker creates the FIRST paid invoice.
+    //   - trial_days = 0: next_renewal_at = now + period_days. Buyer
+    //     already paid for the current cycle; renewal worker creates
+    //     the second cycle's invoice when this one ends.
+    if let Some(p) = policy.as_ref() {
+        if p.is_recurring {
+            let period_days = p.renewal_period_days.max(1);
+            let first_cycle_days = if p.trial_days > 0 { p.trial_days } else { period_days };
+            let listed_currency = invoice
+                .listed_currency
+                .clone()
+                .unwrap_or_else(|| "SAT".to_string());
+            let listed_value = invoice
+                .listed_value
+                .unwrap_or(invoice.amount_sats);
+            let existing = crate::subscriptions::get_subscription_by_license_id(
+                &state.db,
+                &license_id,
+            )
+            .await
+            .ok()
+            .flatten();
+            if existing.is_none() {
+                match crate::subscriptions::create_subscription(
+                    &state.db,
+                    &license_id,
+                    &p.id,
+                    &invoice.product_id,
+                    period_days,
+                    &listed_currency,
+                    listed_value,
+                    &invoice.id,
+                )
+                .await
+                {
+                    Ok(sub) => {
+                        // Override next_renewal_at to the first-cycle window.
+                        // create_subscription defaults to now + period_days;
+                        // for trials we want now + trial_days. Cheap UPDATE.
+                        if first_cycle_days != period_days {
+                            let trial_end = (Utc::now()
+                                + chrono::Duration::days(first_cycle_days))
+                                .to_rfc3339();
+                            let _ = sqlx::query(
+                                "UPDATE subscriptions SET next_renewal_at = ?, \
+                                 updated_at = ? WHERE id = ?",
+                            )
+                            .bind(&trial_end)
+                            .bind(&trial_end)
+                            .bind(&sub.id)
+                            .execute(&state.db)
+                            .await;
+                        }
+                        tracing::info!(
+                            license_id = %license_id,
+                            policy_id = %p.id,
+                            period_days,
+                            first_cycle_days,
+                            listed_currency,
+                            listed_value,
+                            trial = (first_cycle_days != period_days),
+                            "subscription created for recurring purchase"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            license_id = %license_id,
+                            policy_id = %p.id,
+                            error = %e,
+                            "failed to create subscription row on recurring purchase; \
+                             license issued but renewal worker will not pick this up"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Fire-and-forget Lightning tip to the policy's configured recipient,
     // if any. This never blocks issuance: errors are logged + audited inside

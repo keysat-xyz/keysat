@@ -81,6 +81,15 @@ pub struct Invoice {
     /// product's default policy. Migration 0007 adds the column.
     #[serde(default)]
     pub policy_id: Option<String>,
+    /// Listed currency the invoice was priced in. NULL on pre-multi-currency
+    /// invoices (migration 0010+); fall back to "SAT" in that case.
+    #[serde(default)]
+    pub listed_currency: Option<String>,
+    /// Price in the listed currency's smallest unit (sats for SAT, cents
+    /// for USD/EUR). NULL on pre-multi-currency invoices; fall back to
+    /// `amount_sats` (which is correct for SAT-priced products).
+    #[serde(default)]
+    pub listed_value: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

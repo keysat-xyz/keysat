@@ -472,6 +472,11 @@ fn row_to_invoice(row: sqlx::sqlite::SqliteRow) -> Invoice {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         policy_id: row.try_get("policy_id").ok().flatten(),
+        listed_currency: row
+            .try_get::<Option<String>, _>("listed_currency")
+            .ok()
+            .flatten(),
+        listed_value: row.try_get::<Option<i64>, _>("listed_value").ok().flatten(),
     }
 }
 

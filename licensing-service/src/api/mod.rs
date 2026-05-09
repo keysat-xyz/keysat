@@ -443,6 +443,14 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/self-license",
             get(self_license::status).post(self_license::activate),
         )
+        // Manual self-tier refresh — re-reads live entitlements
+        // from the local DB. Operators hit this after a Change
+        // Tier to update the running daemon immediately instead of
+        // waiting for the hourly background refresher.
+        .route(
+            "/v1/admin/self-license/refresh",
+            post(self_license::refresh),
+        )
         // Issuer-key import — admin-only, master-bootstrap path. No
         // StartOS Action surface; documented in MASTER_KEYPAIR_PROCEDURE.md.
         .route("/v1/admin/import-issuer-key", post(issuer_key::import))
