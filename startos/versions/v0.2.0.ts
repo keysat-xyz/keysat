@@ -58,6 +58,24 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:5 — **In-place tier upgrades are functional end-to-end.** Buyers can self-serve "upgrade to Pro" inside the operator\'s app — they pay only the prorated difference for the time remaining in their current cycle, the existing license keeps its key, and the daemon flips entitlements on next online validation. Operators can force-change any license to any policy from the admin UI, with optional comp-mode (skip the invoice).',
+  '',
+  '**Buyer flow.** New `POST /v1/upgrade-quote` returns the prorated charge in the listed currency: "Standard $25/mo → Pro $75/mo with 15 days remaining = $25.00 today, $75.00 next cycle." `POST /v1/upgrade` creates a payment provider invoice for the prorated charge and returns a checkout URL. When the invoice settles, the webhook handler flips the license\'s policy_id + entitlements + max_machines + expires_at and any tied subscription\'s policy_id + listed_value + period_days. The signed license key stays the same — the buyer\'s app just sees the new entitlements on its next call to `/v1/validate`.',
+  '',
+  '**Admin flow.** New `POST /v1/admin/licenses/:id/change-tier` for force-changes. Two modes: `skip_payment: true` applies on the spot for comp upgrades / support fix-ups (no invoice, audit-logged); `skip_payment: false` creates an invoice and returns the checkout URL the operator forwards to the buyer through whatever channel (email, chat, etc.). Bypasses ladder rules — admin can move sideways, downgrade perpetuals, or change to/from policies that aren\'t in any ladder.',
+  '',
+  '**Tier ladder.** Policies gain a `tier_rank` integer column (NULL = excluded from buyer-facing upgrade flows). Operators set this in the policy editor: free=0, standard=1, pro=2, etc. The buyer endpoint enforces that target.tier_rank > current.tier_rank for upgrades; sideways and reverse moves return 400 "admin-only".',
+  '',
+  '**Recurring downgrades, scheduled at cycle boundary.** When the admin records a downgrade tier_change with `effective_at = next_renewal_at`, the renewal worker checks for pending changes before pricing the next cycle and applies them in place. This means "downgrade me at end of cycle" actually fires correctly — the next invoice bills at the new (lower) tier, not the old one. Audit-logged with `actor=system`, `applied_via=renewal_worker`.',
+  '',
+  '**New tables + columns.** Migration 0013 adds `policies.tier_rank` and a new `tier_changes` audit table (one row per upgrade or downgrade ever applied; FK\'d to license + invoice + both policies). Schema is purely additive — existing licenses and policies are untouched and inherit `tier_rank = NULL` (not in any ladder).',
+  '',
+  '**Webhook event.** `license.tier_changed` fires whenever a license\'s policy changes, with `actor=buyer|admin|system` so downstream tooling can distinguish self-service vs operator vs scheduled changes.',
+  '',
+  '**Test count: 77** (was 57 at v0.2.0:4). +5 covering renewal-worker pending-tier-change hook + admin endpoint variants; +6 buyer-endpoint variants + webhook tier-change branch; +8 unit tests for the quote/apply math; +1 migration regression test for the 0013 schema.',
+  '',
+  '**Upgrade path.** v0.2.0:4 → v0.2.0:5 is a drop-in. Migration 0013 is additive only. No behavior change for existing operators unless they explicitly set tier_rank on their policies and start using the new endpoints.',
+  '',
   '0.2.0:4 — **Recurring subscriptions are functional end-to-end.** Migration 0011 stopped being dormant: operators on Pro/Patron tier can now mark a policy as recurring, the renewal worker creates fresh invoices on cadence, the buy page renders subscription pricing, and both operator and buyer can cancel cleanly.',
   '',
   '**Admin UI.** Policy editor (create + edit) gains a "Recurring subscription (Pro)" section: tick the box, pick a cadence (Monthly / Quarterly / Semi-annual / Annual / Custom days), set grace-period days (default 7) and optional free-trial days. The Policies list table shows a gold "every Nd" badge alongside the existing trial badge so recurring tiers are recognisable at a glance. Free / Creator-tier operators see a 402 with an upgrade link if they try to flip a policy to recurring — same gating pattern as the existing product/policy/code caps.',
@@ -106,7 +124,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:4',
+  version: '0.2.0:5',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
