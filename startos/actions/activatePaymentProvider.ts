@@ -26,7 +26,6 @@ const switchInput = InputSpec.of({
       'Which connected payment provider should handle new purchases. ' +
       'The other provider stays configured (no need to re-run Connect ' +
       'if you switch back). Existing license keys are unaffected.',
-    required: true,
     default: 'btcpay',
     values: {
       btcpay: 'BTCPay',
