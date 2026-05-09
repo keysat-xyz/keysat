@@ -603,10 +603,16 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   function selectTier(slug) {{
     if (!TIERS[slug]) return;
     selectedPolicy = slug;
-    // Visual update.
+    // Visual update — toggle .selected on cards AND swap the button
+    // label so the chosen tier reads "Selected" while the others
+    // stay "Select". Buyer gets a clear "yes, this is what's tied
+    // to the price card below" signal.
     document.querySelectorAll('.tier').forEach(function(c) {{
-      if (c.getAttribute('data-policy-slug') === slug) c.classList.add('selected');
+      const isMatch = c.getAttribute('data-policy-slug') === slug;
+      if (isMatch) c.classList.add('selected');
       else c.classList.remove('selected');
+      const btn = c.querySelector('.tier-select-btn');
+      if (btn) btn.textContent = isMatch ? 'Selected' : 'Select';
     }});
     // Reset any active discount apply state — a different tier may not
     // honor the same code (server validates again on the next Apply).

@@ -20,7 +20,7 @@
 
 import { sdk } from '../sdk'
 import { activateLicense, showLicenseStatus } from './activateLicense'
-import { activateBtcpay, activateZaprite } from './activatePaymentProvider'
+import { switchPaymentProvider } from './activatePaymentProvider'
 import { btcpayStatus, configureBtcpay, disconnectBtcpay } from './configureBtcpay'
 import {
   configureZaprite,
@@ -39,14 +39,16 @@ export const actions = sdk.Actions.of()
   // BTCPay setup (Bitcoin-only payments via your own BTCPay Server)
   .addAction(configureBtcpay)
   .addAction(btcpayStatus)
-  .addAction(activateBtcpay)
   .addAction(disconnectBtcpay)
   // Zaprite setup (Bitcoin + fiat-card payments via Zaprite's broker)
   .addAction(configureZaprite)
   .addAction(zapriteStatus)
   .addAction(showZapriteWebhookSetup)
-  .addAction(activateZaprite)
   .addAction(disconnectZaprite)
+  // Single unified switch action — flips active provider via a
+  // dropdown so operators don't see two confusing "Activate X"
+  // actions side-by-side, each appearing to override the other.
+  .addAction(switchPaymentProvider)
   // Keysat self-license (Keysat-licenses-Keysat)
   .addAction(activateLicense)
   .addAction(showLicenseStatus)

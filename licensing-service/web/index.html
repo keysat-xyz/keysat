@@ -701,10 +701,13 @@ The request will be refused if there are licenses or invoices tied to it — use
   function plainCard(body) {
     return el('div', { class: 'card' }, el('div', { class: 'card-body' }, body))
   }
-  function tableCard(title, sub, headers, rows, emptyMsg) {
+  function tableCard(title, sub, headers, rows, emptyMsg, headerAction) {
     const head = el('div', { class: 'card-head' }, [
       el('h3', null, title),
       sub ? el('span', { class: 'sub' }, sub) : null,
+      // Optional right-aligned action element (e.g. "Preview buy page"
+      // button on the policies card).
+      headerAction ? el('span', { style: 'margin-left:auto' }, headerAction) : null,
     ])
     if (rows.length === 0) {
       return el('div', { class: 'card' }, [head, el('div', { class: 'empty' }, emptyMsg || 'Nothing yet.')])
@@ -1371,16 +1374,24 @@ The request will be refused if there are licenses or invoices tied to it — use
 
     function renderPolicyPicker() {
       policiesHolder.innerHTML = ''
-      const opts = allPolicies
-        .filter((p) => p.slug !== currentPolicySlug)
-        .map((p) => ({
+      // Show ALL policies but mark the current one as disabled with
+      // "(current)" suffix — operator sees what they're starting from
+      // but can't pick a no-op. Other policies become the actual
+      // change targets.
+      const opts = allPolicies.map((p) => {
+        const isCurrent = p.slug === currentPolicySlug
+        return {
           value: p.slug,
+          disabled: isCurrent,
           label: p.name + ' (' + p.slug + ')' +
             (p.tier_rank != null ? ' · rank ' + p.tier_rank : '') +
             (p.is_recurring ? ' · recurring' : '') +
-            (p.is_trial ? ' · trial' : ''),
-        }))
-      if (opts.length === 0) {
+            (p.is_trial ? ' · trial' : '') +
+            (isCurrent ? ' · current' : ''),
+        }
+      })
+      const selectableOpts = opts.filter((o) => !o.disabled)
+      if (selectableOpts.length === 0) {
         policiesHolder.appendChild(plainCard([
           el('p', { class: 'muted', style: 'margin:0' },
             'No other policies on this product. Create one first under Policies → ' + (license.product_slug || '<product>') + '.'),
@@ -1394,8 +1405,8 @@ The request will be refused if there are licenses or invoices tied to it — use
         selectedTargetSlug = selEl.value
         runQuote()
       })
-      // Auto-pick first option + run quote.
-      selectedTargetSlug = opts[0].value
+      // Auto-pick first SELECTABLE option (skip the disabled current-tier).
+      selectedTargetSlug = selectableOpts[0].value
       selEl.value = selectedTargetSlug
       runQuote()
     }
@@ -2059,6 +2070,32 @@ The request will be refused if there are licenses or invoices tied to it — use
     const counts = await api('/v1/admin/licenses/counts').catch(() => ({ by_policy: {} }))
     const byPolicy = (counts && counts.by_policy) || {}
 
+    // Render a raw seconds value as a human-readable duration. Common
+    // cadences map to nice labels (1 day, 1 week, 1 month, 1 year);
+    // arbitrary values fall back to the closest unit. 0 = perpetual.
+    function fmtDuration(secs) {
+      if (!secs || secs === 0) return 'perpetual'
+      const days = Math.round(secs / 86400)
+      if (secs < 60) return secs + 's'
+      if (secs < 3600) return Math.round(secs / 60) + 'min'
+      if (secs < 86400) return Math.round(secs / 3600) + 'h'
+      if (days === 1) return '1 day'
+      if (days === 7) return '1 week'
+      if (days === 30) return '1 month'
+      if (days === 90) return '3 months'
+      if (days === 180) return '6 months'
+      if (days === 365) return '1 year'
+      if (days === 730) return '2 years'
+      if (days % 365 === 0) return (days / 365) + ' years'
+      if (days % 30 === 0) return (days / 30) + ' months'
+      if (days % 7 === 0) return (days / 7) + ' weeks'
+      return days + ' days'
+    }
+    function fmtGrace(secs) {
+      if (!secs || secs === 0) return 'none'
+      return fmtDuration(secs)
+    }
+
     for (const p of products) {
       try {
         const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(p.slug))
@@ -2066,8 +2103,8 @@ The request will be refused if there are licenses or invoices tied to it — use
         const rows = policies.map((pol) => el('tr', null, [
           el('td', null, el('code', null, pol.slug)),
           el('td', { style: 'font-weight:600; color:var(--navy-950)' }, pol.name),
-          el('td', null, pol.duration_seconds === 0 ? 'perpetual' : pol.duration_seconds + 's'),
-          el('td', null, pol.grace_seconds + 's'),
+          el('td', null, fmtDuration(pol.duration_seconds)),
+          el('td', null, fmtGrace(pol.grace_seconds)),
           el('td', null, pol.max_machines === 0 ? '∞' : String(pol.max_machines)),
           el('td', null,
             // Stack trial + recurring badges in one cell. Both can be set
@@ -2120,12 +2157,29 @@ The request will be refused if there are licenses or invoices tied to it — use
             }, 'Delete'),
           ])),
         ]))
+        // Per-product header action: open the buy page in a new tab
+        // so the operator can preview how their policies render to a
+        // buyer without leaving the admin SPA. Only shown when the
+        // product has at least one public policy (otherwise the buy
+        // page would render empty).
+        const hasPublicPolicy = policies.some((pol) => pol.public && pol.active)
+        const previewBtn = hasPublicPolicy
+          ? el('a', {
+              class: 'btn sm secondary',
+              href: '/buy/' + encodeURIComponent(p.slug),
+              target: '_blank',
+              rel: 'noopener',
+              title: 'Open this product\'s public buy page in a new tab',
+              style: 'text-decoration:none',
+            }, 'Preview buy page')
+          : null
         target.appendChild(tableCard(
           p.name + ' — ' + p.slug,
           policies.length + ' polic' + (policies.length === 1 ? 'y' : 'ies'),
           ['Slug', 'Name', 'Duration', 'Grace', 'Seats', 'Trial', 'Entitlements', 'Licenses', 'Status', 'On buy page', ''],
           rows,
-          '(no policies yet)'
+          '(no policies yet)',
+          previewBtn,
         ))
       } catch (e) {
         target.appendChild(plainCard([err('Failed to load policies for ' + p.slug + ': ' + e.message)]))
@@ -2555,7 +2609,16 @@ The request will be refused if there are licenses or invoices tied to it — use
             ? el('code', { title: l.product_id }, l.product_slug)
             : shortId(l.product_id)),
           el('td', null, l.policy_slug
-            ? el('span', { title: l.policy_name || l.policy_id || '' }, l.policy_slug)
+            // Display name primary, slug secondary (smaller + muted)
+            // so operators see what the buyer sees ("Pro") without
+            // losing the technical identifier they need for SDK calls.
+            ? el('div', null, [
+                el('div', { style: 'font-weight:500; color:var(--navy-950)' },
+                  l.policy_name || l.policy_slug),
+                l.policy_name
+                  ? el('div', { class: 'muted', style: 'font-size:11.5px; font-family:var(--font-mono)' }, l.policy_slug)
+                  : null,
+              ])
             : el('span', { class: 'muted' }, '–')),
           el('td', null, entitlementsCell(l.entitlements)),
           el('td', null, statusBadge(l.status)),
@@ -3047,7 +3110,15 @@ The request will be refused if there are licenses or invoices tied to it — use
     const id = 'f_' + name + '_' + Math.random().toString(36).slice(2, 6)
     const lbl = el('label', { class: 'lbl', for: id }, [label, opts.required ? el('span', { class: 'req' }, '*') : null])
     const sel = el('select', { class: 'select', id, name })
-    for (const o of options) sel.appendChild(el('option', { value: o.value }, o.label))
+    for (const o of options) {
+      // Per-option `disabled: true` lets callers grey-out specific
+      // entries — e.g. the Change Tier dropdown marks the current
+      // tier as disabled with "(current)" so operators see what
+      // they're starting from but can't pick a no-op.
+      const attrs = { value: o.value }
+      if (o.disabled) attrs.disabled = 'disabled'
+      sel.appendChild(el('option', attrs, o.label))
+    }
     if (opts.value) sel.value = opts.value
     return el('div', { class: 'field' }, [lbl, sel])
   }
