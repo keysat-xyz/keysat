@@ -63,6 +63,7 @@ pub mod policies;
 pub mod products;
 pub mod purchase;
 pub mod subscriptions;
+pub mod upgrade;
 pub mod buy_page;
 pub mod issuer_key;
 pub mod redeem;
@@ -348,6 +349,12 @@ pub fn router(state: AppState) -> Router {
             "/v1/subscriptions/cancel",
             post(subscriptions::buyer_cancel),
         )
+        // Tier upgrades (buyer self-service). Quote is read-only;
+        // start kicks off a payment for the prorated charge.
+        // Both auth via signed license_key in the body, same model
+        // as /v1/recover and /v1/subscriptions/cancel.
+        .route("/v1/upgrade-quote", post(upgrade::quote))
+        .route("/v1/upgrade", post(upgrade::start))
         // Machines (admin views).
         .route("/v1/admin/machines", get(machines::admin_list))
         .route(

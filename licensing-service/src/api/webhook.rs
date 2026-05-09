@@ -124,6 +124,19 @@ pub async fn handle(
         return Ok(StatusCode::OK);
     };
 
+    // Tier-change branch: this settled invoice may be a tier upgrade
+    // (recorded by POST /v1/upgrade or the future admin-change-tier
+    // endpoint) rather than a fresh purchase or a subscription
+    // renewal. If so, apply the change against the existing license
+    // — DON'T issue a new license — and short-circuit the rest.
+    if let Some(tier_change) =
+        crate::upgrades::get_tier_change_by_invoice(&state.db, &invoice.id)
+            .await
+            .map_err(AppError::Internal)?
+    {
+        return apply_tier_change_on_settle(&state, &invoice, &tier_change).await;
+    }
+
     // If this settled invoice is associated with a subscription
     // (renewal cycle), flip the sub back to `active` and fire
     // `subscription.renewed`. Idempotent — re-running on a sub
@@ -313,6 +326,107 @@ pub async fn issue_license_for_invoice(
     }
 
     Ok(license_id)
+}
+
+/// Webhook-side handler for a settled tier-change invoice. Idempotent:
+/// if the license is already on the target tier (re-delivered webhook),
+/// the UPDATE is a no-op and we still ack 200.
+async fn apply_tier_change_on_settle(
+    state: &AppState,
+    invoice: &crate::models::Invoice,
+    tier_change: &crate::upgrades::TierChangeRow,
+) -> AppResult<StatusCode> {
+    // Resolve the bits we need: the license, the target policy, and
+    // the product (so apply_tier_change can compute the new
+    // listed_value for the subscription if any).
+    let license = repo::get_license_by_id(&state.db, &tier_change.license_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "tier_change references missing license '{}'",
+                tier_change.license_id
+            ))
+        })?;
+    let target_policy = repo::get_policy_by_id(&state.db, &tier_change.to_policy_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "tier_change references missing target policy '{}'",
+                tier_change.to_policy_id
+            ))
+        })?;
+    let product = repo::get_product_by_id(&state.db, &target_policy.product_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "target policy references missing product '{}'",
+                target_policy.product_id
+            ))
+        })?;
+
+    // Idempotency: if the license's policy_id already matches the
+    // target, the change has already been applied by an earlier
+    // webhook delivery. Ack and move on.
+    if license.policy_id.as_deref() == Some(target_policy.id.as_str()) {
+        tracing::info!(
+            license_id = %license.id,
+            tier_change_id = %tier_change.id,
+            "tier-change already applied (idempotent re-delivery); acking"
+        );
+        return Ok(StatusCode::OK);
+    }
+
+    // Apply the change.
+    crate::upgrades::apply_tier_change(&state.db, &license.id, &target_policy, &product)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let _ = repo::insert_audit(
+        &state.db,
+        "system",
+        None,
+        "subscription.upgrade.applied",
+        Some("tier_change"),
+        Some(&tier_change.id),
+        None,
+        None,
+        &serde_json::json!({
+            "license_id": license.id,
+            "from_policy_id": tier_change.from_policy_id,
+            "to_policy_id": tier_change.to_policy_id,
+            "invoice_id": invoice.id,
+            "actor": tier_change.actor,
+            "direction": tier_change.direction,
+        }),
+    )
+    .await;
+
+    crate::webhooks::dispatch(
+        state,
+        "license.tier_changed",
+        &serde_json::json!({
+            "license_id": license.id,
+            "product_id": product.id,
+            "from_policy_id": tier_change.from_policy_id,
+            "to_policy_id": tier_change.to_policy_id,
+            "to_policy_slug": target_policy.slug,
+            "direction": tier_change.direction,
+            "actor": tier_change.actor,
+            "invoice_id": invoice.id,
+            "tier_change_id": tier_change.id,
+        }),
+    )
+    .await;
+
+    tracing::info!(
+        license_id = %license.id,
+        from_policy_id = %tier_change.from_policy_id,
+        to_policy_id = %tier_change.to_policy_id,
+        invoice_id = %invoice.id,
+        "tier change applied on settle"
+    );
+
+    Ok(StatusCode::OK)
 }
 
 // Small helper to attach a log line to an error conversion.

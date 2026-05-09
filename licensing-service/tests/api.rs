@@ -2326,6 +2326,401 @@ async fn buyer_cancel_subscription_via_license_key() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Tier upgrade endpoints (Phase 3 of TIER_UPGRADES_DESIGN)
+// ---------------------------------------------------------------------
+
+/// Seed a USD perpetual product with Standard (rank 1) + Pro (rank 2)
+/// policies, plus a license under Standard with a real signed key the
+/// buyer would hold. Returns (license_id, key_string, standard_id, pro_id).
+async fn seed_perpetual_ladder_with_key(state: &AppState) -> (String, String, String, String) {
+    let product = repo::create_product(
+        &state.db,
+        "upgrade-test",
+        "Upgrade Test",
+        "",
+        2500,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+    sqlx::query("UPDATE products SET price_currency='USD', price_value=2500 WHERE id = ?")
+        .bind(&product.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let standard = repo::create_policy(
+        &state.db,
+        &product.id,
+        "Standard",
+        "standard",
+        0,
+        0,
+        1,
+        false,
+        Some(2500),
+        &["core".into()],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig::off(),
+        Some(1),
+    )
+    .await
+    .expect("create standard");
+    let pro = repo::create_policy(
+        &state.db,
+        &product.id,
+        "Pro",
+        "pro",
+        0,
+        0,
+        3,
+        false,
+        Some(7500),
+        &["core".into(), "ai_summaries".into()],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig::off(),
+        Some(2),
+    )
+    .await
+    .expect("create pro");
+
+    let license_id = Uuid::new_v4();
+    let issued_at = Utc::now();
+    repo::create_license(
+        &state.db,
+        &license_id.to_string(),
+        &product.id,
+        None,
+        &issued_at.to_rfc3339(),
+        &json!({}),
+        Some(&standard.id),
+        None,
+        0,
+        1,
+        &["core".to_string()],
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("create_license");
+
+    let product_uuid = Uuid::parse_str(&product.id).expect("product id is uuid");
+    let payload = LicensePayload {
+        version: 2,
+        flags: 0,
+        product_id: product_uuid,
+        license_id,
+        issued_at: issued_at.timestamp(),
+        expires_at: 0,
+        fingerprint_hash: [0; 32],
+        entitlements: vec!["core".into()],
+    };
+    let signature = crypto::sign_payload(&state.keypair.signing, &payload);
+    let key_string = crypto::encode_key(&payload, &signature);
+
+    (license_id.to_string(), key_string, standard.id, pro.id)
+}
+
+/// `/v1/upgrade-quote` returns the prorated charge for a valid
+/// license + target combo.
+#[tokio::test]
+async fn upgrade_quote_returns_perpetual_difference() {
+    let (state, _tmp) = make_test_state().await;
+    let (_lic, key, _std, _pro) = seed_perpetual_ladder_with_key(&state).await;
+
+    let req = build_request(
+        "POST",
+        "/v1/upgrade-quote",
+        &[],
+        Some(json!({
+            "license_key": key,
+            "target_policy_slug": "pro"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["direction"], "upgrade");
+    assert_eq!(body["listed_currency"], "USD");
+    // Pro $75 - Standard $25 = $50 = 5000 cents.
+    assert_eq!(body["proration_charge_value"], 5000);
+    assert_eq!(body["effective_at"], "immediate");
+}
+
+#[tokio::test]
+async fn upgrade_quote_rejects_garbage_key() {
+    let (state, _tmp) = make_test_state().await;
+    let req = build_request(
+        "POST",
+        "/v1/upgrade-quote",
+        &[],
+        Some(json!({
+            "license_key": "not-a-real-key",
+            "target_policy_slug": "pro"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn upgrade_quote_rejects_unknown_target_policy() {
+    let (state, _tmp) = make_test_state().await;
+    let (_lic, key, _, _) = seed_perpetual_ladder_with_key(&state).await;
+    let req = build_request(
+        "POST",
+        "/v1/upgrade-quote",
+        &[],
+        Some(json!({
+            "license_key": key,
+            "target_policy_slug": "no-such-policy"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `/v1/upgrade` against a paid path: creates a real provider invoice
+/// (mock), persists a tier_changes row, returns checkout URL.
+#[tokio::test]
+async fn upgrade_start_creates_invoice_and_tier_change_row() {
+    let (state, _tmp) = make_test_state_with_mock_provider().await;
+    // Pin a USD/BTC rate so the rates fetcher doesn't try the network
+    // when we hit the upgrade path.
+    sqlx::query(
+        "INSERT INTO settings(key, value, updated_at) \
+         VALUES('manual_rate_pin_USD', '50000', ?)",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (license_id, key, _std, pro_id) = seed_perpetual_ladder_with_key(&state).await;
+
+    let req = build_request(
+        "POST",
+        "/v1/upgrade",
+        &[],
+        Some(json!({
+            "license_key": key,
+            "target_policy_slug": "pro"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "upgrade start should succeed; got {}",
+        resp.status()
+    );
+    let body = body_json(resp).await;
+    let invoice_id = body["invoice_id"].as_str().expect("invoice_id").to_string();
+    assert!(body["checkout_url"].as_str().unwrap().contains("mock-checkout"));
+    assert_eq!(body["proration_charge_value"], 5000); // 5000 cents
+    assert!(body["amount_sats"].as_i64().unwrap() > 0,
+        "fiat conversion should produce a non-zero sat charge");
+
+    // tier_changes row exists with this invoice_id.
+    let tc = keysat::upgrades::get_tier_change_by_invoice(&state.db, &invoice_id)
+        .await
+        .unwrap()
+        .expect("tier_change row");
+    assert_eq!(tc.license_id, license_id);
+    assert_eq!(tc.to_policy_id, pro_id);
+    assert_eq!(tc.actor, "buyer");
+    assert_eq!(tc.direction, "upgrade");
+    assert_eq!(tc.invoice_id.as_deref(), Some(invoice_id.as_str()));
+
+    // License is NOT yet on Pro — that happens on settle (next test).
+    let license_now = repo::get_license_by_id(&state.db, &license_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        license_now.policy_id.as_deref(),
+        Some(pro_id.as_str()),
+        "license should NOT change tier until invoice settles"
+    );
+}
+
+/// Webhook settle on a tier-change invoice applies the change instead
+/// of issuing a new license.
+#[tokio::test]
+async fn webhook_settle_on_tier_change_applies_instead_of_issuing() {
+    let (state, _tmp) = make_test_state_with_mock_provider().await;
+    sqlx::query(
+        "INSERT INTO settings(key, value, updated_at) \
+         VALUES('manual_rate_pin_USD', '50000', ?)",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (license_id, key, _std, pro_id) = seed_perpetual_ladder_with_key(&state).await;
+
+    // Start the upgrade, capture the provider invoice id.
+    let req = build_request(
+        "POST",
+        "/v1/upgrade",
+        &[],
+        Some(json!({
+            "license_key": key,
+            "target_policy_slug": "pro"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let invoice_id = body["invoice_id"].as_str().unwrap().to_string();
+    let provider_invoice_id = body["provider_invoice_id"].as_str().unwrap().to_string();
+
+    // Fire a "settled" webhook on that invoice. The MockPaymentProvider's
+    // validate_webhook reads the body as JSON.
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[],
+        Some(json!({
+            "kind": "settled",
+            "provider_invoice_id": provider_invoice_id
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "webhook should ack 200 on tier-change settle"
+    );
+
+    // The license is now on Pro. No NEW license was issued (count
+    // for this product still 1).
+    let license_after = repo::get_license_by_id(&state.db, &license_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        license_after.policy_id.as_deref(),
+        Some(pro_id.as_str()),
+        "settle webhook should have applied the tier change"
+    );
+    assert!(
+        license_after.entitlements.contains(&"ai_summaries".to_string()),
+        "Pro entitlements should now be on the license: {:?}",
+        license_after.entitlements
+    );
+
+    let n_licenses: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM licenses WHERE product_id = ?",
+    )
+    .bind(&license_after.product_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        n_licenses, 1,
+        "tier-change must NOT issue a new license; count must stay at 1"
+    );
+
+    // Re-delivering the same webhook is idempotent.
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[],
+        Some(json!({
+            "kind": "settled",
+            "provider_invoice_id": provider_invoice_id
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "re-delivery must ack 200");
+    let n_licenses_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM licenses WHERE product_id = ?",
+    )
+    .bind(&license_after.product_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(n_licenses_after, 1, "re-delivery must not duplicate licenses");
+
+    // Suppress unused-var warning: invoice_id is used implicitly via
+    // the tier_changes lookup but kept named for readability.
+    let _ = invoice_id;
+}
+
+/// Buyer-initiated downgrade is rejected from this endpoint in v0.2.x
+/// (Phase 4 admin endpoint covers downgrades).
+#[tokio::test]
+async fn upgrade_endpoint_rejects_buyer_downgrade() {
+    let (state, _tmp) = make_test_state().await;
+    let (lic, _key, std_id, pro_id) = seed_perpetual_ladder_with_key(&state).await;
+
+    // Move the license to Pro by direct SQL so we can attempt a
+    // downgrade back to Standard. (Real flow: admin would have done
+    // this; we don't have an admin-change-tier endpoint until Phase 4.)
+    sqlx::query("UPDATE licenses SET policy_id = ? WHERE id = ?")
+        .bind(&pro_id)
+        .bind(&lic)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // Re-sign a key for the now-Pro license. We can reuse the same
+    // license_id + product_id — the entitlements in the payload are
+    // not checked by the upgrade endpoint (it goes by license_id).
+    let license = repo::get_license_by_id(&state.db, &lic).await.unwrap().unwrap();
+    let product_uuid = Uuid::parse_str(&license.product_id).unwrap();
+    let payload = LicensePayload {
+        version: 2,
+        flags: 0,
+        product_id: product_uuid,
+        license_id: Uuid::parse_str(&lic).unwrap(),
+        issued_at: Utc::now().timestamp(),
+        expires_at: 0,
+        fingerprint_hash: [0; 32],
+        entitlements: vec![],
+    };
+    let signature = crypto::sign_payload(&state.keypair.signing, &payload);
+    let key_string = crypto::encode_key(&payload, &signature);
+
+    let req = build_request(
+        "POST",
+        "/v1/upgrade",
+        &[],
+        Some(json!({
+            "license_key": key_string,
+            "target_policy_slug": "standard"
+        })),
+    );
+    let resp = send(&state, req).await;
+    // The quote function intercepts perpetual downgrades with a 400
+    // "admin-only" before the endpoint's blanket-Forbidden check
+    // fires. Either status is "this is not a buyer path"; the
+    // message-level distinction matters more than the code.
+    let status = resp.status();
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN,
+        "buyer-initiated downgrade must be 400 or 403; got {status}"
+    );
+    if status == StatusCode::BAD_REQUEST {
+        let body = body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("admin-only"),
+            "400 should explain that downgrades are admin-only: {body:?}"
+        );
+    }
+
+    let _ = std_id;
+}
+
 #[tokio::test]
 async fn buyer_cancel_rejects_garbage_key() {
     let (state, _tmp) = make_test_state().await;
