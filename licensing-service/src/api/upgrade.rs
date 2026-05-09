@@ -25,12 +25,12 @@
 //! - **Admin force-change.** `POST /v1/admin/licenses/:id/change-tier`
 //!   ships in Phase 4.
 
-use crate::api::admin::request_context;
+use crate::api::admin::{request_context, require_admin};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::payment::{CreateInvoiceParams, Money};
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::HeaderMap,
     Json,
 };
@@ -56,7 +56,7 @@ pub async fn quote(
     Json(body): Json<QuoteReq>,
 ) -> AppResult<Json<Value>> {
     let (license, target_policy) = resolve_request(&state, &body.license_key, &body.target_policy_slug).await?;
-    let q = crate::upgrades::compute_upgrade_quote(&state, &license, &target_policy).await?;
+    let q = crate::upgrades::compute_upgrade_quote(&state, &license, &target_policy, crate::upgrades::QuoteMode::Buyer).await?;
     Ok(Json(quote_to_json(&q)))
 }
 
@@ -93,7 +93,7 @@ pub async fn start(
     let (license, target_policy) =
         resolve_request(&state, &body.license_key, &body.target_policy_slug).await?;
 
-    let quote = crate::upgrades::compute_upgrade_quote(&state, &license, &target_policy).await?;
+    let quote = crate::upgrades::compute_upgrade_quote(&state, &license, &target_policy, crate::upgrades::QuoteMode::Buyer).await?;
 
     // Phase 3 scope: buyer endpoint handles UPGRADE only. Downgrades
     // (even 0-charge ones) need the cycle-boundary apply path which
@@ -263,6 +263,270 @@ async fn resolve_request(
     .ok_or_else(|| AppError::NotFound(format!("target policy '{target_policy_slug}'")))?;
 
     Ok((license, target_policy))
+}
+
+// ---------------------------------------------------------------------
+// Admin force-change endpoint (Phase 4)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AdminChangeReq {
+    /// Slug of the policy to move the license to. Resolved within
+    /// the license's product.
+    pub to_policy_slug: String,
+    /// When true, apply the change immediately with no invoice
+    /// (operator absorbs the cost — comp upgrade, support fix-up,
+    /// fixing a misissue). When false, behave like the buyer
+    /// endpoint: create an invoice for the prorated charge,
+    /// webhook applies on settle.
+    #[serde(default)]
+    pub skip_payment: bool,
+    /// Free-form audit note. Surfaced in audit_log + tier_changes.reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /v1/admin/licenses/:id/change-tier` — admin force-change.
+/// Bypasses ladder rules (sideways changes, NULL-rank policies,
+/// perpetual downgrades all allowed). Two modes:
+///
+/// - `skip_payment: true`: applies immediately. tier_changes row
+///   is written with invoice_id = NULL and proration_charge_value = 0.
+///   The license's policy_id + entitlements + expiry + max_machines
+///   flip on the spot; any tied subscription's policy_id +
+///   listed_value + period_days update so the next renewal bills the
+///   new tier.
+///
+/// - `skip_payment: false`: same flow as the buyer's `/v1/upgrade` —
+///   creates a provider invoice for the prorated charge, persists
+///   the local invoice + a tier_changes row tied to it. The webhook
+///   handler applies on settle. The operator gets the checkout URL
+///   back and forwards it to the buyer through whatever channel
+///   they prefer (email, chat, etc.).
+pub async fn admin_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(license_id): Path<String>,
+    Json(body): Json<AdminChangeReq>,
+) -> AppResult<Json<Value>> {
+    let actor_hash = require_admin(&state, &headers)?;
+    let (ip, ua) = request_context(&headers);
+    let reason = body.reason.as_deref().filter(|s| !s.trim().is_empty());
+
+    let license = crate::db::repo::get_license_by_id(&state.db, &license_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("license '{license_id}'")))?;
+
+    let target_policy = crate::db::repo::get_policy_by_slug(
+        &state.db,
+        &license.product_id,
+        &body.to_policy_slug,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("target policy '{}'", body.to_policy_slug)))?;
+
+    let quote = crate::upgrades::compute_upgrade_quote(
+        &state,
+        &license,
+        &target_policy,
+        crate::upgrades::QuoteMode::Admin,
+    )
+    .await?;
+
+    if body.skip_payment {
+        // Comp path: apply immediately, no invoice.
+        let product = crate::db::repo::get_product_by_id(&state.db, &target_policy.product_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("product '{}'", target_policy.product_id)))?;
+        crate::upgrades::apply_tier_change(&state.db, &license.id, &target_policy, &product)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let tier_change_id = crate::upgrades::record_tier_change(
+            &state.db,
+            &license.id,
+            &quote.from_policy_id,
+            &quote.to_policy_id,
+            quote.direction,
+            &quote.listed_currency,
+            0, // comp: no charge
+            None,
+            &chrono::Utc::now().to_rfc3339(),
+            "admin",
+            reason,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+        let _ = crate::db::repo::insert_audit(
+            &state.db,
+            "admin_api_key",
+            Some(&actor_hash),
+            "license.change_tier.comp",
+            Some("tier_change"),
+            Some(&tier_change_id),
+            ip.as_deref(),
+            ua.as_deref(),
+            &json!({
+                "license_id": license.id,
+                "from_policy_id": quote.from_policy_id,
+                "to_policy_id": quote.to_policy_id,
+                "to_policy_slug": target_policy.slug,
+                "direction": quote.direction.as_str(),
+                "reason": reason,
+                "skip_payment": true,
+            }),
+        )
+        .await;
+
+        crate::webhooks::dispatch(
+            &state,
+            "license.tier_changed",
+            &json!({
+                "license_id": license.id,
+                "product_id": product.id,
+                "from_policy_id": quote.from_policy_id,
+                "to_policy_id": quote.to_policy_id,
+                "to_policy_slug": target_policy.slug,
+                "direction": quote.direction.as_str(),
+                "actor": "admin",
+                "tier_change_id": tier_change_id,
+            }),
+        )
+        .await;
+
+        return Ok(Json(json!({
+            "ok": true,
+            "applied": true,
+            "license_id": license.id,
+            "tier_change_id": tier_change_id,
+            "skip_payment": true,
+            "from_policy_slug": quote.from_policy_slug,
+            "to_policy_slug": quote.to_policy_slug,
+        })));
+    }
+
+    // Paid path: create invoice + tier_changes row tied to it.
+    // If the quote came back with proration <= 0 (sideways or
+    // operator forcing a same-price change), there's nothing to bill.
+    // Surface a clear error so the operator switches to skip_payment=true.
+    if quote.proration_charge_value <= 0 {
+        return Err(AppError::BadRequest(
+            "this change has no charge owed; use skip_payment=true to apply as a comp"
+                .into(),
+        ));
+    }
+
+    let conversion = crate::rates::convert_to_sats(
+        &state,
+        &quote.listed_currency,
+        quote.proration_charge_value,
+    )
+    .await
+    .map_err(|e| AppError::Upstream(format!("rate conversion failed: {e:#}")))?;
+    let amount_sats = conversion.sats.max(1);
+
+    let provider = state.payment_provider().await?;
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let default_redirect = format!(
+        "{}/thank-you?invoice_id={}",
+        state.config.public_base_url, internal_invoice_id
+    );
+
+    let created = provider
+        .create_invoice(CreateInvoiceParams {
+            amount: Money::sats(amount_sats),
+            redirect_url: &default_redirect,
+            metadata: json!({
+                "productId": target_policy.product_id,
+                "intent": "admin_tier_change",
+                "licenseId": license.id,
+                "fromPolicyId": quote.from_policy_id,
+                "toPolicyId": quote.to_policy_id,
+            }),
+            external_order_id: &internal_invoice_id,
+            buyer_email: license.buyer_email.as_deref(),
+        })
+        .await
+        .map_err(|e| AppError::Upstream(format!("provider create_invoice: {e:#}")))?;
+
+    let invoice = crate::db::repo::create_invoice_with_currency(
+        &state.db,
+        &internal_invoice_id,
+        &created.provider_invoice_id,
+        &target_policy.product_id,
+        amount_sats,
+        &created.checkout_url,
+        license.buyer_email.as_deref(),
+        Some("admin tier-change"),
+        Some(&quote.to_policy_id),
+        Some(&quote.listed_currency),
+        Some(quote.proration_charge_value),
+        conversion.rate_centibps,
+        Some(conversion.source.as_str()),
+    )
+    .await?;
+
+    let effective_at = match &quote.effective_at {
+        crate::upgrades::EffectiveAt::Immediate => chrono::Utc::now().to_rfc3339(),
+        crate::upgrades::EffectiveAt::At(s) => s.clone(),
+    };
+    let tier_change_id = crate::upgrades::record_tier_change(
+        &state.db,
+        &license.id,
+        &quote.from_policy_id,
+        &quote.to_policy_id,
+        quote.direction,
+        &quote.listed_currency,
+        quote.proration_charge_value,
+        Some(&invoice.id),
+        &effective_at,
+        "admin",
+        reason,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    let _ = crate::db::repo::insert_audit(
+        &state.db,
+        "admin_api_key",
+        Some(&actor_hash),
+        "license.change_tier.invoice_created",
+        Some("tier_change"),
+        Some(&tier_change_id),
+        ip.as_deref(),
+        ua.as_deref(),
+        &json!({
+            "license_id": license.id,
+            "from_policy_id": quote.from_policy_id,
+            "to_policy_id": quote.to_policy_id,
+            "to_policy_slug": target_policy.slug,
+            "direction": quote.direction.as_str(),
+            "invoice_id": invoice.id,
+            "amount_sats": amount_sats,
+            "listed_currency": quote.listed_currency,
+            "proration_charge_value": quote.proration_charge_value,
+            "reason": reason,
+            "skip_payment": false,
+        }),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "applied": false,
+        "license_id": license.id,
+        "tier_change_id": tier_change_id,
+        "invoice_id": invoice.id,
+        "provider_invoice_id": created.provider_invoice_id,
+        "checkout_url": created.checkout_url,
+        "amount_sats": amount_sats,
+        "proration_charge_value": quote.proration_charge_value,
+        "listed_currency": quote.listed_currency,
+        "from_policy_slug": quote.from_policy_slug,
+        "to_policy_slug": quote.to_policy_slug,
+        "skip_payment": false,
+    })))
 }
 
 fn quote_to_json(q: &crate::upgrades::UpgradeQuote) -> Value {

@@ -2656,6 +2656,144 @@ async fn webhook_settle_on_tier_change_applies_instead_of_issuing() {
     let _ = invoice_id;
 }
 
+/// Admin can force-change a license to any policy under the same
+/// product. skip_payment=true applies immediately with no invoice.
+#[tokio::test]
+async fn admin_change_tier_skip_payment_applies_immediately() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let (license_id, _key, _std, pro_id) = seed_perpetual_ladder_with_key(&state).await;
+
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{license_id}/change-tier"),
+        &[("authorization", &auth)],
+        Some(json!({
+            "to_policy_slug": "pro",
+            "skip_payment": true,
+            "reason": "comp upgrade per support ticket #1234"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["applied"], true);
+    assert_eq!(body["skip_payment"], true);
+    let tc_id = body["tier_change_id"].as_str().unwrap().to_string();
+
+    let license_after = repo::get_license_by_id(&state.db, &license_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        license_after.policy_id.as_deref(),
+        Some(pro_id.as_str()),
+        "skip_payment=true should apply on the spot"
+    );
+
+    let tc = keysat::upgrades::get_tier_change(&state.db, &tc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tc.actor, "admin");
+    assert_eq!(tc.proration_charge_value, 0);
+    assert_eq!(tc.invoice_id, None, "comp upgrade has no invoice");
+    assert_eq!(
+        tc.reason.as_deref(),
+        Some("comp upgrade per support ticket #1234")
+    );
+}
+
+/// Admin can force a perpetual downgrade. Buyer endpoint rejects
+/// these (refund decision per design doc).
+#[tokio::test]
+async fn admin_change_tier_allows_perpetual_downgrade() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let (license_id, _key, std_id, pro_id) = seed_perpetual_ladder_with_key(&state).await;
+    sqlx::query("UPDATE licenses SET policy_id = ? WHERE id = ?")
+        .bind(&pro_id)
+        .bind(&license_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{license_id}/change-tier"),
+        &[("authorization", &auth)],
+        Some(json!({
+            "to_policy_slug": "standard",
+            "skip_payment": true,
+            "reason": "honoring partial refund"
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let license_after = repo::get_license_by_id(&state.db, &license_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(license_after.policy_id.as_deref(), Some(std_id.as_str()));
+}
+
+#[tokio::test]
+async fn admin_change_tier_rejects_zero_charge_paid_path() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let (license_id, _key, std_id, _pro) = seed_perpetual_ladder_with_key(&state).await;
+    let std_policy = repo::get_policy_by_id(&state.db, &std_id).await.unwrap().unwrap();
+    let _sideways = repo::create_policy(
+        &state.db,
+        &std_policy.product_id,
+        "Standard Plus",
+        "standard-plus",
+        0,
+        0,
+        1,
+        false,
+        Some(2500),
+        &["core".into()],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig::off(),
+        Some(1),
+    )
+    .await
+    .unwrap();
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{license_id}/change-tier"),
+        &[("authorization", &auth)],
+        Some(json!({
+            "to_policy_slug": "standard-plus",
+            "skip_payment": false
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("skip_payment"),
+        "error should hint at the skip_payment toggle: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn admin_change_tier_requires_admin_token() {
+    let (state, _tmp) = make_test_state().await;
+    let (license_id, _key, _std, _pro) = seed_perpetual_ladder_with_key(&state).await;
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{license_id}/change-tier"),
+        &[],
+        Some(json!({"to_policy_slug": "pro", "skip_payment": true})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// Buyer-initiated downgrade is rejected from this endpoint in v0.2.x
 /// (Phase 4 admin endpoint covers downgrades).
 #[tokio::test]

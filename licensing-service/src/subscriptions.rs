@@ -378,6 +378,114 @@ pub async fn create_subscription(
     })
 }
 
+/// Settle any pending tier changes whose `effective_at` has arrived
+/// for this subscription's license. Returns the (possibly-updated)
+/// subscription state plus a flag indicating whether at least one
+/// change was applied. Used by the renewal worker before pricing
+/// each cycle so the new cycle reflects any scheduled downgrade /
+/// upgrade.
+///
+/// "Pending" means: tier_changes row with `effective_at <= now` AND
+/// the license's policy_id != to_policy_id (i.e. not yet applied —
+/// the buyer-paid path applies via webhook on settle and that path
+/// updates license.policy_id, so this query naturally excludes
+/// already-applied rows). In practice the rows we apply here are
+/// the comp / scheduled-downgrade rows that have invoice_id IS NULL
+/// (since paid tier-changes are applied at webhook-settle time).
+async fn apply_pending_tier_changes(
+    state: &AppState,
+    sub: &Subscription,
+) -> Result<(Subscription, bool)> {
+    let now_str = Utc::now().to_rfc3339();
+    // Find pending rows ordered oldest-first. We apply each in
+    // order so the audit trail makes sense if there's a chain.
+    let rows = sqlx::query(
+        "SELECT tc.id AS id, tc.to_policy_id AS to_policy_id \
+         FROM tier_changes tc \
+         JOIN licenses l ON l.id = tc.license_id \
+         WHERE tc.license_id = ? \
+           AND tc.effective_at <= ? \
+           AND tc.invoice_id IS NULL \
+           AND (l.policy_id IS NULL OR l.policy_id != tc.to_policy_id) \
+         ORDER BY tc.effective_at ASC, tc.created_at ASC",
+    )
+    .bind(&sub.license_id)
+    .bind(&now_str)
+    .fetch_all(&state.db)
+    .await
+    .context("find pending tier_changes")?;
+
+    if rows.is_empty() {
+        return Ok((sub.clone(), false));
+    }
+
+    let mut applied_any = false;
+    for row in rows {
+        let to_policy_id: String = row.get("to_policy_id");
+        let target_policy = match crate::db::repo::get_policy_by_id(&state.db, &to_policy_id).await? {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    sub_id = %sub.id,
+                    to_policy_id = %to_policy_id,
+                    "pending tier_change references missing policy; skipping"
+                );
+                continue;
+            }
+        };
+        let product = match crate::db::repo::get_product_by_id(&state.db, &target_policy.product_id).await? {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    sub_id = %sub.id,
+                    product_id = %target_policy.product_id,
+                    "pending tier_change references missing product; skipping"
+                );
+                continue;
+            }
+        };
+        crate::upgrades::apply_tier_change(
+            &state.db,
+            &sub.license_id,
+            &target_policy,
+            &product,
+        )
+        .await
+        .context("apply pending tier_change in renewal hook")?;
+        applied_any = true;
+
+        crate::webhooks::dispatch(
+            state,
+            "license.tier_changed",
+            &json!({
+                "license_id": sub.license_id,
+                "product_id": product.id,
+                "to_policy_id": to_policy_id,
+                "to_policy_slug": target_policy.slug,
+                "actor": "system",
+                "applied_via": "renewal_worker",
+            }),
+        )
+        .await;
+    }
+
+    // Re-fetch the sub if we applied anything (apply_tier_change
+    // may have rewritten policy_id / listed_value / period_days /
+    // status — most notably status='cancelled' if the new policy
+    // is perpetual).
+    if applied_any {
+        match get_subscription_by_id(&state.db, &sub.id).await? {
+            Some(updated) => Ok((updated, true)),
+            None => {
+                // Sub was deleted somehow — extremely unlikely.
+                Ok((sub.clone(), true))
+            }
+        }
+    } else {
+        Ok((sub.clone(), false))
+    }
+}
+
 /// Per-attempt backoff schedule for renewal failures. Index = the
 /// upcoming consecutive-failures count (after this failure, what
 /// will the new value be). MAX_CONSECUTIVE_FAILURES (5) is the cap
@@ -447,6 +555,28 @@ pub async fn tick(state: &AppState) -> Result<()> {
 /// next_renewal_at to the start of the next cycle, mark sub as
 /// past_due (returns to active when settle webhook fires).
 async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
+    // 0. Settle any pending tier changes whose effective_at has
+    //    arrived. This fires recurring downgrades scheduled by the
+    //    admin endpoint (or the future buyer-downgrade flow): the
+    //    operator records "downgrade Pro → Standard at next cycle"
+    //    and we apply it here, BEFORE pricing the next invoice, so
+    //    the new cycle bills at the new tier.
+    //
+    //    We re-load `sub` after applying so the renewal proceeds
+    //    against the fresh policy_id / listed_value / period_days.
+    let (sub_for_renewal, updated_at_least_once) =
+        apply_pending_tier_changes(state, sub).await?;
+    let sub = &sub_for_renewal;
+    if updated_at_least_once {
+        tracing::info!(
+            sub_id = %sub.id,
+            new_policy_id = %sub.policy_id,
+            new_listed_value = sub.listed_value,
+            new_period_days = sub.period_days,
+            "applied pending tier change before renewal"
+        );
+    }
+
     // 1. Convert listed price to sats. SAT-currency subs are an
     //    identity (no rate fetcher hit); fiat subs re-quote each
     //    cycle (per MULTI_CURRENCY_DESIGN.md decision).

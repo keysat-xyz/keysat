@@ -355,6 +355,12 @@ pub fn router(state: AppState) -> Router {
         // as /v1/recover and /v1/subscriptions/cancel.
         .route("/v1/upgrade-quote", post(upgrade::quote))
         .route("/v1/upgrade", post(upgrade::start))
+        // Admin force-change: skip ladder rules, optional skip_payment
+        // for comp upgrades. Bears full audit trail.
+        .route(
+            "/v1/admin/licenses/:id/change-tier",
+            post(upgrade::admin_change),
+        )
         // Machines (admin views).
         .route("/v1/admin/machines", get(machines::admin_list))
         .route(

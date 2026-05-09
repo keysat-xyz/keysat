@@ -11,7 +11,7 @@ use keysat::db::repo;
 use keysat::license_self::Tier;
 use keysat::upgrades::{
     apply_tier_change, compute_upgrade_quote, list_tier_changes_for_license,
-    record_tier_change, EffectiveAt, TierDirection,
+    record_tier_change, EffectiveAt, QuoteMode, TierDirection,
 };
 use serde_json::json;
 use sqlx::sqlite::{
@@ -179,7 +179,7 @@ async fn perpetual_upgrade_quote_returns_flat_price_difference() {
         .unwrap();
     let pro = repo::get_policy_by_id(&state.db, &pro_id).await.unwrap().unwrap();
 
-    let quote = compute_upgrade_quote(&state, &license, &pro).await.unwrap();
+    let quote = compute_upgrade_quote(&state, &license, &pro, QuoteMode::Buyer).await.unwrap();
 
     assert_eq!(quote.direction, TierDirection::Upgrade);
     assert_eq!(quote.listed_currency, "USD");
@@ -229,7 +229,7 @@ async fn perpetual_downgrade_is_admin_only() {
         .unwrap()
         .unwrap();
 
-    let err = compute_upgrade_quote(&state, &license, &standard)
+    let err = compute_upgrade_quote(&state, &license, &standard, QuoteMode::Buyer)
         .await
         .expect_err("perpetual downgrade should be rejected");
     let msg = format!("{err}");
@@ -270,7 +270,7 @@ async fn quote_rejects_target_with_null_tier_rank() {
     .await
     .unwrap();
 
-    let err = compute_upgrade_quote(&state, &license, &unlisted)
+    let err = compute_upgrade_quote(&state, &license, &unlisted, QuoteMode::Buyer)
         .await
         .expect_err("unlisted target should be rejected");
     let msg = format!("{err}");
@@ -293,7 +293,7 @@ async fn quote_rejects_same_policy() {
         .await
         .unwrap()
         .unwrap();
-    let err = compute_upgrade_quote(&state, &license, &same)
+    let err = compute_upgrade_quote(&state, &license, &same, QuoteMode::Buyer)
         .await
         .expect_err("same-policy target should be rejected");
     assert!(format!("{err}").contains("same as current"));
@@ -425,7 +425,7 @@ async fn recurring_upgrade_prorates_against_time_remaining() {
         .await
         .unwrap()
         .unwrap();
-    let quote = compute_upgrade_quote(&state, &license, &pro).await.unwrap();
+    let quote = compute_upgrade_quote(&state, &license, &pro, QuoteMode::Buyer).await.unwrap();
 
     assert_eq!(quote.direction, TierDirection::Upgrade);
     assert_eq!(quote.listed_currency, "USD");
@@ -561,7 +561,7 @@ async fn recurring_downgrade_is_zero_charge_at_next_cycle() {
         .await
         .unwrap()
         .unwrap();
-    let quote = compute_upgrade_quote(&state, &license, &standard).await.unwrap();
+    let quote = compute_upgrade_quote(&state, &license, &standard, QuoteMode::Buyer).await.unwrap();
 
     assert_eq!(quote.direction, TierDirection::Downgrade);
     assert_eq!(quote.proration_charge_value, 0,
@@ -723,6 +723,210 @@ async fn apply_tier_change_mutates_license_and_subscription() {
     assert_eq!(pol_id, pro.id);
     assert_eq!(val, 75_000);
     assert_eq!(period, 365);
+}
+
+/// Pending tier_changes with effective_at <= now are applied by
+/// the renewal worker before pricing the next cycle. Mirrors the
+/// recurring-downgrade flow that ships alongside this hook: admin
+/// records "downgrade Pro → Standard at next cycle" with
+/// effective_at = next_renewal_at, and the worker fires it on tick.
+#[tokio::test]
+async fn renewal_worker_applies_pending_tier_change_before_billing() {
+    use keysat::payment::{
+        CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceStatus,
+        ProviderKind, ProviderWebhookEvent,
+    };
+    use std::any::Any;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Local mock provider — same shape as the renewal-worker tests'
+    // mock. Captures the listed_value-derived sat amount so we can
+    // assert the worker billed AT THE NEW TIER, not the old one.
+    #[derive(Default)]
+    struct CapturingProvider {
+        next_id: AtomicU64,
+        last_amount_sats: std::sync::atomic::AtomicI64,
+    }
+    #[async_trait::async_trait]
+    impl PaymentProvider for CapturingProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Btcpay
+        }
+        async fn create_invoice(
+            &self,
+            params: CreateInvoiceParams<'_>,
+        ) -> anyhow::Result<CreatedInvoiceHandle> {
+            self.last_amount_sats
+                .store(params.amount.amount, Ordering::SeqCst);
+            let n = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(CreatedInvoiceHandle {
+                provider_invoice_id: format!("cap-{n}"),
+                checkout_url: format!("http://cap/{n}"),
+            })
+        }
+        async fn get_invoice_status(&self, _id: &str) -> anyhow::Result<ProviderInvoiceStatus> {
+            Ok(ProviderInvoiceStatus::Pending)
+        }
+        fn validate_webhook(
+            &self,
+            _h: &axum::http::HeaderMap,
+            _b: &[u8],
+        ) -> anyhow::Result<ProviderWebhookEvent> {
+            anyhow::bail!("not exercised")
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    let (state, _tmp) = make_state().await;
+    let mock = Arc::new(CapturingProvider::default());
+    *state.payment.write().await = Some(mock.clone() as Arc<dyn PaymentProvider>);
+
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+
+    // SAT-priced product (no rate fetcher) for a clean assertion on
+    // the amount billed.
+    let product = repo::create_product(
+        &state.db,
+        "rw-pending",
+        "Renewal worker pending",
+        "",
+        2500, // 2500 sats base
+        &json!({}),
+    )
+    .await
+    .unwrap();
+
+    let standard = repo::create_policy(
+        &state.db,
+        &product.id,
+        "Standard",
+        "standard",
+        30 * 86_400,
+        0,
+        1,
+        false,
+        Some(2500), // 2500 sats / mo
+        &["core".into()],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig {
+            is_recurring: true,
+            renewal_period_days: 30,
+            grace_period_days: 7,
+            trial_days: 0,
+        },
+        Some(1),
+    )
+    .await
+    .unwrap();
+    let pro = repo::create_policy(
+        &state.db,
+        &product.id,
+        "Pro",
+        "pro",
+        30 * 86_400,
+        0,
+        3,
+        false,
+        Some(7500), // 7500 sats / mo
+        &["core".into(), "ai_summaries".into()],
+        &json!({}),
+        None,
+        0,
+        None,
+        repo::RecurringConfig {
+            is_recurring: true,
+            renewal_period_days: 30,
+            grace_period_days: 7,
+            trial_days: 0,
+        },
+        Some(2),
+    )
+    .await
+    .unwrap();
+
+    // License + sub on Pro, due now (next_renewal_at in the past).
+    let license_id = Uuid::new_v4().to_string();
+    repo::create_license(
+        &state.db,
+        &license_id,
+        &product.id,
+        None,
+        &now_str,
+        &json!({}),
+        Some(&pro.id),
+        Some(&(now + chrono::Duration::days(30)).to_rfc3339()),
+        0,
+        3,
+        &["core".to_string(), "ai_summaries".to_string()],
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let past_due = (now - chrono::Duration::minutes(5)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO subscriptions(id, license_id, policy_id, product_id, period_days, \
+         listed_currency, listed_value, status, started_at, next_renewal_at, \
+         consecutive_failures, created_at, updated_at) \
+         VALUES('sub-rw-pending', ?, ?, ?, 30, 'SAT', 7500, 'active', ?, ?, 0, ?, ?)",
+    )
+    .bind(&license_id)
+    .bind(&pro.id)
+    .bind(&product.id)
+    .bind(&now_str)
+    .bind(&past_due)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Operator (or the future admin endpoint) records a downgrade
+    // tier_change with effective_at = now (= already past). No
+    // invoice attached (this is the comp / scheduled-downgrade
+    // shape).
+    record_tier_change(
+        &state.db,
+        &license_id,
+        &pro.id,
+        &standard.id,
+        TierDirection::Downgrade,
+        "SAT",
+        0,
+        None,
+        &now_str,
+        "admin",
+        Some("scheduled downgrade for cycle boundary"),
+    )
+    .await
+    .unwrap();
+
+    // Tick the renewal worker.
+    keysat::subscriptions::tick(&state).await.unwrap();
+
+    // The new invoice was created at the NEW tier's price (2500
+    // sats), not the old one (7500 sats). This proves the renewal
+    // worker applied the pending tier change BEFORE pricing.
+    let billed = mock.last_amount_sats.load(Ordering::SeqCst);
+    assert_eq!(
+        billed, 2500,
+        "renewal must bill at the new (Standard) tier after the pending downgrade applied; got {billed} sats"
+    );
+
+    // License is now on Standard (apply_tier_change ran during the hook).
+    let license_after = repo::get_license_by_id(&state.db, &license_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(license_after.policy_id.as_deref(), Some(standard.id.as_str()));
 }
 
 /// record_tier_change writes the audit row, and

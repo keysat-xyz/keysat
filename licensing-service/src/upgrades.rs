@@ -95,16 +95,31 @@ pub enum EffectiveAt {
     At(String),
 }
 
-/// Compute a buyer-facing tier change quote. Enforces the
-/// ladder rules: both policies must have non-NULL `tier_rank`,
-/// target must be different from current, direction must match
-/// the rank delta. Admin force-changes use the lower-level
-/// `apply_tier_change` directly and are not subject to these
-/// checks (Phase 4 admin endpoint covers that path).
+/// Quote computation mode. The math is identical for buyer and
+/// admin paths; only the validation rules differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteMode {
+    /// Strict ladder rules: both policies must have non-NULL
+    /// tier_rank; sideways changes rejected; perpetual downgrades
+    /// rejected (admin-only refund decision); recurring → perpetual
+    /// downgrades rejected.
+    Buyer,
+    /// Permissive: skip ladder + downgrade-direction rules. Admin
+    /// can force-change to/from any policy. Same product / active
+    /// target / different policy checks still apply.
+    Admin,
+}
+
+/// Compute a tier change quote. Buyer mode enforces ladder rules
+/// per TIER_UPGRADES_DESIGN.md; admin mode bypasses them so
+/// operators can force-change any license to any policy under
+/// the same product (sideways, cross-NULL-rank, perpetual
+/// downgrade — all allowed).
 pub async fn compute_upgrade_quote(
     state: &AppState,
     license: &License,
     target_policy: &Policy,
+    mode: QuoteMode,
 ) -> AppResult<UpgradeQuote> {
     // 1. Resolve current policy from the license. License rows can
     //    legitimately have policy_id=NULL (legacy issuance / manual
@@ -139,39 +154,63 @@ pub async fn compute_upgrade_quote(
         ));
     }
 
-    // 3. Ladder rules: both policies must be in the ladder
-    //    (non-NULL tier_rank), and target must differ in rank.
-    let from_rank = current_policy.tier_rank.ok_or_else(|| {
-        AppError::BadRequest(
-            "current policy is not in any tier ladder — admin must set tier_rank first".into(),
-        )
-    })?;
-    let to_rank = target_policy.tier_rank.ok_or_else(|| {
-        AppError::BadRequest(
-            "target policy is not in any tier ladder — admin must set tier_rank first".into(),
-        )
-    })?;
-    let direction = match to_rank.cmp(&from_rank) {
-        std::cmp::Ordering::Greater => TierDirection::Upgrade,
-        std::cmp::Ordering::Less => TierDirection::Downgrade,
-        std::cmp::Ordering::Equal => {
-            return Err(AppError::BadRequest(
-                "sideways tier changes (same rank) are admin-only".into(),
-            ));
-        }
-    };
-
-    // 4. Look up the product so we can read price_currency and
+    // 3. Look up the product so we can read price_currency and
     //    fall back to product.price_value when a policy doesn't
-    //    set its own override.
+    //    set its own override. Done before direction inference
+    //    so admin mode can fall back to price-diff if rank is NULL.
     let product = repo::get_product_by_id(&state.db, &current_policy.product_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("product '{}'", current_policy.product_id)))?;
     let listed_currency = product.price_currency.clone();
 
-    // 5. Effective listed price for each policy.
+    // 4. Effective listed price for each policy.
     let from_listed = effective_listed_value(&current_policy, &product);
     let to_listed = effective_listed_value(target_policy, &product);
+
+    // 5. Direction. Buyer mode enforces ladder rules; admin mode
+    //    skips them and infers direction (used for audit + the
+    //    perpetual-downgrade gate further down).
+    let direction = match mode {
+        QuoteMode::Buyer => {
+            let from_rank = current_policy.tier_rank.ok_or_else(|| {
+                AppError::BadRequest(
+                    "current policy is not in any tier ladder — admin must set tier_rank first".into(),
+                )
+            })?;
+            let to_rank = target_policy.tier_rank.ok_or_else(|| {
+                AppError::BadRequest(
+                    "target policy is not in any tier ladder — admin must set tier_rank first".into(),
+                )
+            })?;
+            match to_rank.cmp(&from_rank) {
+                std::cmp::Ordering::Greater => TierDirection::Upgrade,
+                std::cmp::Ordering::Less => TierDirection::Downgrade,
+                std::cmp::Ordering::Equal => {
+                    return Err(AppError::BadRequest(
+                        "sideways tier changes (same rank) are admin-only".into(),
+                    ));
+                }
+            }
+        }
+        QuoteMode::Admin => {
+            // Admin: infer from rank when both ranked, fall back to
+            // price-diff otherwise. tier_changes.direction CHECK
+            // requires upgrade|downgrade; treat ties as upgrade
+            // (operator can still proceed; audit reads honestly via
+            // proration_charge_value).
+            match (current_policy.tier_rank, target_policy.tier_rank) {
+                (Some(a), Some(b)) if b > a => TierDirection::Upgrade,
+                (Some(a), Some(b)) if b < a => TierDirection::Downgrade,
+                _ => {
+                    if to_listed >= from_listed {
+                        TierDirection::Upgrade
+                    } else {
+                        TierDirection::Downgrade
+                    }
+                }
+            }
+        }
+    };
 
     // 6. Branch on perpetual vs recurring (driven by the TARGET
     //    policy — the buyer is choosing what kind of license they
@@ -191,16 +230,19 @@ pub async fn compute_upgrade_quote(
             direction,
         )
     } else {
-        // Target is perpetual. Downgrade from recurring to perpetual
-        // is technically a topology change; we treat it as admin-only.
-        if direction == TierDirection::Downgrade && sub.is_some() {
+        // Target is perpetual. Buyer mode rejects two cases that admin
+        // mode allows:
+        //   1. recurring → perpetual downgrade — the in-flight sub
+        //      complicates the apply step (have to cancel the sub).
+        //      Admin can force.
+        //   2. perpetual → perpetual downgrade — bakes in a refund
+        //      decision the operator has to make.
+        if mode == QuoteMode::Buyer && direction == TierDirection::Downgrade && sub.is_some() {
             return Err(AppError::BadRequest(
                 "downgrading from a recurring subscription to a perpetual policy is admin-only".into(),
             ));
         }
-        // Perpetual downgrades by buyer also rejected — no proration
-        // model that doesn't bake in a refund decision (operator's call).
-        if direction == TierDirection::Downgrade {
+        if mode == QuoteMode::Buyer && direction == TierDirection::Downgrade {
             return Err(AppError::BadRequest(
                 "perpetual downgrades are admin-only — they imply a refund decision".into(),
             ));
