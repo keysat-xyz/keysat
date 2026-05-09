@@ -129,6 +129,149 @@ ranges above and confirm before coding.
 
 ---
 
+## 0a. How enforcement actually works (online vs offline)
+
+This is the most-asked question every operator hits when they
+realize they want to revoke a license, downgrade a buyer, or have
+a recurring sub lapse. Read this section before designing your
+gating logic; the choice you make here is sticky.
+
+### What the buyer's app can enforce **offline**
+
+These are baked into the **signed license key** at issuance time.
+Once issued, they're cryptographically immutable for the life of
+that key. The buyer can install your app on an air-gapped box and
+these checks still work, forever:
+
+- **Hard expiry.** If the operator issued the license with
+  `duration_seconds: 31536000` (1 year), the offline verifier
+  rejects it on day 366. No network needed.
+- **Entitlement set.** Whatever entitlements were on the policy
+  when the license was signed are what the offline check sees
+  forever. Operator edits to the policy after issuance don't
+  reach this license.
+- **Trial flag.** TRIAL bit in the signed payload, offline
+  detectable.
+- **Fingerprint binding.** If the key was issued bound to
+  machine X's fingerprint, machine Y fails offline verification.
+
+These are tamper-proof because Ed25519 signatures can't be forged
+without the operator's private key.
+
+### What the operator can change **only via online enforcement**
+
+These mutations live in the operator's licensing-service DB and
+**never reach the buyer's app** unless the app actively calls
+`/v1/validate`:
+
+- **Revocation.** DB row flips `revoked_at`; signed key still
+  verifies offline.
+- **Tier downgrade / upgrade.** New entitlements live in the DB;
+  signed key still has the old ones.
+- **Recurring subscription lapse.** Sub goes `past_due` →
+  `lapsed` server-side. Signed key (which is just `expires_at =
+  now + 30 days` for monthly subs) keeps verifying offline until
+  its baked expiry.
+- **Seat enforcement** beyond per-key fingerprint binding.
+
+### The two design dials the operator picks
+
+For each product they sell:
+
+1. **How short is the baked expiry?** Short (e.g. 35 days for a
+   monthly sub) = buyer must come online frequently to refresh;
+   operator retains tight control. Long / perpetual = buyer can
+   stay offline indefinitely; operator gives up most post-sale
+   enforcement.
+2. **Does the buyer's app actually call `validate()`?** This is
+   YOUR call as the SDK consumer. If the app only does
+   `verifier.verify(key)` (offline signature check) and never
+   calls `client.validate(...)`, **no operator-side change can
+   ever reach a buyer who's already activated.** If the app calls
+   `validate()` on launch + daily with a sensible cache fallback,
+   operators have near-real-time control.
+
+### The two patterns
+
+**Pattern A — true perpetual, no take-backs.** App does
+`verifier.verify(key)` at launch and trusts whatever the signed
+payload says. Buyer pays once, gets entitlements forever, even
+if the operator regrets it. Honest sale, like buying a Photoshop
+CS6 disk in 2012. Works for: tools the operator is confident they
+want to lifetime-license; markets where buyers explicitly value
+"buy once, own forever"; software that may need to function
+on air-gapped boxes.
+
+**Pattern B — perpetual *price*, online-enforced entitlements.**
+App calls `client.validate(...)` periodically (on launch + daily)
+and treats the SERVER's entitlement set as authoritative. The
+license is "perpetual" in that there's no expiry-driven re-payment,
+but enforcement is live. Operator retains downgrade / revoke /
+sub-lapse control. Buyer's offline experience is normal as long
+as they come online once per cache window. This is what most
+"SaaS replacement" products want.
+
+```ts
+// Pattern A — offline-only
+import { Verifier } from '@keysat/licensing-client'
+const v = new Verifier(OPERATOR_PUBKEY_PEM)
+const ok = v.verify(licenseKey)
+if (!ok.valid || !ok.entitlements.includes('core')) refuseToStart()
+
+// Pattern B — online-aware with offline fallback
+import { Client } from '@keysat/licensing-client'
+const client = new Client(OPERATOR_KEYSAT_URL)
+const result = await client.validate(licenseKey, { productSlug, fingerprint })
+if (!result.ok) refuseToStart()
+// result.entitlements is the LIVE set from the server
+// On network failure, fall back to verifier.verify() with a
+// cache TTL appropriate to your business (e.g. 7 days).
+```
+
+### Operator-side implication
+
+Your pricing/enforcement model has to match the offline-vs-online
+tradeoff:
+
+- **Perpetual licenses** with Pattern A: you give up post-sale
+  control. Honest sale. Refund-if-buyer-asks model.
+- **Perpetual licenses** with Pattern B: full operator control,
+  but the app has to be online periodically to bite. Buyers who
+  go fully offline forever can't be touched.
+- **Recurring subs**: NEED short baked-in expiries (1-2 cycles'
+  worth) plus working `/v1/validate` integration. Otherwise
+  lapsing is unenforceable.
+- **Free trial converting to paid**: bake `expires_at = trial_end`
+  so the trial expires offline, then renewal flow extends it on
+  payment.
+
+### What this means for the tier-upgrade feature (section 11a)
+
+The whole tier-upgrade flow only has teeth if buyers' apps are
+calling `validate()`. For a buyer using Pattern A who paid for
+Patron and the operator later downgrades them: nothing happens
+until they come online. **Same constraint going the other way:**
+a Pattern A buyer's app wouldn't see new entitlements after an
+upgrade until next online call.
+
+This isn't a Keysat-specific limitation — it's a property of any
+license model that doesn't require always-on phone-home. **Keysat
+deliberately doesn't.** That's a feature, not a bug; but you, the
+SDK consumer, need to decide which pattern your app implements
+based on the operator's business model.
+
+### Keysat dogfoods Pattern B
+
+The Keysat daemon itself uses Pattern B for its own self-license:
+verifies the on-disk LIC1 key at boot (Pattern A signature check),
+THEN refreshes entitlements from the local DB hourly + on-demand
+via `POST /v1/admin/self-license/refresh` (Pattern B online
+component). This is the same pattern you'd implement in any
+"perpetual price, live entitlements" app. See
+`license_self::refresh_self_tier_from_db` for reference.
+
+---
+
 ## 1. What Keysat does, in one paragraph
 
 Keysat lets independent software creators sell their work on their own
