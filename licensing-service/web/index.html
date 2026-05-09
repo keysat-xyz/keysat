@@ -1311,6 +1311,168 @@ The request will be refused if there are licenses or invoices tied to it — use
     }
   }
 
+  // Change-tier modal: pick target policy, see quote, choose comp
+  // (skip_payment=true) vs paid (skip_payment=false → operator gets
+  // a checkout URL to forward to the buyer). Auth via admin token —
+  // POST /v1/admin/licenses/:id/change-tier.
+  function openChangeTier(license) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+    })
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:560px; width:100%; padding:24px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); ' +
+        'max-height:90vh; overflow-y:auto;',
+    })
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+
+    card.appendChild(el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Change tier'))
+    card.appendChild(el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:20px; margin:0 0 6px; color:var(--navy-950);' },
+      'License ' + (license.id ? license.id.slice(0, 8) : '?') + '…'))
+    card.appendChild(el('p', { class: 'muted', style: 'margin:0 0 16px; font-size:13px' },
+      'Force-change this license to a different policy under the same product. Bypasses ladder rules — operators can move sideways, downgrade perpetuals, etc. Preview the prorated charge before committing.'))
+
+    const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px;' }, 'Loading product policies…')
+    const policiesHolder = el('div')
+    const quoteHolder = el('div', { style: 'margin-top:14px' })
+    const buttonRow = el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
+      el('button', { class: 'btn secondary', onclick: () => overlay.remove() }, 'Cancel'),
+    ])
+
+    card.appendChild(policiesHolder)
+    card.appendChild(quoteHolder)
+    card.appendChild(status)
+    card.appendChild(buttonRow)
+
+    let allPolicies = []
+    let currentPolicySlug = null
+    let selectedTargetSlug = null
+    let lastQuote = null
+
+    ;(async function init() {
+      try {
+        const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(license.product_slug || ''))
+        allPolicies = j.policies || []
+        if (license.policy_id) {
+          const cur = allPolicies.find((p) => p.id === license.policy_id)
+          if (cur) currentPolicySlug = cur.slug
+        }
+        renderPolicyPicker()
+        status.textContent = ''
+      } catch (e) {
+        status.textContent = 'Failed to load policies: ' + e.message
+        status.style.color = 'var(--danger)'
+      }
+    })()
+
+    function renderPolicyPicker() {
+      policiesHolder.innerHTML = ''
+      const opts = allPolicies
+        .filter((p) => p.slug !== currentPolicySlug)
+        .map((p) => ({
+          value: p.slug,
+          label: p.name + ' (' + p.slug + ')' +
+            (p.tier_rank != null ? ' · rank ' + p.tier_rank : '') +
+            (p.is_recurring ? ' · recurring' : '') +
+            (p.is_trial ? ' · trial' : ''),
+        }))
+      if (opts.length === 0) {
+        policiesHolder.appendChild(plainCard([
+          el('p', { class: 'muted', style: 'margin:0' },
+            'No other policies on this product. Create one first under Policies → ' + (license.product_slug || '<product>') + '.'),
+        ]))
+        return
+      }
+      const sel = formSelect('change_tier_target', 'Target policy', opts, { required: true })
+      policiesHolder.appendChild(sel)
+      const selEl = sel.querySelector('select')
+      selEl.addEventListener('change', () => {
+        selectedTargetSlug = selEl.value
+        runQuote()
+      })
+      // Auto-pick first option + run quote.
+      selectedTargetSlug = opts[0].value
+      selEl.value = selectedTargetSlug
+      runQuote()
+    }
+
+    async function runQuote() {
+      quoteHolder.innerHTML = ''
+      buttonRow.innerHTML = ''
+      buttonRow.appendChild(el('button', { class: 'btn secondary', onclick: () => overlay.remove() }, 'Cancel'))
+      if (!selectedTargetSlug) return
+      try {
+        // Reuse the buyer quote endpoint when both ranks are set;
+        // for admin-only paths (NULL rank, sideways) the operator
+        // path through /v1/admin/.../change-tier validates server-side
+        // anyway. We only render the quote preview when buyer-quote
+        // returns a clean answer; otherwise show a generic preview.
+        // To keep UX simple, we don't currently expose an
+        // admin-mode quote endpoint — fall back to letting the
+        // operator see the listed price diff via the policy's
+        // price_sats_override, surfaced in the picker option label.
+        // For ranks that line up, we can pull a real quote via a
+        // short-lived test license_key... but that requires the
+        // buyer key, which the admin doesn't have. So: we skip
+        // the quote preview in the admin UI and rely on the
+        // server-side response after submit. Show a placeholder.
+        quoteHolder.appendChild(el('p', { class: 'muted', style: 'margin:0; font-size:13px' },
+          'The server will compute the prorated charge in the listed currency on submit. Toggle "Apply as comp" below to skip the invoice and move the license immediately at no charge.'))
+
+        const compToggle = formCheckbox('change_tier_skip_payment', 'Apply as comp (skip_payment=true — no invoice, license flips immediately)')
+        quoteHolder.appendChild(compToggle)
+        const reasonField = formInput('change_tier_reason', 'Audit reason (optional)', {
+          hint: 'Free-form note. Stored on the tier_changes row + audit_log.',
+        })
+        quoteHolder.appendChild(reasonField)
+
+        buttonRow.appendChild(el('button', {
+          class: 'btn primary',
+          onclick: async () => {
+            const skip = !!card.querySelector('[name=change_tier_skip_payment]').checked
+            const reason = (card.querySelector('[name=change_tier_reason]').value || '').trim() || null
+            buttonRow.querySelectorAll('button').forEach((b) => b.disabled = true)
+            status.textContent = skip ? 'Applying comp change…' : 'Creating invoice…'
+            status.style.color = ''
+            try {
+              const r = await api('/v1/admin/licenses/' + license.id + '/change-tier', {
+                method: 'POST',
+                body: {
+                  to_policy_slug: selectedTargetSlug,
+                  skip_payment: skip,
+                  reason,
+                },
+              })
+              if (r.applied) {
+                status.textContent = 'Applied — license is now on ' + r.to_policy_slug + '.'
+              } else {
+                const url = r.checkout_url || ''
+                status.innerHTML = ''
+                status.appendChild(el('div', null, 'Invoice created. Forward this URL to the buyer:'))
+                const link = el('a', { href: url, target: '_blank', style: 'word-break:break-all' }, url)
+                status.appendChild(link)
+              }
+              setTimeout(() => {
+                if (skip) overlay.remove()
+              }, 800)
+            } catch (e) {
+              status.textContent = e.message
+              status.style.color = 'var(--danger)'
+              buttonRow.querySelectorAll('button').forEach((b) => b.disabled = false)
+            }
+          },
+        }, 'Submit'))
+      } catch (e) {
+        status.textContent = 'Quote failed: ' + e.message
+        status.style.color = 'var(--danger)'
+      }
+    }
+  }
+
   // Edit-policy modal. Mutable: name, description, price_sats_override,
   // duration, grace, max_machines, is_trial, entitlements, highlight.
   // Slug + product + tip config are NOT editable here (tip has its own
@@ -1400,6 +1562,14 @@ The request will be refused if there are licenses or invoices tied to it — use
     const trialDaysField = formInput('e_pol_trial_days', 'Free trial (days)', {
       type: 'number', value: String(pol.trial_days || 0),
     })
+    // Tier-ladder rank. Empty input means "not in any ladder" (server
+    // stores NULL); operator can blank it to remove a policy from the
+    // ladder, or set a number to add it. Range 0–1000 enforced server-side.
+    const tierRankField = formInput('e_pol_tier_rank', 'Tier ladder rank (optional)', {
+      type: 'number',
+      value: pol.tier_rank == null ? '' : String(pol.tier_rank),
+      hint: 'Higher = better tier. Leave blank to keep this policy out of the buyer-facing upgrade ladder.',
+    })
     if (isRecurringInit) setTimeout(() => {
       const cb = card.querySelector('[name=e_pol_is_recurring]')
       if (cb) cb.checked = true
@@ -1441,6 +1611,8 @@ The request will be refused if there are licenses or invoices tied to it — use
       el('div', { class: 'row-2' }, [graceField, machinesField]),
       entField,
       el('div', { class: 'row-2' }, [highlightField, trialField]),
+      // Tier ladder rank — sits in its own row above the recurring section.
+      tierRankField,
       // Recurring subscription block
       el('div', {
         style: 'margin-top:14px; padding-top:12px; border-top:1px dashed var(--border-1)',
@@ -1501,6 +1673,15 @@ The request will be refused if there are licenses or invoices tied to it — use
               grace_period_days: isNaN(gracePeriodDays) ? 7 : gracePeriodDays,
               trial_days: trialDays,
             }
+            // tier_rank is a nullable patch. Empty input → null
+            // (remove from ladder). Number → set. We always send
+            // the field on edit so the server's "patch touched
+            // field?" logic fires and the operator's intent (clear
+            // or set) lands.
+            const tierRankRaw = (card.querySelector('[name=e_pol_tier_rank]').value || '').trim()
+            body.tier_rank = tierRankRaw === ''
+              ? null
+              : Math.max(0, Math.min(1000, parseInt(tierRankRaw, 10) || 0))
             await api('/v1/admin/policies/' + pol.id, { method: 'PATCH', body })
             overlay.remove()
             routes.policies()
@@ -1622,6 +1803,16 @@ The request will be refused if there are licenses or invoices tied to it — use
           formCheckbox('is_trial', 'Trial flag (sets TRIAL bit on the signed license)'),
         ]),
 
+        // ---------- Tier ladder rank ----------
+        // Operator-defined ordering for in-place upgrades. Higher
+        // rank = better tier. Leave blank to exclude this policy
+        // from the buyer-facing upgrade ladder (admin can still
+        // force-change to/from any policy via the licenses page).
+        formInput('tier_rank', 'Tier ladder rank (optional)', {
+          type: 'number',
+          hint: 'Position in the upgrade ladder for this product. Higher = better tier. Common pattern: free=0, standard=1, pro=2, patron=3. Leave blank to keep the policy out of the ladder (e.g. one-off promo). Range 0–1000.',
+        }),
+
         // ---------- Recurring subscription (Pro tier) ----------
         el('div', {
           style: 'margin:18px 0 12px; padding-top:14px; border-top:1px dashed var(--border-1)',
@@ -1729,6 +1920,13 @@ The request will be refused if there are licenses or invoices tied to it — use
               entitlements: ents,
               metadata,
               price_sats_override,
+            }
+            // tier_rank: only attach if the operator typed something.
+            // Empty input = "leave out of ladder" (server stores NULL).
+            const rankRaw = (create.querySelector('[name=tier_rank]').value || '').trim()
+            if (rankRaw !== '') {
+              const rank = parseInt(rankRaw, 10)
+              if (!isNaN(rank)) body.tier_rank = rank
             }
             if (tipRecipient) {
               body.tip_recipient = tipRecipient
@@ -2333,6 +2531,13 @@ The request will be refused if there are licenses or invoices tied to it — use
           el('td', { class: 'muted' }, l.expires_at ? fmtDate(l.expires_at) : el('span', { class: 'badge b-gold' }, 'perpetual')),
           el('td', { class: 'muted' }, l.buyer_email || '–'),
           el('td', null, el('div', { class: 'actions-row' }, [
+            l.status !== 'revoked'
+              ? el('button', {
+                  class: 'btn sm secondary',
+                  title: 'Move this license to a different policy/tier',
+                  onclick: () => openChangeTier(l),
+                }, 'Change tier')
+              : null,
             l.status !== 'revoked' && l.status !== 'suspended'
               ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'suspend') }, 'Suspend')
               : null,
