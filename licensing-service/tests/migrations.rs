@@ -664,6 +664,111 @@ async fn migration_0011_adds_subscriptions_without_breaking_existing_data() {
     assert_db_clean(&pool).await.expect("db clean after 0011");
 }
 
+/// Migration 0013 (tier upgrades schema): verifies that adding the
+/// new `policies.tier_rank` column + the `tier_changes` table
+/// doesn't break existing data, and that the new table accepts rows
+/// via FK references back to licenses / policies / invoices created
+/// under the prior schema.
+#[tokio::test]
+async fn migration_0013_adds_tier_upgrades_without_breaking_existing_data() {
+    let (pool, _tmp) = make_pool().await;
+
+    // Apply everything before 0013, populate realistic state.
+    let total = migration_files().len();
+    assert!(total >= 13, "need 13+ migrations to test 0013 in context");
+    apply_range(&pool, 0, 12)
+        .await
+        .expect("apply 0001..=0012");
+    seed_realistic_fixtures(&pool)
+        .await
+        .expect("seed pre-0013 fixtures");
+
+    // Apply 0013.
+    apply_range(&pool, 12, 13)
+        .await
+        .expect("apply 0013_tier_upgrades");
+
+    // The new column exists with NULL default on existing rows
+    // (existing operators didn't opt into tier ladders yet).
+    let rank: Option<i64> = sqlx::query_scalar(
+        "SELECT tier_rank FROM policies WHERE id = 'pol1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rank, None,
+        "existing policies must default to NULL tier_rank (out of any ladder)"
+    );
+
+    // The new tier_changes table accepts a row referencing the
+    // pre-existing fixture license + policy + invoice.
+    let now = "2026-05-08T12:00:00Z";
+    sqlx::query(
+        "INSERT INTO tier_changes(id, license_id, from_policy_id, to_policy_id, \
+         direction, listed_currency, proration_charge_value, invoice_id, \
+         effective_at, actor, reason, created_at) \
+         VALUES('tc1', 'lic1', 'pol1', 'pol1', 'upgrade', 'USD', 3333, \
+                'inv1', ?, 'buyer', 'test upgrade', ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("tier_changes accepts row with FKs into pre-0013 fixture rows");
+
+    // CHECK constraints enforced: bad direction value rejected.
+    let bad_direction = sqlx::query(
+        "INSERT INTO tier_changes(id, license_id, from_policy_id, to_policy_id, \
+         direction, listed_currency, effective_at, actor, created_at) \
+         VALUES('tc2', 'lic1', 'pol1', 'pol1', 'sideways', 'USD', ?, 'buyer', ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_direction.is_err(),
+        "tier_changes.direction must be 'upgrade' or 'downgrade'"
+    );
+
+    // CHECK enforced: bad actor value rejected.
+    let bad_actor = sqlx::query(
+        "INSERT INTO tier_changes(id, license_id, from_policy_id, to_policy_id, \
+         direction, listed_currency, effective_at, actor, created_at) \
+         VALUES('tc3', 'lic1', 'pol1', 'pol1', 'upgrade', 'USD', ?, 'system', ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_actor.is_err(),
+        "tier_changes.actor must be 'buyer' or 'admin'"
+    );
+
+    // CHECK enforced: negative proration value rejected (operator
+    // typo or buggy quote logic should fail loudly, not silently
+    // store a refund-shaped row in an upgrade-shaped table).
+    let bad_proration = sqlx::query(
+        "INSERT INTO tier_changes(id, license_id, from_policy_id, to_policy_id, \
+         direction, listed_currency, proration_charge_value, effective_at, \
+         actor, created_at) \
+         VALUES('tc4', 'lic1', 'pol1', 'pol1', 'upgrade', 'USD', -100, ?, 'admin', ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_proration.is_err(),
+        "tier_changes.proration_charge_value must be >= 0"
+    );
+
+    // FK + integrity invariants overall.
+    assert_db_clean(&pool).await.expect("db clean after 0013");
+}
+
 /// Future-proofing. Always seeds fixtures one migration before the end,
 /// then applies the final migration. As new migrations land (0010,
 /// 0011, …), they get vetted against populated data automatically; no
