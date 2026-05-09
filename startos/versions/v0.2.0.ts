@@ -58,6 +58,37 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:6 — **Recurring subs + trials + self-tier live refresh actually work now.** Major bug-and-UX-fix release driven by hands-on testing of v0.2.0:5. The recurring-sub feature shipped in :4 had a critical gap: buying a recurring policy issued a license but never created the corresponding subscription row, so the renewal worker never picked it up — purchases silently behaved like one-shots. The trial flow shipped with `trial_days` configurable in admin but the field had zero effect on the purchase path. And admin tier changes on the daemon\'s own license never propagated to the running daemon, making it impossible to test Creator-tier gates on the master Keysat. This release fixes all three plus a slate of UX papercuts found during testing.',
+  '',
+  '**Recurring purchases now create subscriptions.** `issue_license_for_invoice` calls `subscriptions::create_subscription` whenever the resolved policy has `is_recurring=1`. The Subscriptions tab populates correctly; the renewal worker sees the row; cancellation works. Idempotent against webhook re-delivery.',
+  '',
+  '**Free trials actually work.** When a buyer hits "Pay with Bitcoin" on a recurring policy with `trial_days > 0`, the daemon now: (a) synthesizes a free invoice via the same shortcut used for free-license-code redemptions, (b) issues a license inline with `expires_at = now + trial_days`, (c) creates the subscription with `next_renewal_at = trial_end` so the renewal worker fires the FIRST paid invoice when the trial ends, (d) returns the license key directly with no checkout step. The buy page CTA flips to "Start N-day free trial" so the buyer knows they\'re not being charged today. Discount codes are intentionally ignored on trial purchases (trial = free; layering a discount is a no-op). Trial license carries the TRIAL flag on the signed payload.',
+  '',
+  '**Self-tier live refresh.** The daemon\'s own tier (`state.self_tier`) was previously loaded from the on-disk LIC1 key at boot and never refreshed — entitlements baked into the signed payload at signing time were the daemon\'s permanent reality. Now there\'s a `license_self::refresh_self_tier_from_db` helper that re-reads the local `licenses` row and rebuilds `state.self_tier` from LIVE entitlements. Wired to fire (a) once at boot right after `check_at_boot`, (b) every hour as a background task, (c) on demand via `POST /v1/admin/self-license/refresh`. Admin tier changes now propagate. This is the same online-entitlement-refresh pattern any operator should implement in their own app — Keysat dogfoods it for itself.',
+  '',
+  '**Renewal-pending webhook payload enriched.** `subscription.renewal_pending` now includes `buyer_email`, `product_id`, `policy_id`, `cycle_start_at`, `cycle_end_at`, `due_at`, and `is_first_paid_cycle` so operators\' webhook receivers have everything they need to render and send "your free trial is ending" / "your monthly renewal is due" emails to the buyer with the checkout URL. (Without this, renewal invoices were created server-side but no one knew about them — the buyer had no way to learn they needed to pay.)',
+  '',
+  '**Admin Change Tier modal redesigned.** The "skip_payment" toggle is gone — admin tier changes always apply as comp from the UI now. Paid tier changes are buyer-initiated via the SDK\'s in-app upgrade flow; admin path is for operators who want to give someone a free upgrade or fix a screwup. Reduces the attack surface of "operator generates invoice, dismisses modal, orphan invoice lives on the provider." The modal also now detects downgrades (target rank or price < current), shows a yellow warning banner listing the entitlements the buyer will lose, and confirms via dialog. The dropdown shows the current tier in disabled state with "(current)" suffix — operators see what they\'re starting from but can\'t pick a no-op.',
+  '',
+  '**Self-tier guard.** `POST /v1/admin/licenses/<id>/change-tier` now refuses when `<id>` is the daemon\'s own self-license, with a clear error pointing at either the master Keysat\'s re-mint flow or the file-rename trick (`mv /data/keysat-license.txt /data/keysat-license.txt.bak; restart`) for testing Creator-tier gates.',
+  '',
+  '**Zaprite webhook flow improved.** Connect Zaprite now shows the EXACT `https://your-keysat-url/v1/zaprite/webhook` URL to paste (was a placeholder before, which Zaprite\'s form rejected). New "Show Zaprite webhook setup" StartOS Action surfaces the URL persistently for operators who skipped the step on first connect. Connect-while-already-connected returns 409 Conflict with a clear message instead of overwriting silently (BTCPay already had this guard).',
+  '',
+  '**Single "Switch active payment provider" StartOS action** replaces the two confusing "Activate BTCPay" / "Activate Zaprite" actions. Dropdown-driven, pre-fills with currently-active provider so opening it is informative.',
+  '',
+  '**UX polish on the admin dashboard:**',
+  '- Policy list duration column is human-readable (`1 year` / `1 week` / `perpetual`) instead of raw seconds (`31536000s`).',
+  '- "Preview buy page" button on each product\'s policies card opens `/buy/<slug>` in a new tab.',
+  '- Buy page tier cards: clicked button reads "Selected" while others stay "Select" — clearer "this is the active choice" cue.',
+  '- Licenses tab POLICY column shows display name primary with slug secondary (was slug-only).',
+  '- Thank-you page copy: "Lightning settles in seconds; on-chain typically 10–20 minutes" instead of misleading "next block confirms" for Lightning payments.',
+  '',
+  '**KEYSAT_INTEGRATION.md adds section 0a "How enforcement actually works"** — the offline-vs-online framing every operator hits when they realize they want to revoke / downgrade / lapse a license. Walks through the two patterns (A: true perpetual, offline-only; B: perpetual price, online-enforced) with TS code samples and the design dials operators pick.',
+  '',
+  '**Test count: 77** (unchanged). The bug fixes are above the renewal-worker tests\' scope (those tests construct subscriptions explicitly via `create_subscription`, bypassing the broken purchase path); test additions deferred to the v0.3 work that\'ll cover the integration paths properly.',
+  '',
+  '**Upgrade path.** v0.2.0:5 → v0.2.0:6 is a drop-in. No new schema migrations. No behavior change unless you actively use recurring policies, trials, or admin tier changes — all of which were broken before and now work.',
+  '',
   '0.2.0:5 — **In-place tier upgrades are functional end-to-end.** Buyers can self-serve "upgrade to Pro" inside the operator\'s app — they pay only the prorated difference for the time remaining in their current cycle, the existing license keeps its key, and the daemon flips entitlements on next online validation. Operators can force-change any license to any policy from the admin UI, with optional comp-mode (skip the invoice).',
   '',
   '**Buyer flow.** New `POST /v1/upgrade-quote` returns the prorated charge in the listed currency: "Standard $25/mo → Pro $75/mo with 15 days remaining = $25.00 today, $75.00 next cycle." `POST /v1/upgrade` creates a payment provider invoice for the prorated charge and returns a checkout URL. When the invoice settles, the webhook handler flips the license\'s policy_id + entitlements + max_machines + expires_at and any tied subscription\'s policy_id + listed_value + period_days. The signed license key stays the same — the buyer\'s app just sees the new entitlements on its next call to `/v1/validate`.',
@@ -124,7 +155,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:5',
+  version: '0.2.0:6',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
