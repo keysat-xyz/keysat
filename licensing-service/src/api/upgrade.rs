@@ -313,6 +313,30 @@ pub async fn admin_change(
     let (ip, ua) = request_context(&headers);
     let reason = body.reason.as_deref().filter(|s| !s.trim().is_empty());
 
+    // Refuse to change-tier on the daemon's OWN self-license. The
+    // signed key on disk is the immutable proof-of-tier and won't
+    // reflect any DB change anyway — operators trying to "downgrade
+    // themselves to test gating" hit a recursion that produces a
+    // confusing half-applied state. Live-refresh from the DB does
+    // pick up the new entitlements, but the operator should drive
+    // self-tier changes through the proper re-mint flow on the
+    // master Keysat instead. For now, refuse with a clear message.
+    {
+        let current = state.self_tier.read().await.clone();
+        if let crate::license_self::Tier::Licensed { license_id: self_id, .. } = current {
+            if self_id.to_string() == license_id {
+                return Err(AppError::BadRequest(
+                    "cannot change tier on the daemon's own self-license — \
+                     re-issue a new key from the master Keysat and activate it via \
+                     'Activate Keysat license' instead. Or, for testing Creator-tier \
+                     gates, temporarily move /data/keysat-license.txt aside and \
+                     restart Keysat to boot Unlicensed."
+                        .into(),
+                ));
+            }
+        }
+    }
+
     let license = crate::db::repo::get_license_by_id(&state.db, &license_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("license '{license_id}'")))?;

@@ -1420,11 +1420,46 @@ The request will be refused if there are licenses or invoices tied to it — use
         // buyer key, which the admin doesn't have. So: we skip
         // the quote preview in the admin UI and rely on the
         // server-side response after submit. Show a placeholder.
-        quoteHolder.appendChild(el('p', { class: 'muted', style: 'margin:0; font-size:13px' },
-          'The server will compute the prorated charge in the listed currency on submit. Toggle "Apply as comp" below to skip the invoice and move the license immediately at no charge.'))
+        // Detect direction (upgrade vs downgrade) by comparing the
+        // current and target policies' price_sats_override (or rank
+        // when both ranked). Drives a "downgrade warning" banner so
+        // the operator sees what entitlements the buyer is about to
+        // lose. Cheap client-side compute; the server still
+        // re-validates.
+        const targetPol = allPolicies.find((p) => p.slug === selectedTargetSlug)
+        const currentPol = allPolicies.find((p) => p.slug === currentPolicySlug)
+        let isDowngrade = false
+        if (targetPol && currentPol) {
+          if (targetPol.tier_rank != null && currentPol.tier_rank != null) {
+            isDowngrade = targetPol.tier_rank < currentPol.tier_rank
+          } else {
+            const a = currentPol.price_sats_override != null ? currentPol.price_sats_override : 0
+            const b = targetPol.price_sats_override != null ? targetPol.price_sats_override : 0
+            isDowngrade = b < a
+          }
+        }
 
-        const compToggle = formCheckbox('change_tier_skip_payment', 'Apply as comp (skip_payment=true — no invoice, license flips immediately)')
-        quoteHolder.appendChild(compToggle)
+        if (isDowngrade && targetPol && currentPol) {
+          // Build a list of entitlements the buyer is about to lose.
+          const losing = (currentPol.entitlements || []).filter(
+            (e) => !(targetPol.entitlements || []).includes(e),
+          )
+          const losingLine = losing.length > 0
+            ? 'Buyer will LOSE these entitlements: ' + losing.join(', ') + '.'
+            : 'Buyer keeps the same entitlements.'
+          quoteHolder.appendChild(plainCard([
+            el('div', { style: 'color:#7a5814; font-weight:600; margin-bottom:6px' },
+              '⚠ Downgrade'),
+            el('p', { style: 'margin:0 0 8px; font-size:13px' },
+              'You\'re moving this license from ' + currentPol.name + ' → ' + targetPol.name + '. ' +
+              losingLine + ' The buyer will NOT be refunded automatically — handle any refund out of band.'),
+          ]))
+        } else {
+          quoteHolder.appendChild(el('p', { class: 'muted', style: 'margin:0; font-size:13px' },
+            'Admin tier changes always apply as comp (no invoice, license flips immediately). ' +
+            'For paid upgrades, point the buyer at /buy/<slug> or have their app drive the SDK\'s in-app purchase flow.'))
+        }
+
         const reasonField = formInput('change_tier_reason', 'Audit reason (optional)', {
           hint: 'Free-form note. Stored on the tier_changes row + audit_log.',
         })
@@ -1433,39 +1468,36 @@ The request will be refused if there are licenses or invoices tied to it — use
         buttonRow.appendChild(el('button', {
           class: 'btn primary',
           onclick: async () => {
-            const skip = !!card.querySelector('[name=change_tier_skip_payment]').checked
             const reason = (card.querySelector('[name=change_tier_reason]').value || '').trim() || null
+            // Confirm on downgrades — operator should explicitly OK
+            // before the buyer loses entitlements.
+            if (isDowngrade && !confirm('Confirm downgrade? Buyer loses entitlements without refund.')) {
+              return
+            }
             buttonRow.querySelectorAll('button').forEach((b) => b.disabled = true)
-            status.textContent = skip ? 'Applying comp change…' : 'Creating invoice…'
+            status.textContent = 'Applying…'
             status.style.color = ''
             try {
+              // Always apply as comp from the admin UI. Paid admin
+              // tier changes are admin-API-only (back-compat) — see
+              // KEYSAT_INTEGRATION.md re: SDK-driven buyer upgrades.
               const r = await api('/v1/admin/licenses/' + license.id + '/change-tier', {
                 method: 'POST',
                 body: {
                   to_policy_slug: selectedTargetSlug,
-                  skip_payment: skip,
+                  skip_payment: true,
                   reason,
                 },
               })
-              if (r.applied) {
-                status.textContent = 'Applied — license is now on ' + r.to_policy_slug + '.'
-              } else {
-                const url = r.checkout_url || ''
-                status.innerHTML = ''
-                status.appendChild(el('div', null, 'Invoice created. Forward this URL to the buyer:'))
-                const link = el('a', { href: url, target: '_blank', style: 'word-break:break-all' }, url)
-                status.appendChild(link)
-              }
-              setTimeout(() => {
-                if (skip) overlay.remove()
-              }, 800)
+              status.textContent = 'Applied — license is now on ' + r.to_policy_slug + '.'
+              setTimeout(() => overlay.remove(), 800)
             } catch (e) {
               status.textContent = e.message
               status.style.color = 'var(--danger)'
               buttonRow.querySelectorAll('button').forEach((b) => b.disabled = false)
             }
           },
-        }, 'Submit'))
+        }, 'Apply'))
       } catch (e) {
         status.textContent = 'Quote failed: ' + e.message
         status.style.color = 'var(--danger)'

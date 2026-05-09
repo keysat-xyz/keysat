@@ -55,6 +55,18 @@ pub async fn connect(
     if api_key.is_empty() {
         return Err(AppError::BadRequest("api_key is required".into()));
     }
+
+    // Short-circuit: refuse to overwrite an existing config silently.
+    // Operators get confused when they re-run Connect after already
+    // being connected — they expect a "you're already set up" message,
+    // not a form re-prompt that can clobber their working config.
+    if let Ok(Some(_)) = zaprite_config::load(&state.db).await {
+        return Err(AppError::Conflict(
+            "Zaprite is already connected. Run 'Disconnect Zaprite' first \
+             if you want to rotate the API key or switch organizations."
+                .into(),
+        ));
+    }
     let base_url = req
         .base_url
         .as_deref()
@@ -118,10 +130,21 @@ pub async fn connect(
     )
     .await;
 
+    // Compute the absolute webhook URL so the StartOS Action can
+    // surface the full https://... endpoint to the operator. They
+    // paste this into the Zaprite dashboard exactly. Zaprite's
+    // webhook form requires a full URL, not a path; the previous
+    // copy showed a placeholder which was confusing.
+    let webhook_url = format!(
+        "{}/v1/zaprite/webhook",
+        state.config.public_base_url.trim_end_matches('/')
+    );
+
     Ok(Json(json!({
         "ok": true,
         "provider": "zaprite",
         "base_url": base_url,
+        "webhook_url": webhook_url,
     })))
 }
 
@@ -207,10 +230,27 @@ pub async fn status(
         Some(p) => Some(p.kind().as_str().to_string()),
         None => None,
     };
+    let webhook_url = format!(
+        "{}/v1/zaprite/webhook",
+        state.config.public_base_url.trim_end_matches('/')
+    );
     Ok(Json(json!({
         "connected": cfg.is_some(),
         "active_provider": active_provider,
         "base_url": cfg.as_ref().map(|c| c.base_url.clone()),
         "webhook_id": cfg.as_ref().and_then(|c| c.webhook_id.clone()),
+        // Surfaced unconditionally so an operator who lost the
+        // first-connect message can still find the URL to paste
+        // into Zaprite's dashboard. Webhook-not-yet-registered
+        // doesn't change the URL — it's the same address Zaprite
+        // would POST to once registered.
+        "webhook_url": webhook_url,
+        "webhook_explainer": "Zaprite doesn't sign webhook deliveries. \
+            Keysat authenticates each delivery via the externalUniqId we attach \
+            at order creation, so a webhook configured to ANY URL on your daemon \
+            is safe even without a shared secret. Polling /v1/orders works as a \
+            fallback if you don't register the webhook, but webhooks fire on \
+            payment settle and let Keysat issue the license within a second \
+            instead of the next reconcile-loop tick (every 60s).",
     })))
 }

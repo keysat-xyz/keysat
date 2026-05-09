@@ -87,18 +87,89 @@ export const configureZaprite = sdk.Action.withInput(
       ok: true
       provider: string
       base_url: string
+      webhook_url: string
     }
     return {
       version: '1',
       title: 'Zaprite connected',
       message:
         `Active payment provider is now Zaprite (${body.base_url}).\n\n` +
-        `Next step: register a webhook in Zaprite's dashboard pointing at:\n` +
-        `<your Keysat public URL>/v1/zaprite/webhook\n\n` +
-        `Zaprite doesn't sign webhook deliveries; Keysat authenticates ` +
-        `each delivery via the externalUniqId we attach at order ` +
-        `creation, so a webhook configured to ANY URL on your daemon ` +
-        `is safe even without a shared secret.`,
+        `Next step — register a webhook in Zaprite's dashboard:\n` +
+        `1. Open app.zaprite.com → Settings → Webhooks → New webhook.\n` +
+        `2. Paste this URL exactly (full https://, not just the path):\n\n` +
+        `   ${body.webhook_url}\n\n` +
+        `3. Subscribe to order events (payment_received, settled, refunded).\n\n` +
+        `Why webhooks: without them, Keysat falls back to polling Zaprite's ` +
+        `/v1/orders every 60 seconds, so license issuance can lag a settle ` +
+        `event by up to a minute. With webhooks, Keysat issues the license ` +
+        `within ~1 second of payment.\n\n` +
+        `Security: Zaprite doesn't sign webhook deliveries. Keysat ` +
+        `authenticates each delivery via the externalUniqId we attach at ` +
+        `order creation, so a webhook configured to ANY URL on your daemon ` +
+        `is safe even without a shared secret.\n\n` +
+        `Lost this message? Run "Show Zaprite webhook setup" to see the URL again.`,
+      result: null,
+    }
+  },
+)
+
+/**
+ * Persistent surface for the webhook URL — operators who skipped the
+ * step on first connect, or who just want to verify which URL Zaprite
+ * should be posting to, run this and get the exact value to paste.
+ */
+export const showZapriteWebhookSetup = sdk.Action.withoutInput(
+  'show-zaprite-webhook-setup',
+  async () => ({
+    name: 'Show Zaprite webhook setup',
+    description:
+      "Display the full webhook URL to register in your Zaprite dashboard, " +
+      "plus an explanation of what webhooks do that polling doesn't. " +
+      "Useful if you skipped the step on first Connect.",
+    warning: null,
+    allowedStatuses: 'only-running',
+    group: 'Zaprite',
+    visibility: 'enabled',
+  }),
+  async ({ effects: _effects }) => {
+    const storeData = await store.read().once()
+    if (!storeData) throw new Error('Store not initialized — restart the service.')
+    const resp = await adminCall(
+      LICENSING_URL,
+      storeData.admin_api_key,
+      '/v1/admin/zaprite/status',
+      { method: 'GET' },
+    )
+    if (!resp.ok) {
+      throw new Error(
+        `Could not read status: HTTP ${resp.status} — ${await resp.text()}`,
+      )
+    }
+    const body = (await resp.json()) as {
+      connected: boolean
+      webhook_url: string
+      webhook_explainer: string
+    }
+    if (!body.connected) {
+      return {
+        version: '1',
+        title: 'Zaprite not connected',
+        message:
+          'Connect Zaprite first via the Connect Zaprite action. ' +
+          'Once connected, re-run this action to see the webhook URL ' +
+          'to register in your Zaprite dashboard.',
+        result: null,
+      }
+    }
+    return {
+      version: '1',
+      title: 'Zaprite webhook setup',
+      message:
+        `Paste this URL exactly into Zaprite's webhook form ` +
+        `(app.zaprite.com → Settings → Webhooks → New webhook):\n\n` +
+        `   ${body.webhook_url}\n\n` +
+        `Subscribe to order events (payment_received, settled, refunded).\n\n` +
+        body.webhook_explainer,
       result: null,
     }
   },

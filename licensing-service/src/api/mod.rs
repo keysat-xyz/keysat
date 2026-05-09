@@ -707,7 +707,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 <div class="wrap">
   <div class="eyebrow">Payment received</div>
   <h1 id="page-title">Issuing your license&hellip;</h1>
-  <p class="lede" id="page-lede">Your Bitcoin payment was received. We&rsquo;re waiting for it to settle on the network and for the license to be signed. This usually takes under a minute once the next block confirms.</p>
+  <p class="lede" id="page-lede">Your Bitcoin payment was received. We&rsquo;re waiting for it to settle and for the license to be signed. Lightning settles in seconds; on-chain typically settles in 10&ndash;20 minutes (one block confirmation).</p>
 
   <!-- pending state (default): polling for the license -->
   <div class="pending-card" id="pending-card">
