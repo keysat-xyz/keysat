@@ -75,6 +75,16 @@ hangs on these:
    for the integration itself, but useful for shaping the "Upgrade"
    message that shows when an unlicensed user hits a paid feature.)
 
+   Two-or-more-tier products unlock a UX option: an **in-app tier
+   picker** that renders the buyer's options inside the operator's
+   own UI (e.g. on the activation screen) and drives the purchase
+   programmatically through the SDK, instead of redirecting to the
+   externally-hosted `/buy/<slug>` page. See section 11a — this is
+   often the strongest fit when the app already has a settings or
+   activation surface where "Choose a plan" feels native. If there's
+   only one tier (or only one *paid* tier), skip this and use the
+   simpler single-policy flow in section 11.
+
 If the creator doesn't know yet, propose sensible defaults from the
 ranges above and confirm before coding.
 
@@ -945,6 +955,16 @@ return <App />
   generic "activation failed"
 - A "Buy a key" link to `${keysatBaseUrl}/buy/${productSlug}` (see §3)
 
+**Optional — embed the tier picker directly in the activation card.**
+For multi-tier products, instead of (or in addition to) the "Buy a
+key" link, render an inline tier picker that lets the buyer pay
+without leaving your app. Calls
+`Client.listPublicPolicies(productSlug)` to render the tier list and
+`Client.startPurchase(productSlug, { policySlug })` to drive the
+checkout. The full pattern, including the architecture diagram and
+common mistakes, is in **section 11a**. This is the pattern Recap
+ships in their activation screen.
+
 **Step 4: Gate Pro features in the UI, not just the server.** The
 server returns 402 for missing entitlements, but unless the frontend
 also checks, users see ghost UI for features they can't use:
@@ -1139,6 +1159,202 @@ settles and the license is signed. Save the returned key to disk
 The simpler alternative: just link to the operator's buy page and let
 them complete the purchase on the web, then paste the resulting key
 into your app's settings. Less integrated, less friction to implement.
+
+If the product has **two or more public policies** (Core/Pro, Free/
+Standard/Pro, etc.), see section 11a for the tier-aware flow that
+lets buyers pick a tier inside your app's own UI.
+
+---
+
+## 11a. Tier-aware purchases — in-app tier picker (multi-tier products)
+
+When a product has multiple public policies, the buyer needs to **pick
+which tier they're paying for** before the invoice is created. Section
+11's `startPurchase(slug, { buyerEmail })` defaults to the product's
+"default" policy (or the first active one), which works fine for
+single-tier products but always issues a Core license on a Core/Pro
+setup — no matter what the buyer wanted.
+
+The fix has two pieces, both supported by the SDK since 0.2.0:
+
+1. **`Client.listPublicPolicies(productSlug)`** — fetches the buyer-
+   visible tier list from `GET /v1/products/<slug>/policies`. Public
+   endpoint, no auth. Returns each tier's slug, display name, price
+   (in the product's listed currency's smallest unit — sats for SAT,
+   cents for USD/EUR), entitlements, recurring/trial flags, and the
+   "Most popular" highlight flag. Render this into your tier-picker
+   UI; it'll stay in sync if the operator adds/edits tiers in Keysat
+   admin without you redeploying the app.
+2. **`policySlug` field on `startPurchase`'s options** — when set, the
+   licensing service prices the invoice at that policy's
+   `price_sats_override` and the issued license carries that policy's
+   entitlements, duration, max_machines, and trial flag.
+
+### When you'd use this
+
+- Multi-tier products where the choice happens in the buyer's app
+  (activation screen, settings, in-app upgrade banner). Common shape:
+  freemium app where Free is gated by `core` entitlement and Pro
+  unlocks `subscriptions, history, library`.
+- Operators who want to add or rename tiers without forcing an app
+  update — the picker rebuilds itself off `listPublicPolicies`.
+- Apps that need to write the issued license key directly to disk
+  themselves (e.g. via a backend service, not via copy-paste from
+  the buy page). The SDK delivers the signed key as a string; you
+  write it where you want.
+
+### Pattern (TypeScript / web app frontend)
+
+```ts
+import { Client, PublicPolicy } from '@keysat/licensing-client'
+
+const client = new Client('https://licensing.example.com')
+
+// 1. Fetch tiers — typically on activation screen mount.
+const { product, policies } = await client.listPublicPolicies(PRODUCT_SLUG)
+
+// 2. Render `policies` into your tier-picker UI. Each policy carries
+//    everything you need to display:
+function renderTier(p: PublicPolicy) {
+  return `
+    <button data-slug="${p.slug}" class="tier ${p.highlighted ? 'popular' : ''}">
+      <h3>${p.name}</h3>
+      <p>${p.description}</p>
+      <div class="price">${formatPrice(p.priceSats, product /* for currency */)}
+                         ${p.isRecurring ? '/' + cadence(p.renewalPeriodDays) : ''}</div>
+      <ul>${p.entitlements.map(e => `<li>${e}</li>`).join('')}</ul>
+    </button>`
+}
+
+// 3. Buyer picks a tier; you call startPurchase with policySlug.
+async function buyTier(chosenSlug: string, buyerEmail: string) {
+  const session = await client.startPurchase(PRODUCT_SLUG, {
+    policySlug: chosenSlug,            // <-- the discriminator
+    buyerEmail,
+    redirectUrl: 'https://your-app.example/thank-you',
+  })
+
+  // 4. Open the checkout URL. For desktop apps, `open(session.checkoutUrl)`.
+  //    For web apps, `window.location.href = session.checkoutUrl`.
+  window.location.href = session.checkoutUrl
+
+  // 5. After payment settles, your backend (or the buyer's poll) hits
+  //    /v1/purchase/<invoice_id> and gets the signed license_key.
+  //    Write it to wherever your app reads from. Reload validate.
+}
+```
+
+### Pattern (other languages — same shape)
+
+```python
+# Python
+from keysat_licensing_client import Client, StartPurchaseOptions
+
+client = Client('https://licensing.example.com')
+tiers = client.list_public_policies(PRODUCT_SLUG)
+
+# render tiers.policies in your UI; user picks "pro"
+session = client.start_purchase(PRODUCT_SLUG, StartPurchaseOptions(
+    policy_slug='pro',
+    buyer_email='buyer@example.com',
+))
+# open session.checkout_url; poll on settle
+key = client.wait_for_license(session.invoice_id, timeout_s=30*60)
+```
+
+```rust
+// Rust
+use licensing_client::{Client, StartPurchaseOptions};
+let client = Client::new("https://licensing.example.com")?;
+let tiers = client.list_public_policies(PRODUCT_SLUG).await?;
+// render tiers.policies; user picks "pro"
+let session = client.start_purchase(PRODUCT_SLUG, &StartPurchaseOptions {
+    policy_slug: Some("pro"),
+    buyer_email: Some("buyer@example.com"),
+    ..Default::default()
+}).await?;
+// open session.checkout_url; poll on settle
+```
+
+```go
+// Go
+client := keysat.NewClient("https://licensing.example.com", nil)
+tiers, _ := client.ListPublicPolicies(ctx, PRODUCT_SLUG)
+// render tiers.Policies; user picks "pro"
+session, _ := client.StartPurchase(ctx, PRODUCT_SLUG, keysat.StartPurchaseOptions{
+    PolicySlug: "pro",
+    BuyerEmail: "buyer@example.com",
+})
+// open session.CheckoutURL; poll on settle
+```
+
+### Common mistakes
+
+- **Hardcoding policy slugs in the client.** The whole point of
+  `listPublicPolicies` is that the operator owns the tier shape. If
+  you ship a build that only knows about Core and Pro, and the
+  operator adds a "Patron" tier next month, the picker is silently
+  stale. Render the picker off the live API response.
+- **Splitting a product into multiple products.** Don't. Different
+  tiers of the same product share the product slug and differ only on
+  the policy slug. Splitting breaks `validate()` calls from clients
+  that expect one canonical `productSlug`. The whole tier system is
+  built on the assumption of one product, many policies.
+- **Using discount codes as a tier discriminator.** `code` is for
+  promos and referral discounts. It can't change which tier the buyer
+  ends up on. Use `policySlug`.
+- **Forgetting `policySlug` and assuming the right tier.** With
+  `policySlug` omitted, the daemon picks the policy slugged "default"
+  (if any), else the first active one. On a Core/Pro setup where
+  Core happens to be alphabetically first or named "default", every
+  buyer who hits your in-app upgrade flow without a `policySlug` ends
+  up on Core regardless of what they clicked. Always pass the slug
+  the buyer chose.
+- **Copying the price from your hardcoded UI rather than the API.**
+  Operators legitimately edit tier pricing in admin without warning;
+  if you cache a price, you'll under- or over-charge buyers vs. what
+  they actually pay. Render `policy.priceSats` directly from the
+  current `listPublicPolicies` response.
+
+### Architecture diagram
+
+```
+Buyer in your app
+    │
+    ▼
+listPublicPolicies(slug)         ← public, no auth
+    │
+    │ returns [{slug, name, priceSats, entitlements, ...}, ...]
+    ▼
+your in-app tier picker UI       ← operator's branding
+    │
+    │ buyer clicks "Pro"
+    ▼
+startPurchase(slug, {policySlug: 'pro', buyerEmail, redirectUrl})
+    │
+    │ returns {checkoutUrl, invoiceId, ...}
+    ▼
+open checkoutUrl in browser      ← BTCPay or Zaprite
+    │
+    │ buyer pays
+    ▼
+operator's licensing service     ← webhook fires on settle
+    │
+    │ issues license with Pro entitlements + invoice.policy_id = 'pro'
+    ▼
+poll /v1/purchase/<id> OR webhook to your backend
+    │
+    │ returns license_key (signed string)
+    ▼
+write to /data/license.txt (or your chosen path)
+    │
+    ▼
+checkLicense() reloads, app sees Pro entitlements
+```
+
+This is the same architecture Keysat itself uses for its own
+self-licensing (cf section 17) and the same flow Recap implements
+in their Recap app's activation screen.
 
 ---
 
