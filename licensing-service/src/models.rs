@@ -186,6 +186,15 @@ pub struct Policy {
     /// `trial_days`.
     #[serde(default)]
     pub trial_days: i64,
+    /// Operator-defined ladder ordering for in-place tier upgrades
+    /// (migration 0013). Higher rank = better tier. Per-product space:
+    /// "free" → 0, "standard" → 1, "pro" → 2, "patron" → 3 etc.
+    /// `None` means the policy isn't part of any ladder — buyer-facing
+    /// upgrade endpoints reject changes that touch a NULL-rank policy
+    /// on either side. Admin endpoints can force-change to/from any
+    /// policy. See TIER_UPGRADES_DESIGN.md for the full semantics.
+    #[serde(default)]
+    pub tier_rank: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }

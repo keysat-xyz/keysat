@@ -22,6 +22,7 @@ pub mod rates;
 pub mod reconcile;
 pub mod subscriptions;
 pub mod tipping;
+pub mod upgrades;
 pub mod webhooks;
 
 /// Hex-encoded SHA-256 of a string — used everywhere we need a deterministic

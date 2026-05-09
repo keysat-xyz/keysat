@@ -2028,6 +2028,7 @@ async fn edit_policy_to_recurring_respects_tier_gate() {
         0,
         None,
         repo::RecurringConfig::off(),
+        None,
     )
     .await
     .expect("create_policy");
@@ -2137,6 +2138,7 @@ async fn seed_subscription(state: &AppState) -> (String, String, String) {
             grace_period_days: 7,
             trial_days: 0,
         },
+        None,
     )
     .await
     .expect("create_policy");

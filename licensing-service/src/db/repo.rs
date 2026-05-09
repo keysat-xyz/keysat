@@ -764,6 +764,7 @@ const POLICY_COLS: &str = "id, product_id, name, slug, duration_seconds, grace_s
                            max_machines, is_trial, price_sats_override,
                            entitlements_json, metadata_json, active, public,
                            is_recurring, renewal_period_days, grace_period_days, trial_days,
+                           tier_rank,
                            created_at, updated_at";
 
 /// Bundles the recurring-subscription knobs so we don't keep growing
@@ -807,6 +808,7 @@ pub async fn create_policy(
     tip_pct_bps: i64,
     tip_label: Option<&str>,
     recurring: RecurringConfig,
+    tier_rank: Option<i64>,
 ) -> AppResult<Policy> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -820,8 +822,9 @@ pub async fn create_policy(
             is_trial, price_sats_override, entitlements_json, metadata_json, active, public,
             tip_recipient, tip_pct_bps, tip_label,
             is_recurring, renewal_period_days, grace_period_days, trial_days,
+            tier_rank,
             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(product_id)
@@ -841,6 +844,7 @@ pub async fn create_policy(
     .bind(recurring.renewal_period_days)
     .bind(recurring.grace_period_days)
     .bind(recurring.trial_days)
+    .bind(tier_rank)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -923,6 +927,11 @@ pub struct RecurringUpdate {
     pub renewal_period_days: Option<i64>,
     pub grace_period_days: Option<i64>,
     pub trial_days: Option<i64>,
+    /// Tier-upgrade ladder rank. Outer Option = "did the patch touch
+    /// this field?", inner Option = the value (Some(n) sets a rank,
+    /// None removes it from the ladder). Mirrors the `price_sats_override`
+    /// nullable-patch pattern.
+    pub tier_rank: Option<Option<i64>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -976,6 +985,9 @@ pub async fn update_policy(
     if recurring.trial_days.is_some() {
         sets.push("trial_days = ?");
     }
+    if recurring.tier_rank.is_some() {
+        sets.push("tier_rank = ?");
+    }
     if sets.is_empty() {
         return get_policy_by_id(pool, id)
             .await?
@@ -1024,6 +1036,9 @@ pub async fn update_policy(
     }
     if let Some(v) = recurring.trial_days {
         q = q.bind(v);
+    }
+    if let Some(opt_r) = recurring.tier_rank {
+        q = q.bind(opt_r);
     }
     q = q.bind(&now).bind(id);
     let rows = q.execute(pool).await?.rows_affected();
@@ -1080,6 +1095,18 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
     let renewal_period_days: i64 = row.try_get("renewal_period_days").unwrap_or(0);
     let grace_period_days: i64 = row.try_get("grace_period_days").unwrap_or(7);
     let trial_days: i64 = row.try_get("trial_days").unwrap_or(0);
+    // tier_rank lands in migration 0013. The column is nullable —
+    // NULL = "policy not in any ladder", a valid state. We must
+    // ask sqlx to return Option<i64> directly so a NULL produces
+    // Ok(None) instead of decode-erroring out (which would also
+    // give us None via .ok(), but an error is the wrong signal
+    // for legitimate NULL data and would mask a real schema gap).
+    // For pre-0013 databases that lack the column, try_get errors
+    // with ColumnNotFound; .ok().flatten() collapses that to None.
+    let tier_rank: Option<i64> = row
+        .try_get::<Option<i64>, _>("tier_rank")
+        .ok()
+        .flatten();
     Policy {
         id: row.get("id"),
         product_id: row.get("product_id"),
@@ -1101,6 +1128,7 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
         renewal_period_days,
         grace_period_days,
         trial_days,
+        tier_rank,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

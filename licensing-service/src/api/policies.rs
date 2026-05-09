@@ -66,6 +66,12 @@ pub struct CreatePolicyReq {
     /// Optional free-trial length at the first cycle. 0 = no trial.
     #[serde(default)]
     pub trial_days: i64,
+    /// Operator-defined ladder rank for in-place tier upgrades.
+    /// `None` (or omitted) leaves the policy out of any ladder —
+    /// buyer-facing upgrade flows reject changes touching it.
+    /// Higher rank = better tier. See TIER_UPGRADES_DESIGN.md.
+    #[serde(default)]
+    pub tier_rank: Option<i64>,
 }
 
 fn default_max_machines() -> i64 {
@@ -185,6 +191,17 @@ pub async fn create(
         trial_days: req.trial_days,
     };
 
+    // Tier-rank validation: if set, must be 0..=1000 — high enough
+    // for any real ladder, low enough to keep arithmetic in i32 if
+    // we ever expose a tier-rank UI dropdown.
+    if let Some(r) = req.tier_rank {
+        if !(0..=1000).contains(&r) {
+            return Err(AppError::BadRequest(
+                "tier_rank must be between 0 and 1000".into(),
+            ));
+        }
+    }
+
     let policy = repo::create_policy(
         &state.db,
         &product.id,
@@ -201,6 +218,7 @@ pub async fn create(
         req.tip_pct_bps,
         tip_label,
         recurring,
+        req.tier_rank,
     )
     .await?;
     let _ = repo::insert_audit(
@@ -434,6 +452,13 @@ pub struct UpdatePolicyReq {
     pub grace_period_days: Option<i64>,
     #[serde(default)]
     pub trial_days: Option<i64>,
+    /// Tier-upgrade ladder rank. Outer Option = "did the patch
+    /// touch this field?", inner Option = the value. Use
+    /// `Some(Some(n))` to set, `Some(null)` to remove from the
+    /// ladder, omit to leave alone. Mirrors `price_sats_override`'s
+    /// nullable-patch pattern.
+    #[serde(default, deserialize_with = "deser_double_option_i64", skip_serializing_if = "Option::is_none")]
+    pub tier_rank: Option<Option<i64>>,
 }
 
 fn deser_double_option_i64<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
@@ -496,11 +521,23 @@ pub async fn update(
         }
     }
 
+    // Tier-rank: if the patch sets it, validate range. None-from-the-
+    // outer-Option means "leave alone"; Some(None) means "remove from
+    // ladder" and is always allowed.
+    if let Some(Some(r)) = req.tier_rank {
+        if !(0..=1000).contains(&r) {
+            return Err(AppError::BadRequest(
+                "tier_rank must be between 0 and 1000".into(),
+            ));
+        }
+    }
+
     let recurring_update = repo::RecurringUpdate {
         is_recurring: req.is_recurring,
         renewal_period_days: req.renewal_period_days,
         grace_period_days: req.grace_period_days,
         trial_days: req.trial_days,
+        tier_rank: req.tier_rank,
     };
 
     let updated = repo::update_policy(
