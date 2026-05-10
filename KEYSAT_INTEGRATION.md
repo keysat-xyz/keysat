@@ -1178,6 +1178,57 @@ selling tiered plans typically have:
 - A pro / paid tier with several (`unlimited_*`, premium features)
 - Optional Patron / supporter tier with all of Pro plus a `patron` badge
 
+### Entitlements catalog (v0.2.0:8+)
+
+Operators can declare a closed list of entitlements per product
+in admin (Products → Edit → "Entitlements catalog"). Each entry has
+three fields:
+
+```
+slug          name              description
+core          Core              Past the activation screen, basic features.
+ai_summaries  AI summaries      Auto-generate per-video summaries with GPT.
+library_io    Library I/O       Bulk import/export of saved summaries.
+```
+
+Once a catalog exists for a product, two things change:
+
+1. **The policy editor switches** from a free-text textarea to a
+   click-to-toggle bubble picker that only offers entitlements from
+   the catalog. The daemon enforces this at write time too (closed
+   list).
+2. **The buy page renders display names + descriptions** instead of
+   raw slugs. Buyers see "AI summaries" with the description as a
+   hover tooltip, never the underscore-laden `ai_summaries`.
+
+For your SDK integration, the catalog comes back on
+`GET /v1/products/<slug>/policies` (and equivalently
+`Client.listPublicPolicies()` in all four SDKs):
+
+```ts
+const { product, policies } = await client.listPublicPolicies(SLUG)
+// product.entitlementsCatalog is EntitlementDef[]:
+//   [{ slug: 'ai_summaries', name: 'AI summaries', description: '...' }, ...]
+//
+// Use it to render an in-app tier picker that shows the same human-
+// readable names the buy page does:
+function entitlementLabel(slug: string): string {
+  const def = product.entitlementsCatalog.find((e) => e.slug === slug)
+  return def?.name || slug.replace(/_/g, ' ')
+}
+```
+
+If the operator hasn't defined a catalog (legacy "free-text" mode),
+the array is empty and you fall back to rendering the raw slugs —
+or replacing underscores with spaces yourself for a quick polish.
+
+**Catalog stability rule**: once you ship gating logic that checks
+for entitlement `"export"`, the operator's catalog and policy
+references have to stay using `"export"`. Renaming the slug breaks
+existing licenses (which carry the old slug in their signed
+payload). Adding NEW entitlement slugs to the catalog is fine —
+just not renaming or deleting ones that licenses already reference.
+
 ---
 
 ## 9. Online validation (optional, recommended)

@@ -58,6 +58,26 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:8 — **Entitlements catalog on products.** Operators define each product\'s entitlements once with display names + descriptions; policies pick from that closed list with a click-to-toggle bubble picker; the buy page renders human-readable names ("AI summaries") with descriptions as tooltips, never the raw slug ("ai_summaries"). Existing products are auto-backfilled from the union of their policies\' current entitlements (with name = slug-with-underscores-stripped) — operator can edit afterward to add proper descriptions.',
+  '',
+  '**Admin UI changes.** Product create + edit forms gain an "Entitlements catalog" editor: repeating rows for slug + display name + description, with an "+ Add entitlement" button. Policy create + edit forms swap the free-text entitlements textarea for a row of clickable pill chips populated from the parent product\'s catalog — click each chip to toggle that entitlement on or off for the policy. Policies list table renders entitlement display names (resolved via catalog) instead of slugs.',
+  '',
+  '**Buy page rendering.** Tier cards now show display names with the description as a hover tooltip on each entitlement bullet. Falls back to raw-slug rendering for legacy entries that predate the catalog (no buy-page-side breakage on upgrade).',
+  '',
+  '**Closed-list enforcement.** Once a product has a non-empty catalog, policy create + update endpoints reject any entitlement slug that\'s not in the catalog with a clear error pointing at the right path ("add it to the product\'s entitlements catalog first"). Products without a catalog stay in legacy "free-text" mode where any string is accepted — back-compat preserved.',
+  '',
+  '**SDK support.** All four SDKs (`@keysat/licensing-client`, `keysat-licensing-client` Rust crate, `keysat-licensing-client` Python package, `keysat-client-go`) bumped to 0.3.0. `Client.listPublicPolicies()` response now includes `product.entitlementsCatalog` (camelCase TS / snake_case Rust + Python + Go) — an array of `{slug, name, description}` so SDK consumers\' in-app tier pickers can render the same human-readable names + tooltips the buy page does. Empty array on legacy products without a catalog.',
+  '',
+  '**Schema (migration 0014).** Adds `products.entitlements_catalog_json` (nullable). Auto-backfill per product: collect the distinct union of all entitlement slugs across the product\'s policies, build a catalog with `name = slug.replace("_", " ")` and empty description, write it. Products with no policy entitlements anywhere stay NULL (legacy mode preserved).',
+  '',
+  '**Documentation.** KEYSAT_INTEGRATION.md section 8 ("Picking entitlement names") gets a new subsection explaining the catalog: how the bubble picker works, how the buy page renders, how SDKs surface it, and the catalog-stability rule (renaming a slug breaks existing licenses).',
+  '',
+  '**Test count: 78** (was 77; +1 for `migration_0014_backfills_entitlements_catalog_from_policies`).',
+  '',
+  '**Upgrade path.** v0.2.0:7 → v0.2.0:8 is a drop-in. Migration 0014 is additive; auto-backfill runs at boot. No behavior change for operators who don\'t open the product editor — old free-text policy entitlements continue to work. Operators who open the editor see the catalog already populated from their policies\' existing entitlements; they can refine display names + add descriptions.',
+  '',
+  '**What\'s next (v0.2.0:9):** side-by-side card-grid policy authoring UI. The current "open a disclosure, fill a form, click Create, repeat" flow gets replaced by a tier-card grid where operators can see existing policies as buy-page-style cards alongside editable draft cards, with multiple drafts allowed simultaneously. Lands as its own focused release on top of this.',
+  '',
   '0.2.0:7 — Marketing-copy alignment. Package short and long descriptions now read "Bitcoin-native self-hosted licensing service for software creators" — matches keysat.xyz and the new positioning. Long description also calls out Zaprite (Bitcoin + cards), recurring subscriptions, and tier upgrades, all of which shipped in earlier :N revisions but weren\'t reflected in the registry listing. Same change applied to the daemon Cargo.toml description, repo READMEs, and the in-StartOS About panel for consistency. No code changes; pure copy.',
   '',
   '0.2.0:6 — **Recurring subs + trials + self-tier live refresh actually work now.** Major bug-and-UX-fix release driven by hands-on testing of v0.2.0:5. The recurring-sub feature shipped in :4 had a critical gap: buying a recurring policy issued a license but never created the corresponding subscription row, so the renewal worker never picked it up — purchases silently behaved like one-shots. The trial flow shipped with `trial_days` configurable in admin but the field had zero effect on the purchase path. And admin tier changes on the daemon\'s own license never propagated to the running daemon, making it impossible to test Creator-tier gates on the master Keysat. This release fixes all three plus a slate of UX papercuts found during testing.',
@@ -157,7 +177,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:7',
+  version: '0.2.0:8',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
