@@ -979,13 +979,34 @@ fn render_tier_picker(
                 .as_ref()
                 .map(|ip| ip.slug == p.slug)
                 .unwrap_or(false);
+            // If the product has an entitlements catalog, render
+            // each policy entitlement using the catalog's display
+            // name + description (as a tooltip). Falls back to the
+            // raw slug if the catalog is empty or the slug isn't in
+            // it (legacy slugs that predate the catalog land here).
             let entitlements_html = if p.entitlements.is_empty() {
                 String::new()
             } else {
+                let catalog = product.entitlements_catalog.as_deref().unwrap_or(&[]);
                 let lis: Vec<String> = p
                     .entitlements
                     .iter()
-                    .map(|e| format!("<li>{}</li>", html_escape(e)))
+                    .map(|slug| {
+                        let entry = catalog.iter().find(|e| &e.slug == slug);
+                        let display = entry
+                            .map(|e| if e.name.trim().is_empty() { e.slug.as_str() } else { e.name.as_str() })
+                            .unwrap_or(slug.as_str());
+                        let title_attr = entry
+                            .map(|e| e.description.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|d| format!(" title=\"{}\"", html_escape(d)))
+                            .unwrap_or_default();
+                        format!(
+                            "<li{}>{}</li>",
+                            title_attr,
+                            html_escape(display),
+                        )
+                    })
                     .collect();
                 format!("<ul class=\"tier-entitlements\">{}</ul>", lis.join(""))
             };

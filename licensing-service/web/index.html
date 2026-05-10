@@ -1102,6 +1102,7 @@ The request will be refused if there are licenses or invoices tied to it — use
     })
     const nameField = formInput('e_p_name', 'Display name', { value: p.name || '', required: true })
     const descField = formInput('e_p_description', 'Description', { textarea: true, value: p.description || '' })
+    const editCatalog = catalogEditor(p.entitlements_catalog || null)
 
     // Currency-aware price inputs. For SAT-currency products, show
     // the integer sat amount. For USD/EUR, render the cents value
@@ -1152,6 +1153,12 @@ The request will be refused if there are licenses or invoices tied to it — use
       el('label', { style: 'display:block; font-weight:600; font-size:13px; margin:12px 0 4px' }, 'Price'),
       el('div', { style: 'display:flex; gap:8px; align-items:flex-start' }, [priceInput, curPicker]),
       hint,
+      // Entitlements catalog — pre-filled from the loaded product.
+      // Operator can edit/add/remove rows; submit sends the full
+      // current catalog (closed list semantics).
+      el('div', { style: 'margin-top:18px; padding-top:14px; border-top:1px dashed var(--border-1)' }, [
+        editCatalog.element,
+      ]),
       status,
       el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
         el('button', { class: 'btn primary', onclick: async function () {
@@ -1166,6 +1173,12 @@ The request will be refused if there are licenses or invoices tied to it — use
               price_currency: currency,
               price_value: Math.max(0, priceValue),
             }
+            // Always send the catalog on edit so the operator can
+            // also CLEAR it (empty editor → null → drops back to
+            // free-text mode). The double-Option PATCH shape on
+            // the server treats null as "set to NULL", absent as
+            // "leave alone".
+            body.entitlements_catalog = editCatalog.read()
             await api('/v1/admin/products/' + p.id, { method: 'PATCH', body })
             overlay.remove()
             routes.products()
@@ -1215,6 +1228,7 @@ The request will be refused if there are licenses or invoices tied to it — use
             : 'Euros — converted to BTC at invoice creation. Buyer pays the locked-in BTC amount.'
       }
     })
+    const createCatalog = catalogEditor(null)
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new product'),
       el('div', { class: 'body' }, [
@@ -1227,6 +1241,11 @@ The request will be refused if there are licenses or invoices tied to it — use
           currencyPicker,
         ]),
         priceHint,
+        // Entitlements catalog — closed list of slugs the product
+        // offers. Policies pick from this list. See catalogEditor().
+        el('div', { style: 'margin-top:18px; padding-top:14px; border-top:1px dashed var(--border-1)' }, [
+          createCatalog.element,
+        ]),
         el('button', { class: 'btn primary', style: 'margin-top:16px' }, 'Create product').addEventListener
           ? null : null, // dummy; the real button is below for clarity
         (() => {
@@ -1243,14 +1262,17 @@ The request will be refused if there are licenses or invoices tied to it — use
               // SAT/BTC are sat-denominated already; USD/EUR are
               // entered as decimal amounts and converted to cents.
               const priceValue = currency === 'SAT' ? Math.round(rawValue) : Math.round(rawValue * 100)
-              await api('/v1/admin/products', { method: 'POST', body: {
+              const catalog = createCatalog.read()
+              const body = {
                 slug: create.querySelector('[name=slug]').value.trim(),
                 name: create.querySelector('[name=name]').value.trim(),
                 description: create.querySelector('[name=description]').value || '',
                 price_currency: currency,
                 price_value: priceValue,
                 metadata: {},
-              }})
+              }
+              if (catalog) body.entitlements_catalog = catalog
+              await api('/v1/admin/products', { method: 'POST', body })
               status.replaceWith(ok('Created. Reloading…'))
               setTimeout(routes.products, 600)
             } catch (e) {
@@ -1564,11 +1586,29 @@ The request will be refused if there are licenses or invoices tied to it — use
     const machinesField = formInput('e_pol_machines', 'Max devices (0 = unlimited)', {
       type: 'number', value: String(pol.max_machines == null ? 1 : pol.max_machines),
     })
-    const entField = formInput('e_pol_entitlements', 'Entitlements (one per line, or comma-separated)', {
-      textarea: true,
-      value: (pol.entitlements || []).join('\n'),
-      hint: 'Examples: self_host, ai_summaries, export. No quotes or brackets.',
-    })
+    // Entitlements input: bubble picker against the product's catalog
+    // (closed-list mode) when one exists, else legacy free-text
+    // textarea. The picker pre-selects the policy's current
+    // entitlements; the textarea pre-fills with one slug per line.
+    const editCatalog_pol = (prod && prod.entitlements_catalog) || []
+    const entField = (() => {
+      const host = el('div', { 'data-ent-host': '1' })
+      if (editCatalog_pol.length > 0) {
+        const picker = entitlementBubblePicker(editCatalog_pol, pol.entitlements || [])
+        host.appendChild(picker.element)
+        host._read = picker.read
+        host._mode = 'bubbles'
+      } else {
+        const fallback = formInput('e_pol_entitlements', 'Entitlements (one per line, or comma-separated)', {
+          textarea: true,
+          value: (pol.entitlements || []).join('\n'),
+          hint: 'Examples: self_host, ai_summaries, export. No quotes or brackets.',
+        })
+        host.appendChild(fallback)
+        host._mode = 'textarea'
+      }
+      return host
+    })()
     const highlightField = formCheckbox('e_pol_highlight', 'Mark as "Most popular" on the tier picker')
     if (highlight) setTimeout(() => {
       const cb = card.querySelector('[name=e_pol_highlight]')
@@ -1676,10 +1716,19 @@ The request will be refused if there are licenses or invoices tied to it — use
             const duration_seconds = presetV === 'custom' ? customV : parseInt(presetV, 10)
             const grace_days = parseInt(card.querySelector('[name=e_pol_grace]').value, 10) || 0
             const grace_seconds = grace_days * 86400
-            const rawEnts = card.querySelector('[name=e_pol_entitlements]').value || ''
-            const ents = Array.from(new Set(
-              rawEnts.replace(/[\[\]"'`]/g, '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
-            ))
+            // Read from whichever mode the entitlements host is in
+            // (bubble picker vs textarea fallback). _read is set by
+            // entitlementBubblePicker; absence = textarea.
+            const entHost = card.querySelector('[data-ent-host]')
+            let ents
+            if (entHost && entHost._mode === 'bubbles' && entHost._read) {
+              ents = entHost._read()
+            } else {
+              const rawEnts = card.querySelector('[name=e_pol_entitlements]').value || ''
+              ents = Array.from(new Set(
+                rawEnts.replace(/[\[\]"'`]/g, '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
+              ))
+            }
             const newDescription = (card.querySelector('[name=e_pol_description]').value || '').trim()
             const newHighlight = card.querySelector('[name=e_pol_highlight]').checked
             // Preserve any other metadata keys we don't manage in the form.
@@ -1779,6 +1828,12 @@ The request will be refused if there are licenses or invoices tied to it — use
     // Price for a given product slug. Used to prefill the override field
     // when the operator picks a product from the dropdown.
     const PRODUCT_PRICE_BY_SLUG = Object.fromEntries(products.map((p) => [p.slug, p.price_sats]))
+    // Each product's entitlements catalog (migration 0014). Drives
+    // the closed-list bubble picker on the policy form. Empty / null
+    // catalog = legacy free-text textarea fallback.
+    const PRODUCT_CATALOG_BY_SLUG = Object.fromEntries(
+      products.map((p) => [p.slug, p.entitlements_catalog || []])
+    )
     const initialProductSlug = products[0] ? products[0].slug : ''
     const initialProductPrice = PRODUCT_PRICE_BY_SLUG[initialProductSlug] || 0
 
@@ -1835,11 +1890,29 @@ The request will be refused if there are licenses or invoices tied to it — use
           }),
         ]),
 
-        // Entitlements — textarea, one-per-line OR comma-separated. No JSON brackets, no quotes.
-        formInput('entitlements', 'Entitlements (one per line, or comma-separated)', {
-          textarea: true,
-          hint: 'Plain words. Examples: core, ai_summaries, export, recurring_billing, card_payments. These get baked into the signed license key; your software checks for them with `entitlements.has("ai_summaries")` to decide what to unlock. Don\'t add quotes or brackets — the form does that for you.',
-        }),
+        // Entitlements input — swaps based on product's catalog:
+        //   - Closed list (catalog has entries): bubble multi-select
+        //   - Legacy / no catalog: free-text textarea
+        // Rebuilt on product-change so the picker reflects the
+        // chosen product's catalog.
+        (() => {
+          const host = el('div', { 'data-ent-host': '1' })
+          const initial = PRODUCT_CATALOG_BY_SLUG[initialProductSlug] || []
+          if (initial.length > 0) {
+            const picker = entitlementBubblePicker(initial, [])
+            host.appendChild(picker.element)
+            host._read = picker.read
+            host._mode = 'bubbles'
+          } else {
+            const fallback = formInput('entitlements', 'Entitlements (one per line, or comma-separated)', {
+              textarea: true,
+              hint: 'Plain words. Examples: core, ai_summaries. Define them on the parent product\'s catalog to switch to a click-to-pick picker (recommended).',
+            })
+            host.appendChild(fallback)
+            host._mode = 'textarea'
+          }
+          return host
+        })(),
 
         el('div', { class: 'row-2' }, [
           formCheckbox('mark_highlight', 'Mark as "Most popular" (gold pill on tier picker)'),
@@ -1914,16 +1987,24 @@ The request will be refused if there are licenses or invoices tied to it — use
           const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
           create.querySelector('.body').appendChild(status)
           try {
-            // Entitlements: split on newlines OR commas, trim, dedupe, drop empties.
-            // Also strip any quotes/brackets a paranoid operator might have typed.
-            const rawEnts = create.querySelector('[name=entitlements]').value || ''
-            const ents = Array.from(new Set(
-              rawEnts
-                .replace(/[\[\]"'`]/g, '') // strip JSON noise if pasted
-                .split(/[\n,]/)
-                .map((s) => s.trim())
-                .filter(Boolean)
-            ))
+            // Entitlements: read either from the bubble picker
+            // (when the product has a catalog) or the legacy
+            // free-text textarea. _read is set on the host by
+            // entitlementBubblePicker; absence = textarea mode.
+            const entHost = create.querySelector('[data-ent-host]')
+            let ents = []
+            if (entHost && entHost._mode === 'bubbles' && entHost._read) {
+              ents = entHost._read()
+            } else {
+              const rawEnts = create.querySelector('[name=entitlements]').value || ''
+              ents = Array.from(new Set(
+                rawEnts
+                  .replace(/[\[\]"'`]/g, '') // strip JSON noise if pasted
+                  .split(/[\n,]/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              ))
+            }
 
             // Duration: preset wins unless "custom" selected.
             const preset = create.querySelector('[name=duration_preset]').value
@@ -2059,6 +2140,27 @@ The request will be refused if there are licenses or invoices tied to it — use
         priceFieldEl.value = String(newPrice)
       }
       lastPrefilledPrice = String(newPrice)
+
+      // Rebuild the entitlements picker to reflect the new product's
+      // catalog (bubbles vs textarea fallback).
+      const host = create.querySelector('[data-ent-host]')
+      if (host) {
+        host.innerHTML = ''
+        const cat = PRODUCT_CATALOG_BY_SLUG[newSlug] || []
+        if (cat.length > 0) {
+          const picker = entitlementBubblePicker(cat, [])
+          host.appendChild(picker.element)
+          host._read = picker.read
+          host._mode = 'bubbles'
+        } else {
+          const fallback = formInput('entitlements', 'Entitlements (one per line, or comma-separated)', {
+            textarea: true,
+            hint: 'Plain words. Examples: core, ai_summaries. Define them on the parent product\'s catalog to switch to a click-to-pick picker (recommended).',
+          })
+          host.appendChild(fallback)
+          host._mode = 'textarea'
+        }
+      }
     })
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' },
@@ -2120,7 +2222,21 @@ The request will be refused if there are licenses or invoices tied to it — use
                     : null,
                 ].filter(Boolean))
               : el('span', { class: 'muted' }, '–')),
-          el('td', { class: 'muted' }, (pol.entitlements || []).join(', ') || '–'),
+          el('td', { class: 'muted' }, (() => {
+            // Render entitlement display names from the product's
+            // catalog when available, falling back to the slug
+            // verbatim. Tooltip shows the slug + description for
+            // operator reference.
+            const ents = pol.entitlements || []
+            if (ents.length === 0) return '–'
+            const cat = (p.entitlements_catalog || [])
+            return ents
+              .map((slug) => {
+                const entry = cat.find((c) => c.slug === slug)
+                return entry && entry.name ? entry.name : slug
+              })
+              .join(', ')
+          })()),
           el('td', null, el('span', { class: 'muted' }, String(byPolicy[pol.id] || 0))),
           el('td', null, activePill(pol.active)),
           el('td', null, pol.public
@@ -3129,6 +3245,156 @@ The request will be refused if there are licenses or invoices tied to it — use
       cb,
       el('label', { class: 'lbl', for: id, style: 'margin:0' }, label),
     ])
+  }
+
+  /**
+   * Repeating-row editor for the product entitlements catalog
+   * (migration 0014). Operator declares the closed list of
+   * {slug, name, description} the product offers, then policies
+   * pick from this list rather than free-typing entitlement strings.
+   *
+   * Usage:
+   *   const editor = catalogEditor(initialCatalog)  // array or null
+   *   container.appendChild(editor.element)
+   *   // later, on submit:
+   *   const catalog = editor.read()  // returns array of {slug, name, description}
+   *   //                                    or null when the operator left it empty
+   *
+   * Empty editor = null (caller can treat that as "leave field alone"
+   * or "clear catalog" depending on context). Whitespace-only slugs
+   * are dropped silently. Validation (lowercase, ASCII, unique) is
+   * server-side; the UI just shows a hint.
+   */
+  function catalogEditor(initial) {
+    const rowsHost = el('div', { style: 'display:flex; flex-direction:column; gap:8px' })
+    const addRow = (slug, name, description) => {
+      const row = el('div', {
+        class: 'catalog-row',
+        style: 'display:grid; grid-template-columns: 1fr 1fr 1.6fr auto; gap:6px; align-items:flex-start',
+      }, [
+        el('input', {
+          class: 'input', placeholder: 'slug',
+          value: slug || '',
+          'data-field': 'slug',
+        }),
+        el('input', {
+          class: 'input', placeholder: 'Display name',
+          value: name || '',
+          'data-field': 'name',
+        }),
+        el('input', {
+          class: 'input', placeholder: 'Description (shown on buy page tooltip)',
+          value: description || '',
+          'data-field': 'description',
+        }),
+        (() => {
+          const btn = el('button', {
+            type: 'button',
+            class: 'btn sm danger',
+            title: 'Remove this entitlement',
+            style: 'padding:6px 10px',
+          }, '×')
+          btn.addEventListener('click', () => row.remove())
+          return btn
+        })(),
+      ])
+      rowsHost.appendChild(row)
+    }
+    if (Array.isArray(initial) && initial.length > 0) {
+      initial.forEach((e) => addRow(e.slug, e.name, e.description))
+    }
+    const addBtn = el('button', {
+      type: 'button',
+      class: 'btn sm secondary',
+      style: 'margin-top:6px; align-self:flex-start',
+    }, '+ Add entitlement')
+    addBtn.addEventListener('click', () => addRow('', '', ''))
+
+    const wrap = el('div', { style: 'display:flex; flex-direction:column' }, [
+      el('div', { class: 'lbl', style: 'margin-bottom:4px' }, 'Entitlements catalog'),
+      el('div', { class: 'muted', style: 'font-size:12px; margin-bottom:8px' },
+        'Declare the entitlements this product offers (e.g. "core", "ai_summaries"). ' +
+        'Policies will pick from this list — buyers see the display name + description, ' +
+        'never the raw slug. Leave empty to use the legacy free-text mode (any string allowed).'),
+      rowsHost,
+      addBtn,
+    ])
+    return {
+      element: wrap,
+      read: function () {
+        const out = []
+        rowsHost.querySelectorAll('.catalog-row').forEach((row) => {
+          const slug = row.querySelector('[data-field=slug]').value.trim()
+          if (!slug) return
+          const name = row.querySelector('[data-field=name]').value.trim()
+          const description = row.querySelector('[data-field=description]').value.trim()
+          out.push({ slug, name: name || slug, description })
+        })
+        return out.length > 0 ? out : null
+      },
+    }
+  }
+
+  /**
+   * Bubble multi-select for picking entitlements off a product's
+   * catalog. Renders one clickable pill per catalog entry; click to
+   * toggle selected state. Hover shows the description.
+   *
+   * Used in the policy create + edit forms when the parent product
+   * has a non-empty catalog (closed-list mode). When the catalog is
+   * empty, callers fall back to the legacy free-text textarea.
+   *
+   *   const picker = entitlementBubblePicker(catalog, ['core', 'pro'])
+   *   container.appendChild(picker.element)
+   *   const slugs = picker.read()  // -> ['core', 'pro']
+   */
+  function entitlementBubblePicker(catalog, initialSelection) {
+    const selected = new Set(Array.isArray(initialSelection) ? initialSelection : [])
+    const host = el('div', {
+      style: 'display:flex; flex-wrap:wrap; gap:6px; margin-top:4px',
+    })
+    const pills = []
+    function renderPill(entry) {
+      const isSel = selected.has(entry.slug)
+      const pill = el('button', {
+        type: 'button',
+        title: entry.description || entry.slug,
+        'data-slug': entry.slug,
+        style:
+          'padding:6px 12px; border-radius:999px; cursor:pointer; ' +
+          'font-family:var(--font-body); font-size:13px; font-weight:500; ' +
+          'transition:all 100ms; ' +
+          (isSel
+            ? 'background:var(--gold-500); color:var(--navy-950); border:1px solid var(--gold-500); '
+            : 'background:transparent; color:var(--ink-700); border:1px solid var(--border-2); '),
+      }, entry.name || entry.slug)
+      pill.addEventListener('click', () => {
+        if (selected.has(entry.slug)) {
+          selected.delete(entry.slug)
+        } else {
+          selected.add(entry.slug)
+        }
+        // Re-style only this pill rather than re-rendering the host.
+        const nowSel = selected.has(entry.slug)
+        pill.style.background = nowSel ? 'var(--gold-500)' : 'transparent'
+        pill.style.color = nowSel ? 'var(--navy-950)' : 'var(--ink-700)'
+        pill.style.borderColor = nowSel ? 'var(--gold-500)' : 'var(--border-2)'
+      })
+      pills.push(pill)
+      host.appendChild(pill)
+    }
+    ;(catalog || []).forEach(renderPill)
+
+    const wrap = el('div', { class: 'field' }, [
+      el('label', { class: 'lbl' }, 'Entitlements'),
+      el('div', { class: 'muted', style: 'font-size:12px; margin-bottom:6px' },
+        'Click each entitlement this tier should grant. Defined on the parent product\'s catalog.'),
+      host,
+    ])
+    return {
+      element: wrap,
+      read: () => Array.from(selected),
+    }
   }
 
   // ---------- nav + auth ----------

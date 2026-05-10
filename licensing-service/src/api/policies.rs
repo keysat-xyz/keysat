@@ -123,6 +123,36 @@ fn validate_recurring(
     Ok(())
 }
 
+/// Closed-list validation for policy entitlements (migration 0014).
+/// When the product has a non-empty entitlements catalog, every slug
+/// referenced by the policy must appear in that catalog. Products
+/// with no catalog (NULL or empty) accept any free-text entitlement
+/// — that's the legacy mode preserved for back-compat.
+fn validate_entitlements_against_catalog(
+    product: &crate::models::Product,
+    entitlements: &[String],
+) -> AppResult<()> {
+    let Some(catalog) = product.entitlements_catalog.as_ref() else {
+        return Ok(());
+    };
+    if catalog.is_empty() {
+        return Ok(());
+    }
+    let known: std::collections::HashSet<&str> =
+        catalog.iter().map(|e| e.slug.as_str()).collect();
+    for slug in entitlements {
+        if !known.contains(slug.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "entitlement '{slug}' is not in product '{}' catalog. \
+                 Add it to the product's entitlements catalog first, or \
+                 clear the catalog to drop back to free-text mode.",
+                product.slug
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -201,6 +231,12 @@ pub async fn create(
             ));
         }
     }
+
+    // Closed-list validation: if the product has a non-empty
+    // entitlements catalog, every requested entitlement slug must
+    // appear in that catalog. Products without a catalog stay in
+    // legacy "free-text" mode where any string is accepted.
+    validate_entitlements_against_catalog(&product, &req.entitlements)?;
 
     let policy = repo::create_policy(
         &state.db,
@@ -532,6 +568,20 @@ pub async fn update(
         }
     }
 
+    // Closed-list validation: if the patch supplies a new entitlements
+    // list AND the parent product has a non-empty catalog, every
+    // entitlement slug must appear in the catalog. Look up the
+    // policy → product chain to do the check.
+    if let Some(new_ents) = req.entitlements.as_deref() {
+        let policy = repo::get_policy_by_id(&state.db, &id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("policy '{id}'")))?;
+        let product = repo::get_product_by_id(&state.db, &policy.product_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("product '{}'", policy.product_id)))?;
+        validate_entitlements_against_catalog(&product, new_ents)?;
+    }
+
     let recurring_update = repo::RecurringUpdate {
         is_recurring: req.is_recurring,
         renewal_period_days: req.renewal_period_days,
@@ -671,12 +721,23 @@ pub async fn list_public_policies(
         })
         .collect();
 
+    // Surface the entitlements catalog so the buy page (and SDK
+    // consumers' in-app tier pickers) can render display names and
+    // descriptions instead of raw slugs. Empty/None falls through
+    // to the buyer's app rendering slugs verbatim — same as today.
+    let entitlements_catalog = product
+        .entitlements_catalog
+        .as_ref()
+        .map(|cat| serde_json::to_value(cat).unwrap_or_else(|_| json!([])))
+        .unwrap_or_else(|| json!([]));
+
     Ok(Json(json!({
         "product": {
             "slug": product.slug,
             "name": product.name,
             "description": product.description,
             "base_price_sats": product.price_sats,
+            "entitlements_catalog": entitlements_catalog,
         },
         "policies": policies_json,
     })))

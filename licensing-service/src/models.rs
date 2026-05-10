@@ -27,8 +27,32 @@ pub struct Product {
     pub active: bool,
     /// Arbitrary JSON metadata the developer can attach.
     pub metadata: serde_json::Value,
+    /// Per-product entitlements catalog (migration 0014). Defines the
+    /// closed list of entitlement slugs the product offers, with
+    /// human-readable display names + descriptions used by the buy
+    /// page and SDK consumers. None = "free-text mode" (legacy
+    /// behavior); operators can opt-in by adding rows.
+    #[serde(default)]
+    pub entitlements_catalog: Option<Vec<EntitlementDef>>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One entry in a product's entitlements catalog. Operator defines
+/// these once per product; policies reference them by slug.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntitlementDef {
+    /// Stable identifier — what gets baked into the signed license
+    /// payload + checked by the SDK's `hasEntitlement(slug)` calls.
+    /// Must be ASCII, lowercase, no spaces (operator's responsibility).
+    pub slug: String,
+    /// Human-readable label rendered on the buy page tier cards
+    /// (e.g. "AI summaries"). Falls back to the slug if empty.
+    pub name: String,
+    /// Optional one-sentence description shown as a tooltip / sub-line
+    /// on the buy page. Empty when operator hasn't filled it in.
+    #[serde(default)]
+    pub description: String,
 }
 
 fn default_currency() -> String {

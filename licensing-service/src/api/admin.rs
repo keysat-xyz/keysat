@@ -93,6 +93,13 @@ pub struct CreateProductReq {
     pub price_value: Option<i64>,
     #[serde(default)]
     pub metadata: Value,
+    /// Entitlements catalog (migration 0014). Closed list of
+    /// {slug, name, description} the operator declares the product
+    /// offers. Policies must reference slugs from this catalog at
+    /// write time. Omit / leave null to keep "free-text" mode where
+    /// policies can carry any entitlement string.
+    #[serde(default)]
+    pub entitlements_catalog: Option<Vec<crate::models::EntitlementDef>>,
 }
 
 /// Currencies the admin endpoints accept. Whitelist enforced here so
@@ -189,6 +196,15 @@ pub async fn create_product(
         &metadata,
     )
     .await?;
+    // Apply the entitlements catalog (if any) as a follow-up. Done
+    // separately so the create_product_with_currency signature stays
+    // narrow and the catalog edit path (set_product_entitlements_catalog)
+    // is reused for both create + edit.
+    let product = if let Some(catalog) = req.entitlements_catalog.as_deref() {
+        repo::set_product_entitlements_catalog(&state.db, &product.id, Some(catalog)).await?
+    } else {
+        product
+    };
     let _ = repo::insert_audit(
         &state.db,
         "admin_api_key",
@@ -406,6 +422,27 @@ pub struct UpdateProductReq {
     pub price_currency: Option<String>,
     #[serde(default)]
     pub price_value: Option<i64>,
+    /// Replace the entitlements catalog. `Some(vec)` sets it,
+    /// `Some(empty vec)` clears it (drops back to free-text mode),
+    /// omit / `None` to leave alone. Note: clearing is potentially
+    /// destructive — existing policies that reference now-orphaned
+    /// slugs keep working but new policies / edits will accept any
+    /// string until the catalog is set again.
+    #[serde(default, deserialize_with = "deser_double_option_catalog", skip_serializing_if = "Option::is_none")]
+    pub entitlements_catalog: Option<Option<Vec<crate::models::EntitlementDef>>>,
+}
+
+/// Serde adapter — distinguishes "field omitted" (None) from
+/// "field supplied as null" (Some(None)) from "field supplied with
+/// value" (Some(Some(...))). Same nullable-patch shape used for
+/// price_sats_override on policies.
+fn deser_double_option_catalog<'de, D>(
+    de: D,
+) -> Result<Option<Option<Vec<crate::models::EntitlementDef>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<crate::models::EntitlementDef>>::deserialize(de).map(Some)
 }
 
 pub async fn update_product(
@@ -477,6 +514,18 @@ pub async fn update_product(
         pricing_patch.as_ref().map(|(c, v)| (c.as_str(), *v)),
     )
     .await?;
+    // If the patch touched entitlements_catalog, apply it as a
+    // separate UPDATE. Some(Some(vec)) sets, Some(Some(empty vec))
+    // and Some(None) both clear (drop back to free-text mode).
+    let updated = match &req.entitlements_catalog {
+        Some(Some(catalog)) => {
+            repo::set_product_entitlements_catalog(&state.db, &id, Some(catalog.as_slice())).await?
+        }
+        Some(None) => {
+            repo::set_product_entitlements_catalog(&state.db, &id, None).await?
+        }
+        None => updated,
+    };
     let _ = repo::insert_audit(
         &state.db,
         "admin_api_key",

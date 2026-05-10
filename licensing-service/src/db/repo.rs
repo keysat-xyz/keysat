@@ -243,6 +243,64 @@ pub async fn update_product_with_currency(
         .ok_or_else(|| AppError::NotFound(format!("product {id}")))
 }
 
+/// Set the product's entitlements catalog (migration 0014). Pass
+/// `Some(vec)` to replace the catalog, `Some(empty vec)` to clear it
+/// (closed-list rules drop back to free-text mode), or call this with
+/// `None` to set the column to NULL.
+///
+/// Validates: slugs must be ASCII, lowercase, non-empty, and unique
+/// within the catalog. Names default to the slug if empty.
+pub async fn set_product_entitlements_catalog(
+    pool: &SqlitePool,
+    product_id: &str,
+    catalog: Option<&[crate::models::EntitlementDef]>,
+) -> AppResult<Product> {
+    if let Some(items) = catalog {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for item in items {
+            if item.slug.trim().is_empty() {
+                return Err(AppError::BadRequest(
+                    "entitlement slug cannot be empty".into(),
+                ));
+            }
+            if !item
+                .slug
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                return Err(AppError::BadRequest(format!(
+                    "entitlement slug '{}' must be ASCII lowercase, digits, or underscore only",
+                    item.slug
+                )));
+            }
+            if !seen.insert(item.slug.as_str()) {
+                return Err(AppError::BadRequest(format!(
+                    "duplicate entitlement slug '{}'",
+                    item.slug
+                )));
+            }
+        }
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let value: Option<String> = match catalog {
+        Some(items) if items.is_empty() => None,
+        Some(items) => Some(serde_json::to_string(items).unwrap_or_else(|_| "[]".into())),
+        None => None,
+    };
+    sqlx::query(
+        "UPDATE products SET entitlements_catalog_json = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(value.as_deref())
+    .bind(&now)
+    .bind(product_id)
+    .execute(pool)
+    .await?;
+    get_product_by_id(pool, product_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("product {product_id}")))
+}
+
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
     let metadata_json: String = row.try_get("metadata_json")?;
     let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap_or_default();
@@ -258,6 +316,16 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
     let price_value: i64 = row
         .try_get("price_value")
         .unwrap_or(price_sats_value);
+    // entitlements_catalog_json lands in migration 0014. NULL =
+    // legacy "free-text" mode (no catalog defined). Empty array
+    // and parse failures both collapse to None so the API layer
+    // can treat them uniformly.
+    let entitlements_catalog: Option<Vec<crate::models::EntitlementDef>> = row
+        .try_get::<Option<String>, _>("entitlements_catalog_json")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<crate::models::EntitlementDef>>(&s).ok())
+        .filter(|v| !v.is_empty());
     Ok(Product {
         id: row.try_get("id")?,
         slug: row.try_get("slug")?,
@@ -268,6 +336,7 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
         price_value,
         active: active_int != 0,
         metadata,
+        entitlements_catalog,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
