@@ -58,6 +58,20 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:9 — **Side-by-side tier-card policy authoring + form polish.** The Policies tab\'s table view is gone — replaced with a card grid where each existing policy renders as a buy-page-style tier card sitting alongside a dashed "+ Add tier" placeholder. Click the placeholder and it morphs into an editable draft card with form fields inline; submit "Create" on the card and it flips back to a read-only tier preview. **Multiple drafts can coexist** in the same product\'s grid, so operators can author Core / Pro / Patron in parallel and visually compare what each will look like to a buyer before committing any of them. Same visual language as the buy page, so what you see while authoring is what buyers see.',
+  '',
+  '**Form polish.** New `helpIcon()` helper renders a small "?" hover-tooltip next to field labels — replaces the verbose hint text under inputs that was making forms feel cluttered. Applied first to the product create form (Display name → Slug → Description → Price all use help icons now); spread to other forms incrementally over follow-up releases.',
+  '',
+  '**Auto-slug from display name.** Type "Bitcoin Ticker Pro" into the new product form\'s Display name field and the Slug field auto-fills with `bitcoin-ticker-pro` as you type. Operators can still override; the auto-fill stops mirroring once they edit the slug manually. Cuts a step out of the most common product-creation path.',
+  '',
+  '**Legacy create-policy disclosure removed from the UI.** The "Create a new policy" form that used to sit at the top of the Policies tab is gone — the card grid below replaces it for all common authoring. Advanced fields (custom grace period, tip recipient, tier rank) still live on the existing Edit modal of any committed tier card; create-the-basics-then-edit-for-advanced is the new flow.',
+  '',
+  '**No code surface change for SDKs or buy page.** This release is admin-side UX only. The catalog work shipped in v0.2.0:8 still applies (closed-list bubble pickers, display-name rendering); the new draft cards just package those into a more usable authoring flow.',
+  '',
+  '**Test count: 78** (unchanged from :8 — UI-only release).',
+  '',
+  '**Upgrade path.** v0.2.0:8 → v0.2.0:9 is a drop-in. No schema changes, no SDK changes. Operators see the new card-grid layout the next time they open the Policies tab.',
+  '',
   '0.2.0:8 — **Entitlements catalog on products.** Operators define each product\'s entitlements once with display names + descriptions; policies pick from that closed list with a click-to-toggle bubble picker; the buy page renders human-readable names ("AI summaries") with descriptions as tooltips, never the raw slug ("ai_summaries"). Existing products are auto-backfilled from the union of their policies\' current entitlements (with name = slug-with-underscores-stripped) — operator can edit afterward to add proper descriptions.',
   '',
   '**Admin UI changes.** Product create + edit forms gain an "Entitlements catalog" editor: repeating rows for slug + display name + description, with an "+ Add entitlement" button. Policy create + edit forms swap the free-text entitlements textarea for a row of clickable pill chips populated from the parent product\'s catalog — click each chip to toggle that entitlement on or off for the policy. Policies list table renders entitlement display names (resolved via catalog) instead of slugs.',
@@ -177,7 +191,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:8',
+  version: '0.2.0:9',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

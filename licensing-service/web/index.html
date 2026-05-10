@@ -680,6 +680,45 @@ The request will be refused if there are licenses or invoices tied to it — use
   function err(msg) { return el('div', { class: 'err' }, msg) }
   function ok(msg) { return el('div', { class: 'ok' }, msg) }
 
+  /**
+   * Inline help affordance — small "?" icon that shows the given
+   * text in a hover tooltip. Used in form labels to replace the
+   * verbose hint text that was making create / edit forms feel
+   * cluttered. Usage:
+   *
+   *   el('label', null, ['Slug', helpIcon('lowercase, hyphens-not-spaces')])
+   *
+   * The tooltip uses the browser's native title attribute — works
+   * everywhere, no JS, accessible to screen readers.
+   */
+  function helpIcon(text) {
+    return el('span', {
+      class: 'help-icon',
+      title: text,
+      tabindex: '0',
+      'aria-label': text,
+      style:
+        'display:inline-flex; align-items:center; justify-content:center; ' +
+        'width:14px; height:14px; border-radius:50%; ' +
+        'background:var(--ink-500); color:var(--cream-50); ' +
+        'font-size:10px; font-weight:700; font-family:var(--font-body); ' +
+        'cursor:help; margin-left:6px; user-select:none; flex:none;',
+    }, '?')
+  }
+
+  /** Slugify a display name into a URL-safe slug. Used by the
+   * auto-slug feature on the product create form. */
+  function slugify(s) {
+    return (s || '')
+      .toString()
+      .toLowerCase()
+      .trim()
+      .replace(/['"’]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 64)
+  }
+
   function fmtDate(s) {
     if (!s) return ''
     try { return new Date(s).toLocaleString() } catch (_) { return s }
@@ -1232,9 +1271,21 @@ The request will be refused if there are licenses or invoices tied to it — use
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new product'),
       el('div', { class: 'body' }, [
-        formInput('slug', 'Slug', { required: true, hint: 'lowercase, hyphens, e.g. "bitcoin-ticker-pro"' }),
-        formInput('name', 'Display name', { required: true }),
-        formInput('description', 'Description', { textarea: true }),
+        // Name first — the slug field auto-derives from this as the
+        // operator types, so they only fill in one of them in the
+        // common case. Help icons replace the verbose hint copy.
+        formInput('name', 'Display name', {
+          required: true,
+          help: 'What buyers see on the buy page (e.g. "Bitcoin Ticker Pro").',
+        }),
+        formInput('slug', 'Slug', {
+          required: true,
+          help: 'Stable URL part — buyers see this in /buy/<slug>. Auto-fills from the display name; edit if needed. Lowercase letters, digits, hyphens.',
+        }),
+        formInput('description', 'Description', {
+          textarea: true,
+          help: 'One paragraph shown under the product name on the buy page. Optional — leave blank if the tier cards say enough.',
+        }),
         el('label', { style: 'display:block; font-weight:600; font-size:13px; margin:12px 0 4px' }, 'Price'),
         el('div', { style: 'display:flex; gap:8px; align-items:flex-start' }, [
           priceInput,
@@ -1290,6 +1341,23 @@ The request will be refused if there are licenses or invoices tied to it — use
         'A product is anything you sell. Each product has a public purchase URL at /buy/<slug> and zero or more policies that determine what kind of license is issued.'),
       create,
     ]))
+
+    // Auto-slug: as the operator types a Display Name, mirror a
+    // slugified version into the Slug field — UNLESS they've manually
+    // edited the slug. Tracked via a "userOverridden" flag set on
+    // the slug input's `input` event. Manual edits stick; clearing
+    // the slug back to "" re-arms the auto-fill.
+    const nameInput = create.querySelector('[name=name]')
+    const slugInput = create.querySelector('[name=slug]')
+    let slugUserOverridden = false
+    if (nameInput && slugInput) {
+      slugInput.addEventListener('input', () => {
+        slugUserOverridden = slugInput.value.trim().length > 0
+      })
+      nameInput.addEventListener('input', () => {
+        if (!slugUserOverridden) slugInput.value = slugify(nameInput.value)
+      })
+    }
 
     try {
       const [j, counts] = await Promise.all([
@@ -1798,6 +1866,492 @@ The request will be refused if there are licenses or invoices tied to it — use
     syncRecurringEdit()
   }
 
+  // ---------- Policy tier-card grid (Phase 2 of v0.2.0:9) ----------
+  //
+  // Replaces the older table-based render of policies with a card
+  // grid that mirrors the buy page's tier cards. Operators get a
+  // side-by-side visual comparison of their tiers + an inline
+  // "+ Add tier" card that morphs into an editable draft card on
+  // click — multiple drafts can exist simultaneously.
+
+  /**
+   * Format a price for display on a tier card. Returns
+   * `{ amount, unit }` so the card can render the amount in a
+   * larger font and the unit beside it.
+   */
+  function fmtTierPrice(pol, product) {
+    if (product.price_currency === 'SAT' || !product.price_currency) {
+      const sats = pol.price_sats_override != null ? pol.price_sats_override : product.price_sats
+      return { amount: Number(sats || 0).toLocaleString('en-US'), unit: 'sats' }
+    }
+    const cents = pol.price_sats_override != null ? pol.price_sats_override : product.price_value
+    return { amount: ((cents || 0) / 100).toFixed(2), unit: product.price_currency }
+  }
+
+  function fmtCadenceSuffix(pol) {
+    if (!pol.is_recurring) return ''
+    const d = pol.renewal_period_days || 0
+    if (d === 7) return ' / wk'
+    if (d === 30) return ' / mo'
+    if (d === 90) return ' / qtr'
+    if (d === 180) return ' / 6mo'
+    if (d === 365) return ' / yr'
+    return d > 0 ? (' / ' + d + 'd') : ''
+  }
+
+  /**
+   * Read-only tier card showing an existing policy. Visual matches
+   * the buy page's tier cards; bottom action row exposes Edit /
+   * Hide-Show / Delete and the public-vs-private + active state.
+   */
+  function renderTierCard(pol, product, onMutate) {
+    const meta = pol.metadata || {}
+    const highlighted = !!meta.highlight
+    const description = (typeof meta.description === 'string') ? meta.description : ''
+    const price = fmtTierPrice(pol, product)
+    const cadenceSuffix = fmtCadenceSuffix(pol)
+
+    const popularPill = highlighted
+      ? el('div', {
+          style:
+            'position:absolute; top:-10px; left:50%; transform:translateX(-50%); ' +
+            'background:var(--gold-500); color:var(--navy-950); ' +
+            'font-family:var(--font-body); font-size:10px; font-weight:700; ' +
+            'letter-spacing:0.16em; text-transform:uppercase; ' +
+            'padding:3px 9px; border-radius:999px; white-space:nowrap;',
+        }, 'Most popular')
+      : null
+
+    const durationLine = pol.duration_seconds === 0
+      ? 'Perpetual'
+      : (() => {
+          const days = Math.floor(pol.duration_seconds / 86400)
+          if (days >= 1) return days + ' days'
+          const hours = Math.floor(pol.duration_seconds / 3600)
+          return Math.max(1, hours) + ' hours'
+        })()
+
+    const recurringMeta = pol.is_recurring
+      ? el('div', { class: 'muted', style: 'font-size:12px' },
+          (() => {
+            const d = pol.renewal_period_days || 0
+            if (d === 7) return 'Renews weekly'
+            if (d === 30) return 'Renews monthly'
+            if (d === 90) return 'Renews quarterly'
+            if (d === 180) return 'Renews semi-annually'
+            if (d === 365) return 'Renews annually'
+            return 'Renews every ' + d + ' days'
+          })())
+      : null
+
+    const trialBanner = (pol.is_recurring && (pol.trial_days || 0) > 0)
+      ? el('div', { style: 'font-size:12px; color:var(--gold-700); font-weight:600' },
+          pol.trial_days + ' day free trial')
+      : null
+
+    // Entitlements as small chips with display name + tooltip.
+    const cat = product.entitlements_catalog || []
+    const entChips = (pol.entitlements || []).length === 0
+      ? null
+      : el('ul', {
+          style: 'list-style:none; padding:0; margin:8px 0 0; font-size:12.5px; color:var(--ink-700)',
+        }, (pol.entitlements || []).map((slug) => {
+          const entry = cat.find((c) => c.slug === slug)
+          const display = entry && entry.name ? entry.name : slug
+          const desc = entry && entry.description ? entry.description : slug
+          return el('li', {
+            title: desc,
+            style: 'padding:2px 0 2px 16px; position:relative',
+          }, [
+            el('span', {
+              style: 'position:absolute; left:0; top:2px; color:var(--gold-700); font-weight:700',
+            }, '✓'),
+            display,
+          ])
+        }))
+
+    // Status pills row (active vs disabled, public vs private, trial).
+    const pillsRow = el('div', {
+      style: 'display:flex; flex-wrap:wrap; gap:5px; margin:6px 0',
+    }, [
+      pol.active
+        ? el('span', { class: 'badge b-success', style: 'font-size:10.5px; padding:2px 7px' }, 'active')
+        : el('span', { class: 'badge b-neutral', style: 'font-size:10.5px; padding:2px 7px' }, 'disabled'),
+      pol.public
+        ? el('span', {
+            class: 'badge b-gold',
+            style: 'font-size:10.5px; padding:2px 7px',
+            title: 'Visible on /buy/' + product.slug + ' tier picker',
+          }, 'public')
+        : el('span', {
+            class: 'badge b-neutral',
+            style: 'font-size:10.5px; padding:2px 7px',
+            title: 'Hidden from public buy page; admin-only',
+          }, 'private'),
+      pol.is_trial
+        ? el('span', { class: 'badge b-warning', style: 'font-size:10.5px; padding:2px 7px' }, 'trial flag')
+        : null,
+      pol.tier_rank != null
+        ? el('span', {
+            class: 'badge b-neutral',
+            style: 'font-size:10.5px; padding:2px 7px',
+            title: 'Ladder rank (used by tier-upgrade flow)',
+          }, 'rank ' + pol.tier_rank)
+        : null,
+    ].filter(Boolean))
+
+    // Action row.
+    const actions = el('div', {
+      style: 'display:flex; flex-wrap:wrap; gap:6px; margin-top:auto; padding-top:10px; border-top:1px solid var(--border-1)',
+    }, [
+      el('button', {
+        class: 'btn sm secondary',
+        onclick: () => openEditPolicy(pol, product),
+      }, 'Edit'),
+      el('button', {
+        class: 'btn sm secondary',
+        title: pol.public ? 'Hide from /buy/' + product.slug : 'Show on /buy/' + product.slug,
+        onclick: async () => {
+          try {
+            await api('/v1/admin/policies/' + pol.id + '/public', {
+              method: 'PATCH', body: { public: !pol.public },
+            })
+            onMutate && onMutate()
+          } catch (e) { alert(e.message) }
+        },
+      }, pol.public ? 'Hide' : 'Show'),
+      el('button', {
+        class: 'btn sm danger',
+        onclick: () => safeOrForceDelete({
+          kind: 'policy',
+          slug: pol.slug,
+          pathBase: '/v1/admin/policies/' + pol.id,
+          onSuccess: onMutate,
+        }),
+      }, 'Delete'),
+    ])
+
+    return el('div', {
+      class: 'tier-card',
+      style:
+        'position:relative; background:var(--cream-50); ' +
+        'border:' + (highlighted ? '2px solid var(--gold-500)' : '1px solid var(--border-1)') + '; ' +
+        'border-radius:12px; padding:' + (highlighted ? '21px 19px 16px' : '22px 20px 16px') + '; ' +
+        'display:flex; flex-direction:column; gap:6px; min-height:280px;' +
+        (highlighted ? ' box-shadow:0 0 0 3px rgba(191,160,104,0.12);' : ''),
+    }, [
+      popularPill,
+      el('div', {
+        style: 'font-family:var(--font-display); font-weight:600; font-size:18px; color:var(--navy-950); letter-spacing:-0.01em',
+      }, pol.name),
+      el('div', {
+        class: 'muted',
+        style: 'font-family:var(--font-mono); font-size:11px',
+      }, pol.slug),
+      el('div', {
+        style: 'font-family:var(--font-display); font-weight:700; font-size:24px; color:var(--navy-950); letter-spacing:-0.02em; line-height:1.1; margin-top:6px',
+      }, [
+        price.amount,
+        el('span', {
+          style: 'font-family:var(--font-body); font-size:12px; font-weight:500; color:var(--ink-500); margin-left:6px',
+        }, price.unit + cadenceSuffix),
+      ]),
+      el('div', { class: 'muted', style: 'font-size:12px' }, durationLine),
+      recurringMeta,
+      trialBanner,
+      pillsRow,
+      description ? el('p', {
+        style: 'font-size:13px; line-height:1.45; color:var(--ink-700); margin:6px 0 0',
+      }, description) : null,
+      entChips,
+      el('div', { class: 'muted', style: 'font-size:11px; margin-top:4px' },
+        (pol._license_count || 0) + ' license' + ((pol._license_count || 0) === 1 ? '' : 's')),
+      actions,
+    ])
+  }
+
+  /**
+   * Empty placeholder card with a "+" affordance. On click, the
+   * caller should swap this card with a draft card via
+   * renderDraftTierCard.
+   */
+  function renderAddTierCard(onClick) {
+    const card = el('button', {
+      type: 'button',
+      class: 'add-tier-card',
+      style:
+        'background:transparent; border:2px dashed var(--border-2); ' +
+        'border-radius:12px; padding:22px 20px; cursor:pointer; ' +
+        'min-height:280px; display:flex; flex-direction:column; ' +
+        'align-items:center; justify-content:center; gap:8px; ' +
+        'color:var(--ink-500); font-family:var(--font-body); ' +
+        'transition:all 120ms;',
+    }, [
+      el('div', { style: 'font-size:42px; line-height:1; font-weight:300' }, '+'),
+      el('div', { style: 'font-size:13px; font-weight:600' }, 'Add tier'),
+      el('div', { style: 'font-size:11px; max-width:160px; text-align:center' },
+        'Create a new policy on this product'),
+    ])
+    card.addEventListener('mouseenter', () => {
+      card.style.borderColor = 'var(--gold-500)'
+      card.style.color = 'var(--navy-800)'
+    })
+    card.addEventListener('mouseleave', () => {
+      card.style.borderColor = 'var(--border-2)'
+      card.style.color = 'var(--ink-500)'
+    })
+    card.addEventListener('click', onClick)
+    return card
+  }
+
+  /**
+   * Inline-editable draft tier card. Same outer dimensions as
+   * renderTierCard so drafts sit visually side-by-side with
+   * existing policies. Form fields are compact: name + slug + price,
+   * a "More options" disclosure for the rest (duration, max
+   * devices, recurring, trial, tier rank), and the entitlements
+   * bubble picker against the product's catalog (or fallback
+   * textarea when no catalog).
+   */
+  function renderDraftTierCard(product, onCommit, onCancel) {
+    // Compact inputs. Help icons replace per-field hint text to
+    // keep the card narrow.
+    const nameInput = el('input', {
+      class: 'input', placeholder: 'Display name (e.g. Pro)', required: 'required',
+    })
+    const slugInput = el('input', {
+      class: 'input mono', placeholder: 'slug',
+    })
+    let slugUserOverridden = false
+    slugInput.addEventListener('input', () => {
+      slugUserOverridden = slugInput.value.trim().length > 0
+    })
+    nameInput.addEventListener('input', () => {
+      if (!slugUserOverridden) slugInput.value = slugify(nameInput.value)
+    })
+
+    // Price override: defaults to product base price, displayed in
+    // the right unit. Operator can edit.
+    const isSat = (product.price_currency === 'SAT' || !product.price_currency)
+    const initialPrice = isSat
+      ? String(product.price_sats || 0)
+      : (((product.price_value || 0) / 100).toFixed(2))
+    const priceInput = el('input', {
+      class: 'input', type: 'number',
+      step: isSat ? '1' : '0.01',
+      min: '0', value: initialPrice,
+      style: 'flex:1',
+    })
+    const priceUnit = el('span', {
+      class: 'muted',
+      style: 'font-size:12px; align-self:center',
+    }, isSat ? 'sats' : product.price_currency)
+
+    // Duration preset
+    const DURATION_PRESETS = [
+      { value: '0', label: 'Perpetual' },
+      { value: '604800', label: '7 days' },
+      { value: '2592000', label: '30 days' },
+      { value: '7776000', label: '90 days' },
+      { value: '31536000', label: '1 year' },
+    ]
+    const durationSel = el('select', { class: 'select' })
+    DURATION_PRESETS.forEach((p) => durationSel.appendChild(el('option', { value: p.value }, p.label)))
+    durationSel.value = '0'
+
+    const maxMachinesInput = el('input', {
+      class: 'input', type: 'number', min: '0', value: '1',
+      style: 'flex:1',
+    })
+
+    // Entitlements: bubble picker (closed list) when product has a
+    // catalog; legacy textarea otherwise.
+    const cat = product.entitlements_catalog || []
+    const entHost = el('div')
+    let entRead = () => []
+    if (cat.length > 0) {
+      const picker = entitlementBubblePicker(cat, [])
+      entHost.appendChild(picker.element)
+      entRead = picker.read
+    } else {
+      const textarea = el('textarea', {
+        class: 'input', rows: '2',
+        placeholder: 'comma-separated entitlement slugs',
+      })
+      entHost.appendChild(textarea)
+      entRead = () => textarea.value
+        .replace(/[\[\]"'`]/g, '')
+        .split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
+    }
+
+    // Recurring + trial toggles
+    const recurringCb = el('input', { type: 'checkbox' })
+    const trialDaysInput = el('input', {
+      class: 'input', type: 'number', min: '0', value: '0', style: 'width:60px',
+    })
+    const renewalPeriodInput = el('input', {
+      class: 'input', type: 'number', min: '1', value: '30', style: 'width:60px',
+    })
+
+    // Tip recipient (advanced — collapsed by default to keep the
+    // card narrow).
+    const status = el('div', { style: 'font-size:12px; min-height:16px' }, '')
+
+    function fieldRow(label, helpText, control) {
+      return el('div', { style: 'display:flex; flex-direction:column; gap:3px; margin-top:8px' }, [
+        el('label', { class: 'lbl', style: 'display:flex; align-items:center; font-size:11.5px; margin:0' }, [
+          label,
+          helpText ? helpIcon(helpText) : null,
+        ].filter(Boolean)),
+        control,
+      ])
+    }
+
+    // Build the card body
+    const body = el('div', { style: 'display:flex; flex-direction:column; gap:0' }, [
+      el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'New tier'),
+      fieldRow('Display name', 'What buyers see (e.g. "Pro").', nameInput),
+      fieldRow('Slug', 'Stable id used by SDK; auto-fills from name. Lowercase, digits, hyphens.', slugInput),
+      fieldRow('Price', 'Override for this tier. Pre-filled with product base price.',
+        el('div', { style: 'display:flex; gap:6px' }, [priceInput, priceUnit])),
+      fieldRow('Duration', 'How long the issued license is valid. Perpetual = no expiry.', durationSel),
+      fieldRow('Max devices', '1 = single seat; 0 = unlimited; n = n-seat.', maxMachinesInput),
+      fieldRow('Entitlements', cat.length > 0
+        ? 'Click to toggle. Defined on the product\'s catalog.'
+        : 'Comma-separated slugs. Define a product catalog for click-to-pick.',
+        entHost),
+      // Recurring section — minimal, expanded inline (no nested
+      // disclosure; cards already imply compactness).
+      el('div', { style: 'display:flex; align-items:center; gap:6px; margin-top:8px' }, [
+        recurringCb,
+        el('label', { class: 'lbl', style: 'margin:0; font-size:11.5px; display:flex; align-items:center' }, [
+          'Recurring subscription',
+          helpIcon('Bills the buyer on a repeating cycle. Pro tier required.'),
+        ]),
+      ]),
+      el('div', {
+        'data-recurring-detail': '1',
+        style: 'display:none; padding:8px 0 0 18px; border-left:2px solid var(--border-1); margin-left:6px',
+      }, [
+        el('div', { style: 'display:flex; gap:8px; align-items:center; font-size:11.5px' }, [
+          'Renew every',
+          renewalPeriodInput,
+          'days',
+        ]),
+        el('div', { style: 'display:flex; gap:8px; align-items:center; font-size:11.5px; margin-top:6px' }, [
+          'Free trial',
+          trialDaysInput,
+          'days',
+        ]),
+      ]),
+      status,
+      el('div', { style: 'display:flex; gap:6px; margin-top:auto; padding-top:10px; border-top:1px solid var(--border-1)' }, [
+        (() => {
+          const btn = el('button', { class: 'btn sm primary' }, 'Create')
+          btn.addEventListener('click', async () => {
+            status.textContent = 'Creating…'
+            status.style.color = 'var(--ink-500)'
+            btn.disabled = true
+            try {
+              const isRecurring = recurringCb.checked
+              const body = {
+                product_slug: product.slug,
+                slug: slugInput.value.trim(),
+                name: nameInput.value.trim(),
+                duration_seconds: parseInt(durationSel.value, 10) || 0,
+                grace_seconds: 0,
+                max_machines: parseInt(maxMachinesInput.value, 10),
+                is_trial: false,
+                entitlements: Array.isArray(entRead()) ? entRead() : entRead(),
+                metadata: {},
+                price_sats_override: isSat
+                  ? Math.max(0, parseInt(priceInput.value, 10) || 0)
+                  : Math.max(0, Math.round(parseFloat(priceInput.value) * 100) || 0),
+              }
+              if (isRecurring) {
+                body.is_recurring = true
+                body.renewal_period_days = parseInt(renewalPeriodInput.value, 10) || 30
+                body.grace_period_days = 7
+                body.trial_days = parseInt(trialDaysInput.value, 10) || 0
+              }
+              await api('/v1/admin/policies', { method: 'POST', body })
+              onCommit && onCommit()
+            } catch (e) {
+              if (handleTierCap(e)) {
+                status.textContent = ''
+              } else {
+                status.textContent = e.message
+                status.style.color = 'var(--danger)'
+                btn.disabled = false
+              }
+            }
+          })
+          return btn
+        })(),
+        (() => {
+          const btn = el('button', { class: 'btn sm secondary' }, 'Cancel')
+          btn.addEventListener('click', () => onCancel && onCancel())
+          return btn
+        })(),
+      ]),
+    ])
+
+    // Toggle the recurring detail block
+    recurringCb.addEventListener('change', () => {
+      const det = body.querySelector('[data-recurring-detail]')
+      if (det) det.style.display = recurringCb.checked ? 'block' : 'none'
+    })
+
+    return el('div', {
+      class: 'tier-card draft',
+      style:
+        'position:relative; background:#fff; ' +
+        'border:2px dashed var(--gold-500); border-radius:12px; ' +
+        'padding:18px 16px; min-height:280px; ' +
+        'box-shadow:0 0 0 1px rgba(191,160,104,0.06); ' +
+        'display:flex; flex-direction:column;',
+    }, [body])
+  }
+
+  /**
+   * The card grid for one product. Renders each existing policy
+   * as a tier card + an "+ Add tier" card on the right. Click to
+   * add → morphs into a draft card; multiple drafts can coexist.
+   */
+  function renderPolicyCardGrid(product, policies, byPolicyCounts, onMutate) {
+    const grid = el('div', {
+      style:
+        'display:grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); ' +
+        'gap:14px; margin-top:12px;',
+    })
+
+    policies.forEach((pol) => {
+      // Annotate with license count for the card footer.
+      pol._license_count = byPolicyCounts[pol.id] || 0
+      grid.appendChild(renderTierCard(pol, product, onMutate))
+    })
+
+    // Add-tier card. On click, the placeholder transforms into a
+    // draft card AND a fresh placeholder is appended so the
+    // operator can keep clicking "+ Add tier" to author multiple
+    // policies side-by-side. Named recursive function so each new
+    // placeholder reuses the same handler.
+    function makePlaceholder() {
+      const placeholder = renderAddTierCard(() => {
+        const draft = renderDraftTierCard(
+          product,
+          () => onMutate && onMutate(), // commit → reload (rebuilds grid)
+          () => grid.replaceChild(makePlaceholder(), draft), // cancel → swap back
+        )
+        grid.replaceChild(draft, placeholder)
+        grid.appendChild(makePlaceholder())
+      })
+      return placeholder
+    }
+    grid.appendChild(makePlaceholder())
+    return grid
+  }
+
   // -------- Policies --------
   routes.policies = async function () {
     const target = document.getElementById('route-target')
@@ -2162,11 +2716,23 @@ The request will be refused if there are licenses or invoices tied to it — use
         }
       }
     })
+    // Intro card. The legacy "Create a new policy" disclosure form
+    // is no longer surfaced — the per-product card grid below has
+    // an inline "+ Add tier" affordance that authors policies in
+    // place, with multiple drafts allowed for side-by-side
+    // comparison. Advanced fields (tip recipient, custom grace
+    // seconds, tier rank) live on the Edit modal of an existing
+    // tier card; create the basics first, then click Edit.
     target.appendChild(plainCard([
-      el('p', { class: 'muted', style: 'margin:0 0 16px' },
-        'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance.'),
-      create,
+      el('p', { class: 'muted', style: 'margin:0' },
+        'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance. Click the dashed "+ Add tier" card under any product to author a new policy in place — multiple drafts can coexist for side-by-side comparison.'),
     ]))
+    // Intentionally not used: `create` (legacy disclosure-form
+    // create-policy flow). Kept around as dead code for one release
+    // so power users can re-enable by re-introducing the appendChild
+    // if the card-grid flow turns out to miss something. Removed
+    // entirely in v0.3.
+    void create;
 
     // License-count map (one fetch covers all products / policies on the page).
     const counts = await api('/v1/admin/licenses/counts').catch(() => ({ by_policy: {} }))
@@ -2202,82 +2768,6 @@ The request will be refused if there are licenses or invoices tied to it — use
       try {
         const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(p.slug))
         const policies = j.policies || []
-        const rows = policies.map((pol) => el('tr', null, [
-          el('td', null, el('code', null, pol.slug)),
-          el('td', { style: 'font-weight:600; color:var(--navy-950)' }, pol.name),
-          el('td', null, fmtDuration(pol.duration_seconds)),
-          el('td', null, fmtGrace(pol.grace_seconds)),
-          el('td', null, pol.max_machines === 0 ? '∞' : String(pol.max_machines)),
-          el('td', null,
-            // Stack trial + recurring badges in one cell. Both can be set
-            // independently (a recurring policy can also have a trial bit).
-            pol.is_trial || pol.is_recurring
-              ? el('span', { style: 'display:inline-flex; gap:4px; flex-wrap:wrap' }, [
-                  pol.is_trial ? el('span', { class: 'badge b-warning' }, 'trial') : null,
-                  pol.is_recurring
-                    ? el('span', {
-                        class: 'badge b-gold',
-                        title: 'Renews every ' + (pol.renewal_period_days || 0) + ' days',
-                      }, 'every ' + (pol.renewal_period_days || 0) + 'd')
-                    : null,
-                ].filter(Boolean))
-              : el('span', { class: 'muted' }, '–')),
-          el('td', { class: 'muted' }, (() => {
-            // Render entitlement display names from the product's
-            // catalog when available, falling back to the slug
-            // verbatim. Tooltip shows the slug + description for
-            // operator reference.
-            const ents = pol.entitlements || []
-            if (ents.length === 0) return '–'
-            const cat = (p.entitlements_catalog || [])
-            return ents
-              .map((slug) => {
-                const entry = cat.find((c) => c.slug === slug)
-                return entry && entry.name ? entry.name : slug
-              })
-              .join(', ')
-          })()),
-          el('td', null, el('span', { class: 'muted' }, String(byPolicy[pol.id] || 0))),
-          el('td', null, activePill(pol.active)),
-          el('td', null, pol.public
-            ? el('span', { class: 'badge b-gold', title: 'Visible on /buy/' + p.slug + ' tier picker' }, 'public')
-            : el('span', { class: 'muted', title: 'Hidden from public buy page; admin issuance only' }, 'private')),
-          el('td', null, el('div', { class: 'actions-row' }, [
-            el('button', {
-              class: 'btn sm secondary',
-              onclick: function () { openEditPolicy(pol, p) },
-            }, 'Edit'),
-            el('button', {
-              class: 'btn sm secondary',
-              title: pol.public ? 'Hide from /buy/' + p.slug : 'Show on /buy/' + p.slug,
-              onclick: async function () {
-                try {
-                  await api('/v1/admin/policies/' + pol.id + '/public', {
-                    method: 'PATCH', body: { public: !pol.public },
-                  })
-                  routes.policies()
-                } catch (e) { alert(e.message) }
-              },
-            }, pol.public ? 'Hide' : 'Show'),
-            el('button', {
-              class: 'btn sm danger',
-              title: 'Delete this policy. Safe by default; offers a force-delete with cascade if the policy has licenses or invoices.',
-              onclick: function () {
-                safeOrForceDelete({
-                  kind: 'policy',
-                  slug: pol.slug,
-                  pathBase: '/v1/admin/policies/' + pol.id,
-                  onSuccess: () => routes.policies(),
-                })
-              },
-            }, 'Delete'),
-          ])),
-        ]))
-        // Per-product header action: open the buy page in a new tab
-        // so the operator can preview how their policies render to a
-        // buyer without leaving the admin SPA. Only shown when the
-        // product has at least one public policy (otherwise the buy
-        // page would render empty).
         const hasPublicPolicy = policies.some((pol) => pol.public && pol.active)
         const previewBtn = hasPublicPolicy
           ? el('a', {
@@ -2289,14 +2779,24 @@ The request will be refused if there are licenses or invoices tied to it — use
               style: 'text-decoration:none',
             }, 'Preview buy page')
           : null
-        target.appendChild(tableCard(
-          p.name + ' — ' + p.slug,
-          policies.length + ' polic' + (policies.length === 1 ? 'y' : 'ies'),
-          ['Slug', 'Name', 'Duration', 'Grace', 'Seats', 'Trial', 'Entitlements', 'Licenses', 'Status', 'On buy page', ''],
-          rows,
-          '(no policies yet)',
-          previewBtn,
-        ))
+
+        // Card grid replaces the older table — operators see tier
+        // cards that mirror the buy page layout, with a side-by-side
+        // "+ Add tier" affordance that morphs into an inline draft
+        // card on click. Multiple drafts can coexist for parallel
+        // multi-tier authoring.
+        const productCard = el('div', { class: 'card' }, [
+          el('div', { class: 'card-head' }, [
+            el('h3', null, p.name + ' — ' + p.slug),
+            el('span', { class: 'sub' },
+              policies.length + ' polic' + (policies.length === 1 ? 'y' : 'ies')),
+            previewBtn ? el('span', { style: 'margin-left:auto' }, previewBtn) : null,
+          ]),
+          el('div', { class: 'card-body' }, [
+            renderPolicyCardGrid(p, policies, byPolicy, () => routes.policies()),
+          ]),
+        ])
+        target.appendChild(productCard)
       } catch (e) {
         target.appendChild(plainCard([err('Failed to load policies for ' + p.slug + ': ' + e.message)]))
       }
@@ -3212,10 +3712,17 @@ The request will be refused if there are licenses or invoices tied to it — use
   function formInput(name, label, opts) {
     opts = opts || {}
     const id = 'f_' + name + '_' + Math.random().toString(36).slice(2, 6)
-    const lbl = el('label', { class: 'lbl', for: id }, [label, opts.required ? el('span', { class: 'req' }, '*') : null])
+    // Label can carry an optional `help:` hover-tooltip via helpIcon
+    // (replaces the older verbose `hint:` block-text below the input
+    // for a more compact form layout). Both can coexist if a caller
+    // wants both, but help-icon-only is the recommended new pattern.
+    const labelChildren = [label, opts.required ? el('span', { class: 'req' }, '*') : null]
+    if (opts.help) labelChildren.push(helpIcon(opts.help))
+    const lbl = el('label', { class: 'lbl', for: id }, labelChildren)
     const inp = opts.textarea
       ? el('textarea', { class: 'input', id, name, rows: '3' })
       : el('input', { class: 'input' + (opts.mono ? ' mono' : ''), id, name, type: opts.type || 'text' })
+    if (opts.placeholder) inp.setAttribute('placeholder', opts.placeholder)
     if (opts.value != null) inp.value = opts.value
     const wrap = el('div', { class: 'field' }, [lbl, inp])
     if (opts.hint) wrap.appendChild(el('div', { class: 'hint' }, opts.hint))
