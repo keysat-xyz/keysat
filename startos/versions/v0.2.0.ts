@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:7 — Marketing-copy alignment. Package short and long descriptions now read "Bitcoin-native self-hosted licensing service for software creators" — matches keysat.xyz and the new positioning. Long description also calls out Zaprite (Bitcoin + cards), recurring subscriptions, and tier upgrades, all of which shipped in earlier :N revisions but weren\'t reflected in the registry listing. Same change applied to the daemon Cargo.toml description, repo READMEs, and the in-StartOS About panel for consistency. No code changes; pure copy.',
+  '',
   '0.2.0:6 — **Recurring subs + trials + self-tier live refresh actually work now.** Major bug-and-UX-fix release driven by hands-on testing of v0.2.0:5. The recurring-sub feature shipped in :4 had a critical gap: buying a recurring policy issued a license but never created the corresponding subscription row, so the renewal worker never picked it up — purchases silently behaved like one-shots. The trial flow shipped with `trial_days` configurable in admin but the field had zero effect on the purchase path. And admin tier changes on the daemon\'s own license never propagated to the running daemon, making it impossible to test Creator-tier gates on the master Keysat. This release fixes all three plus a slate of UX papercuts found during testing.',
   '',
   '**Recurring purchases now create subscriptions.** `issue_license_for_invoice` calls `subscriptions::create_subscription` whenever the resolved policy has `is_recurring=1`. The Subscriptions tab populates correctly; the renewal worker sees the row; cancellation works. Idempotent against webhook re-delivery.',
@@ -155,7 +157,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:6',
+  version: '0.2.0:7',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

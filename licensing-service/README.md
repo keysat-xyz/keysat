@@ -1,6 +1,6 @@
 # Keysat
 
-**Keysat** is a self-hosted Bitcoin-paid software licensing server, designed to run as a [Start9](https://start9.com) 0.4.0.x service alongside [BTCPay Server](https://btcpayserver.org). One instance can sell, issue, validate, and revoke licenses for any number of software products you own.
+**Keysat** is a Bitcoin-native, self-hosted licensing service for software creators, designed to run as a [Start9](https://start9.com) 0.4.0.x service alongside [BTCPay Server](https://btcpayserver.org) (or [Zaprite](https://zaprite.com) for Bitcoin + cards). One instance can sell, issue, validate, and revoke licenses for any number of software products you own.
 
 > The repository directory is still called `licensing-service/` on disk for continuity with earlier revisions. The crate, the binary, the StartOS package id, and all user-visible strings use **Keysat**.
 

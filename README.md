@@ -5,7 +5,7 @@
 <h1 align="center">Keysat</h1>
 
 <p align="center">
-  Self-hosted, Bitcoin-paid software-licensing service for Start9.
+  Bitcoin-native self-hosted licensing service for software creators. Runs on Start9.
 </p>
 
 > **About this README.** Keysat is a from-scratch service authored for

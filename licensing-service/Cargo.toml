@@ -3,7 +3,7 @@ name = "keysat"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Keysat — self-hosted Bitcoin-paid software licensing server for Start9"
+description = "Keysat — Bitcoin-native self-hosted licensing service for software creators"
 license-file = "LICENSE"
 publish = false
 

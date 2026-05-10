@@ -1,6 +1,6 @@
 # About Keysat
 
-**Keysat** is a self-hosted, Bitcoin-paid software licensing server: every operator runs their own instance on their own hardware, so there is no central authority, no shared database, and no lock-in. You own the signing key, the customer records, and the payment rails.
+**Keysat** is a Bitcoin-native, self-hosted licensing service for software creators: every operator runs their own instance on their own hardware, so there is no central authority, no shared database, and no lock-in. You own the signing key, the customer records, and the payment rails.
 
 After installing:
 
