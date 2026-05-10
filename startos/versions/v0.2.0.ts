@@ -58,6 +58,24 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:10 — **Licenses + Subscriptions tabs reorganized to match Products + Policies.** Both tabs now group by product (matching the per-product card sections used elsewhere in the admin UI), with product-filter pills + per-product license counts at the top. Single-product instances continue to see a flat table; multi-product instances see one section per product with a status breakdown subtitle ("3 active · 1 revoked · 2 expired"). Search results bypass grouping (search is global across all products).',
+  '',
+  '**Licenses tab gains a quick-stats row** matching the Overview dashboard: Licenses, Active, Revoked, Expiring within 30 days. Scope follows the active product filter — pick a product, the stats reflect just that product. Hover the "?" icons next to each stat label for definitions.',
+  '',
+  '**Subscriptions tab gains a Product column + status filter pill counts.** "Active (3) · Past due (0) · Cancelled (1) · Lapsed (0)" so operators see the breakdown at a glance. Status badges hover-explain what each state means ("past_due → renewal invoice exists, license still valid through grace window," etc.).',
+  '',
+  '**Inline reason modals replace browser prompt() dialogs.** Cancelling a subscription or revoking / suspending a license used to fire a jarring native prompt() box and a separate confirm(); both flows are now the same overlay-card UX as Change Tier — title, contextual message, optional warning banner for irreversible operations, audit-reason textarea, Cancel / Confirm buttons. Operators get clearer copy + a less-noisy interaction.',
+  '',
+  '**Click-to-copy IDs.** License IDs and subscription license_ids in both tabs render as clickable codes — click to copy the full UUID to clipboard with a brief "✓ copied" indicator. Replaces the older hover-to-see-full-id pattern; one fewer step to grab an id for SDK debugging or audit-log spelunking.',
+  '',
+  '**Relative dates with absolute hover.** `5/12/2026, 2:31:00 PM` becomes `in 3 days` / `12 hours ago` / `2 months ago` with the absolute timestamp in the hover tooltip. Applied to license issued/expires + subscription next_renewal. Operators care about "is this happening soon?" more than the wall-clock value; full timestamp still one hover away.',
+  '',
+  '**Manual-issue form on Licenses tab uses help icons.** Verbose hint blocks under each input replaced with `?` hover tooltips — same compact-form treatment as the Products + Policies tabs got in :8 / :9.',
+  '',
+  '**Test count: 78** (UI-only release, unchanged from :9).',
+  '',
+  '**Upgrade path.** v0.2.0:9 → v0.2.0:10 is a drop-in. No schema, SDK, or behavior change. Pure admin UI.',
+  '',
   '0.2.0:9 — **Side-by-side tier-card policy authoring + form polish.** The Policies tab\'s table view is gone — replaced with a card grid where each existing policy renders as a buy-page-style tier card sitting alongside a dashed "+ Add tier" placeholder. Click the placeholder and it morphs into an editable draft card with form fields inline; submit "Create" on the card and it flips back to a read-only tier preview. **Multiple drafts can coexist** in the same product\'s grid, so operators can author Core / Pro / Patron in parallel and visually compare what each will look like to a buyer before committing any of them. Same visual language as the buy page, so what you see while authoring is what buyers see.',
   '',
   '**Form polish.** New `helpIcon()` helper renders a small "?" hover-tooltip next to field labels — replaces the verbose hint text under inputs that was making forms feel cluttered. Applied first to the product create form (Display name → Slug → Description → Price all use help icons now); spread to other forms incrementally over follow-up releases.',
@@ -191,7 +209,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:9',
+  version: '0.2.0:10',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

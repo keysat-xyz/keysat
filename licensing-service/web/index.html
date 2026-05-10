@@ -706,6 +706,166 @@ The request will be refused if there are licenses or invoices tied to it — use
     }, '?')
   }
 
+  /**
+   * Wraps a string in a clickable element that copies the FULL value
+   * to the clipboard on click and shows a brief "Copied" indicator.
+   * Used in the licenses + subscriptions tables for IDs that get
+   * truncated for display but are useful to grab in full.
+   *
+   *   clickToCopy('a1b2c3d4-...', 'a1b2c3d4…')
+   *   → <span title="Click to copy">a1b2c3d4…</span>
+   */
+  function clickToCopy(fullValue, displayLabel) {
+    const span = el('code', {
+      class: 'click-to-copy',
+      title: 'Click to copy: ' + fullValue,
+      style:
+        'cursor:pointer; padding:2px 5px; border-radius:4px; ' +
+        'transition:background 100ms; user-select:none;',
+    }, displayLabel || fullValue)
+    span.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      try {
+        await navigator.clipboard.writeText(fullValue)
+        const orig = span.textContent
+        span.textContent = '✓ copied'
+        span.style.background = 'var(--success-bg)'
+        setTimeout(() => {
+          span.textContent = orig
+          span.style.background = ''
+        }, 1100)
+      } catch (_) {
+        // Clipboard API can fail on insecure contexts; fall back to a
+        // brief style flash so at least click feedback is visible.
+        span.style.background = 'var(--warning-bg)'
+        setTimeout(() => { span.style.background = '' }, 600)
+      }
+    })
+    span.addEventListener('mouseenter', () => {
+      if (!span.textContent.startsWith('✓')) span.style.background = 'var(--cream-200)'
+    })
+    span.addEventListener('mouseleave', () => {
+      if (!span.textContent.startsWith('✓')) span.style.background = ''
+    })
+    return span
+  }
+
+  /**
+   * Render an RFC3339 timestamp as a human-relative string with the
+   * absolute value as a hover tooltip. "in 3 days" / "12 hours ago" /
+   * "just now". Falls back to the raw string if parsing fails.
+   *
+   * Useful for subscription `next_renewal_at`, license `issued_at` /
+   * `expires_at`, etc. — operators care about "is this happening
+   * soon?" more than the wall-clock value.
+   */
+  function relativeDate(rfc3339, opts) {
+    opts = opts || {}
+    if (!rfc3339) return el('span', { class: 'muted' }, '–')
+    const t = new Date(rfc3339)
+    if (isNaN(t.getTime())) return el('span', null, rfc3339)
+    const now = Date.now()
+    const diffMs = t.getTime() - now
+    const future = diffMs > 0
+    const absMs = Math.abs(diffMs)
+    const m = 60_000, h = 3_600_000, d = 86_400_000
+    let label
+    if (absMs < 30_000) label = 'just now'
+    else if (absMs < h) label = Math.round(absMs / m) + 'min'
+    else if (absMs < d) label = Math.round(absMs / h) + 'h'
+    else if (absMs < 30 * d) label = Math.round(absMs / d) + 'd'
+    else if (absMs < 365 * d) label = Math.round(absMs / (30 * d)) + 'mo'
+    else label = Math.round(absMs / (365 * d)) + 'y'
+    if (label !== 'just now') label = future ? ('in ' + label) : (label + ' ago')
+    return el('span', {
+      class: opts.muted === false ? '' : 'muted',
+      title: t.toLocaleString(),
+      style: opts.style || '',
+    }, label)
+  }
+
+  /**
+   * Inline reason-modal — replaces the jarring browser prompt() for
+   * cancel/suspend/revoke flows. Shows an overlay card with a
+   * textarea for the reason + Cancel / Confirm buttons. Returns a
+   * promise that resolves with the trimmed reason string (or null
+   * if the operator cancels).
+   *
+   *   const reason = await reasonModal({
+   *     title: 'Cancel subscription',
+   *     message: 'License stays valid through end of cycle.',
+   *     confirmLabel: 'Cancel subscription',
+   *     confirmVariant: 'danger',
+   *   })
+   *   if (reason !== null) {
+   *     await api(...)
+   *   }
+   */
+  function reasonModal(opts) {
+    opts = opts || {}
+    return new Promise((resolve) => {
+      const overlay = el('div', {
+        style:
+          'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+          'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+      })
+      const textarea = el('textarea', {
+        class: 'input', rows: '3',
+        placeholder: opts.placeholder || 'Optional — recorded on the audit log.',
+      })
+      const status = el('div', {
+        class: 'muted', style: 'margin-top:6px; font-size:12.5px; min-height:16px',
+      }, '')
+      let resolved = false
+      function done(value) {
+        if (resolved) return
+        resolved = true
+        overlay.remove()
+        resolve(value)
+      }
+      const card = el('div', {
+        style:
+          'background:var(--cream-50); border:1px solid var(--border-1); ' +
+          'border-radius:12px; max-width:480px; width:100%; padding:24px; ' +
+          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+      }, [
+        el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, opts.eyebrow || 'Confirm'),
+        el('h3', {
+          style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 6px; color:var(--navy-950);',
+        }, opts.title || 'Are you sure?'),
+        opts.message ? el('p', { class: 'muted', style: 'margin:0 0 14px; font-size:13.5px' }, opts.message) : null,
+        opts.warning ? el('div', {
+          class: 'badge b-warning',
+          style: 'display:block; padding:8px 12px; margin-bottom:12px; font-size:12px',
+        }, opts.warning) : null,
+        el('label', { class: 'lbl', style: 'display:flex; align-items:center; font-size:12.5px' }, [
+          opts.reasonLabel || 'Reason (optional)',
+          helpIcon(opts.reasonHelp || 'Free-form note. Stored on the audit log; not user-visible.'),
+        ]),
+        textarea,
+        status,
+        el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
+          (() => {
+            const btn = el('button', {
+              class: 'btn ' + (opts.confirmVariant === 'danger' ? 'danger' : 'primary'),
+            }, opts.confirmLabel || 'Confirm')
+            btn.addEventListener('click', () => done(textarea.value.trim()))
+            return btn
+          })(),
+          (() => {
+            const btn = el('button', { class: 'btn secondary' }, 'Cancel')
+            btn.addEventListener('click', () => done(null))
+            return btn
+          })(),
+        ]),
+      ])
+      overlay.appendChild(card)
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null) })
+      document.body.appendChild(overlay)
+      setTimeout(() => textarea.focus(), 0)
+    })
+  }
+
   /** Slugify a display name into a URL-safe slug. Used by the
    * auto-slug feature on the product create form. */
   function slugify(s) {
@@ -2808,115 +2968,267 @@ The request will be refused if there are licenses or invoices tied to it — use
     const target = document.getElementById('route-target')
     target.innerHTML = ''
     target.appendChild(plainCard([
-      el('p', { class: 'muted', style: 'margin:0' },
-        'Recurring subscriptions tied to active licenses. Cancellation here ' +
-        'is non-destructive: the license stays valid through the end of the ' +
-        'current cycle, the renewal worker just stops creating new invoices.'),
+      el('p', { class: 'muted', style: 'margin:0' }, [
+        'Recurring subscriptions tied to active licenses. ',
+        helpIcon(
+          'Cancellation here is non-destructive — the license stays valid through ' +
+          'the end of the current cycle, the renewal worker just stops creating ' +
+          'new invoices. Lapses fire automatically when grace expires past a ' +
+          'past-due cycle.',
+        ),
+      ]),
     ]))
 
-    // Status filter pills.
+    // Status copy with tooltip help.
     const STATUSES = [
-      { value: '',           label: 'All' },
-      { value: 'active',     label: 'Active' },
-      { value: 'past_due',   label: 'Past due' },
-      { value: 'cancelled',  label: 'Cancelled' },
-      { value: 'lapsed',     label: 'Lapsed' },
+      { value: '',           label: 'All',        help: 'Every subscription regardless of state.' },
+      { value: 'active',     label: 'Active',     help: 'Currently paid through the next renewal date.' },
+      { value: 'past_due',   label: 'Past due',   help: 'Renewal invoice was created but not yet paid. Buyer\'s license is still valid through the grace window.' },
+      { value: 'cancelled',  label: 'Cancelled',  help: 'Operator or buyer cancelled. License stays valid through the current cycle; renewal worker stops.' },
+      { value: 'lapsed',     label: 'Lapsed',     help: 'Past-due window expired. License rejects validation; only re-purchase reactivates.' },
     ]
-    let currentFilter = ''
-    const filterRow = el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0' })
-    function renderFilterPills() {
-      filterRow.innerHTML = ''
-      STATUSES.forEach((s) => {
-        const active = s.value === currentFilter
+    let currentStatusFilter = ''
+    let currentProductFilter = ''  // empty = all products
+    let allSubs = []                // full list, refreshed on load
+    let products = []               // for product slug → name lookup
+
+    const productPillRow = el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 6px' })
+    const statusPillRow = el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 14px' })
+
+    function statusBadge(s) {
+      const klass = s === 'active' ? 'b-success'
+        : s === 'past_due' ? 'b-warning'
+        : s === 'cancelled' ? 'b-neutral'
+        : s === 'lapsed' ? 'b-danger' : 'b-neutral'
+      const help = (STATUSES.find((row) => row.value === s) || {}).help
+      return el('span', { class: 'badge ' + klass, title: help || s }, s)
+    }
+
+    function fmtCadence(periodDays) {
+      return periodDays === 7 ? 'weekly'
+        : periodDays === 30 ? 'monthly'
+        : periodDays === 90 ? 'quarterly'
+        : periodDays === 180 ? 'semi-annual'
+        : periodDays === 365 ? 'annual'
+        : 'every ' + periodDays + 'd'
+    }
+
+    function fmtPrice(s) {
+      if (s.listed_currency === 'SAT') {
+        return Number(s.listed_value).toLocaleString() + ' sats'
+      }
+      return (s.listed_value / 100).toFixed(2) + ' ' + s.listed_currency
+    }
+
+    function productNameForId(productId) {
+      const p = products.find((pr) => pr.id === productId)
+      return p ? p.name : null
+    }
+
+    function productSlugForId(productId) {
+      const p = products.find((pr) => pr.id === productId)
+      return p ? p.slug : null
+    }
+
+    function renderProductPills() {
+      productPillRow.innerHTML = ''
+      // Compute counts per product after applying the status filter
+      // (so the product pill counts reflect the active status view).
+      const statusFiltered = currentStatusFilter
+        ? allSubs.filter((s) => s.status === currentStatusFilter)
+        : allSubs
+      const byProduct = {}
+      statusFiltered.forEach((s) => {
+        byProduct[s.product_id] = (byProduct[s.product_id] || 0) + 1
+      })
+      const allCount = statusFiltered.length
+      const pills = [{ id: '', label: 'All products', count: allCount }]
+      products.forEach((p) => {
+        pills.push({ id: p.id, label: p.name, count: byProduct[p.id] || 0 })
+      })
+      pills.forEach((opt) => {
+        const active = opt.id === currentProductFilter
         const pill = el('button', {
           class: 'btn sm ' + (active ? 'primary' : 'secondary'),
-          onclick: () => { currentFilter = s.value; renderFilterPills(); load() },
-        }, s.label)
-        filterRow.appendChild(pill)
+          onclick: () => { currentProductFilter = opt.id; renderProductPills(); renderStatusPills(); render() },
+        }, [
+          opt.label,
+          opt.count > 0
+            ? el('span', { style: 'margin-left:6px; opacity:0.7; font-weight:500' }, '(' + opt.count + ')')
+            : null,
+        ])
+        productPillRow.appendChild(pill)
       })
     }
-    renderFilterPills()
-    target.appendChild(filterRow)
+
+    function renderStatusPills() {
+      statusPillRow.innerHTML = ''
+      // Counts per status, filtered to the chosen product.
+      const productFiltered = currentProductFilter
+        ? allSubs.filter((s) => s.product_id === currentProductFilter)
+        : allSubs
+      const byStatus = {}
+      productFiltered.forEach((s) => { byStatus[s.status] = (byStatus[s.status] || 0) + 1 })
+      STATUSES.forEach((row) => {
+        const active = row.value === currentStatusFilter
+        const count = row.value ? (byStatus[row.value] || 0) : productFiltered.length
+        const pill = el('button', {
+          class: 'btn sm ' + (active ? 'primary' : 'secondary'),
+          title: row.help,
+          onclick: () => { currentStatusFilter = row.value; renderStatusPills(); renderProductPills(); render() },
+        }, [
+          row.label,
+          el('span', { style: 'margin-left:6px; opacity:0.7; font-weight:500' }, '(' + count + ')'),
+        ])
+        statusPillRow.appendChild(pill)
+      })
+    }
+
+    target.appendChild(productPillRow)
+    target.appendChild(statusPillRow)
 
     const tableHost = el('div')
     target.appendChild(tableHost)
 
-    async function load() {
+    function buildTableForSubs(subs) {
+      if (subs.length === 0) {
+        return plainCard([
+          el('p', { class: 'muted', style: 'margin:0' },
+            currentStatusFilter || currentProductFilter
+              ? '(no subscriptions match these filters)'
+              : 'No subscriptions yet — once a buyer purchases a recurring policy, they appear here.'),
+        ])
+      }
+      const headers = [
+        'License', 'Product', 'Cadence', 'Listed price', 'Status',
+        'Next renewal', 'Failures', '',
+      ]
+      const rows = subs.map((s) => el('tr', null, [
+        el('td', null, clickToCopy(s.license_id, s.license_id.slice(0, 8) + '…')),
+        el('td', null, productNameForId(s.product_id)
+          ? el('div', null, [
+              el('div', { style: 'font-weight:500; color:var(--navy-950)' }, productNameForId(s.product_id)),
+              el('div', { class: 'muted', style: 'font-size:11px; font-family:var(--font-mono)' },
+                productSlugForId(s.product_id) || s.product_id.slice(0, 8) + '…'),
+            ])
+          : el('span', { class: 'muted' }, '–')),
+        el('td', null, fmtCadence(s.period_days)),
+        el('td', null, fmtPrice(s)),
+        el('td', null, statusBadge(s.status)),
+        el('td', null, s.next_renewal_at
+          ? relativeDate(s.next_renewal_at, { muted: false })
+          : el('span', { class: 'muted' }, '–')),
+        el('td', null, String(s.consecutive_failures || 0)),
+        el('td', null, (s.status === 'active' || s.status === 'past_due')
+          ? el('button', {
+              class: 'btn sm danger',
+              onclick: async () => {
+                const reason = await reasonModal({
+                  eyebrow: 'Cancel subscription',
+                  title: 'Cancel this subscription?',
+                  message:
+                    'The license stays valid through the end of the current cycle. ' +
+                    'No new invoices will be created. The buyer can resubscribe later.',
+                  confirmLabel: 'Cancel subscription',
+                  confirmVariant: 'danger',
+                })
+                if (reason === null) return
+                try {
+                  await api('/v1/admin/subscriptions/' + s.id + '/cancel', {
+                    method: 'POST',
+                    body: { reason: reason || null },
+                  })
+                  loadAll()
+                } catch (e) { alert(e.message) }
+              },
+            }, 'Cancel')
+          : el('span', { class: 'muted', style: 'font-size:12px' }, '–')),
+      ]))
+      const t = el('table', { class: 't' })
+      t.appendChild(el('thead', null, el('tr', null, headers.map((h) => el('th', null, h)))))
+      const tb = el('tbody')
+      rows.forEach((r) => tb.appendChild(r))
+      t.appendChild(tb)
+      return t
+    }
+
+    function render() {
       tableHost.innerHTML = ''
-      try {
-        const url = '/v1/admin/subscriptions' + (currentFilter ? ('?status=' + currentFilter) : '')
-        const j = await api(url)
-        const subs = j.subscriptions || []
-        if (subs.length === 0) {
-          tableHost.appendChild(plainCard([
-            el('p', { class: 'muted', style: 'margin:0' }, '(no subscriptions match this filter)'),
-          ]))
-          return
-        }
-        const table = el('table', { class: 'table' })
-        const thead = el('thead', null, el('tr', null, [
-          el('th', null, 'License'),
-          el('th', null, 'Cadence'),
-          el('th', null, 'Listed price'),
-          el('th', null, 'Status'),
-          el('th', null, 'Next renewal'),
-          el('th', null, 'Failures'),
-          el('th', null, 'Actions'),
+      // Apply both filters.
+      let subs = allSubs
+      if (currentStatusFilter) subs = subs.filter((s) => s.status === currentStatusFilter)
+      if (currentProductFilter) subs = subs.filter((s) => s.product_id === currentProductFilter)
+
+      // If the operator has multiple products and isn't filtering to
+      // one specifically, group by product. Single-product instances
+      // get a flat table without the section chrome.
+      if (products.length <= 1 || currentProductFilter) {
+        const card = el('div', { class: 'card' }, [
+          el('div', { class: 'card-head' }, [
+            el('h3', null, currentProductFilter
+              ? (productNameForId(currentProductFilter) || 'Subscriptions')
+              : 'Subscriptions'),
+            el('span', { class: 'sub' }, subs.length + ' subscription' + (subs.length === 1 ? '' : 's')),
+          ]),
+          buildTableForSubs(subs),
+        ])
+        tableHost.appendChild(card)
+        return
+      }
+
+      // Multi-product: group + collapse empty products.
+      const productsWithSubs = products
+        .map((p) => ({
+          product: p,
+          subs: subs.filter((s) => s.product_id === p.id),
+        }))
+        .filter((g) => g.subs.length > 0)
+
+      if (productsWithSubs.length === 0) {
+        tableHost.appendChild(plainCard([
+          el('p', { class: 'muted', style: 'margin:0' },
+            '(no subscriptions match these filters)'),
         ]))
-        const tbody = el('tbody')
-        subs.forEach((s) => {
-          const statusBadge = (function () {
-            const klass = s.status === 'active' ? 'b-success'
-              : s.status === 'past_due' ? 'b-warning'
-              : s.status === 'cancelled' ? 'b-neutral'
-              : s.status === 'lapsed' ? 'b-danger' : 'b-neutral'
-            return el('span', { class: 'badge ' + klass }, s.status)
-          })()
-          const cadence = (s.period_days === 30 ? 'monthly'
-            : s.period_days === 90 ? 'quarterly'
-            : s.period_days === 180 ? 'semi-annual'
-            : s.period_days === 365 ? 'annual'
-            : ('every ' + s.period_days + 'd'))
-          const priceFmt = s.listed_currency === 'SAT'
-            ? (Number(s.listed_value).toLocaleString() + ' sats')
-            : ((s.listed_value / 100).toFixed(2) + ' ' + s.listed_currency)
-          const tr = el('tr', null, [
-            el('td', null, el('code', { class: 'small', title: s.license_id }, s.license_id.slice(0, 8) + '…')),
-            el('td', null, cadence),
-            el('td', null, priceFmt),
-            el('td', null, statusBadge),
-            el('td', { class: 'muted' }, s.next_renewal_at ? s.next_renewal_at.slice(0, 16).replace('T', ' ') : '–'),
-            el('td', null, String(s.consecutive_failures || 0)),
-            el('td', null, (s.status === 'active' || s.status === 'past_due')
-              ? el('button', {
-                  class: 'btn sm danger',
-                  onclick: async () => {
-                    const reason = prompt(
-                      'Cancel this subscription?\n\nThe license stays valid through the end of the current cycle. ' +
-                      'No new invoices will be created.\n\nOptional: enter a reason for the audit log:'
-                    )
-                    if (reason === null) return // user clicked Cancel
-                    try {
-                      await api('/v1/admin/subscriptions/' + s.id + '/cancel', {
-                        method: 'POST',
-                        body: { reason: reason || null },
-                      })
-                      load()
-                    } catch (e) { alert(e.message) }
-                  },
-                }, 'Cancel')
-              : el('span', { class: 'muted', style: 'font-size:12px' }, '–')),
-          ])
-          tbody.appendChild(tr)
-        })
-        table.appendChild(thead)
-        table.appendChild(tbody)
-        tableHost.appendChild(table)
+        return
+      }
+
+      productsWithSubs.forEach(({ product, subs: subList }) => {
+        // Per-product status breakdown for the section subtitle.
+        const breakdown = {}
+        subList.forEach((s) => { breakdown[s.status] = (breakdown[s.status] || 0) + 1 })
+        const breakdownTxt = Object.keys(breakdown).sort().map((k) => breakdown[k] + ' ' + k).join(' · ')
+        const card = el('div', { class: 'card', style: 'margin-bottom:14px' }, [
+          el('div', { class: 'card-head' }, [
+            el('h3', null, product.name + ' — ' + product.slug),
+            el('span', { class: 'sub' }, breakdownTxt),
+          ]),
+          buildTableForSubs(subList),
+        ])
+        tableHost.appendChild(card)
+      })
+    }
+
+    async function loadAll() {
+      tableHost.innerHTML = ''
+      tableHost.appendChild(plainCard([el('p', { class: 'muted', style: 'margin:0' }, 'Loading…')]))
+      try {
+        // Pull product list (for grouping + name lookup) and subs in parallel.
+        const [productsResp, subsResp] = await Promise.all([
+          api('/v1/products').catch(() => ({ products: [] })),
+          api('/v1/admin/subscriptions'),
+        ])
+        products = productsResp.products || []
+        allSubs = subsResp.subscriptions || []
+        renderProductPills()
+        renderStatusPills()
+        render()
       } catch (e) {
+        tableHost.innerHTML = ''
         tableHost.appendChild(plainCard([err('Failed to load subscriptions: ' + e.message)]))
       }
     }
-    load()
+
+    loadAll()
   }
 
   // -------- Discount codes --------
@@ -3184,106 +3496,285 @@ The request will be refused if there are licenses or invoices tied to it — use
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
-    const queryInput = el('input', { class: 'input', type: 'text', placeholder: 'email, npub, or invoice id (leave blank for recent)' })
+    // ---- Search row ----
+    const queryInput = el('input', {
+      class: 'input', type: 'text',
+      placeholder: 'email, npub, or invoice id (leave blank for recent)',
+    })
     const fieldSel = el('select', { class: 'select' }, [
       el('option', { value: 'email' }, 'Email'),
       el('option', { value: 'npub' }, 'Nostr npub'),
       el('option', { value: 'invoice' }, 'BTCPay invoice id'),
     ])
+
+    // ---- State for filters + grouping ----
+    let products = []                  // for product-name lookup + grouping
+    let allLicenses = []               // last fetched set
+    let currentProductFilter = ''      // empty = all products
+    let lastQuery = ''
+    let lastQueryField = 'email'
+
+    const productPillRow = el('div', {
+      style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0',
+    })
+    const statsRow = el('div', { class: 'stats', style: 'margin:0 0 14px' })
     const tableHolder = el('div')
+
+    function entitlementsCell(ents, productCatalog) {
+      if (!ents || ents.length === 0) {
+        return el('span', { class: 'muted' }, '–')
+      }
+      const cat = productCatalog || []
+      const wrap = el('div', { style: 'display:flex; flex-wrap:wrap; gap:4px;' })
+      ents.forEach((slug) => {
+        const entry = cat.find((c) => c.slug === slug)
+        const display = entry && entry.name ? entry.name : slug
+        const help = entry && entry.description ? entry.description : slug
+        wrap.appendChild(el('span', {
+          class: 'badge',
+          style:
+            'font-size:10.5px; padding:2px 7px; background:var(--cream-200); ' +
+            'color:var(--ink-700); font-weight:500;',
+          title: help,
+        }, display))
+      })
+      return wrap
+    }
+
+    function productById(id) {
+      return products.find((p) => p.id === id)
+    }
+    function productCatalogFor(license) {
+      const p = productById(license.product_id)
+      return (p && p.entitlements_catalog) || []
+    }
+
+    async function actLicense(l, op) {
+      // Suspend / unsuspend / revoke. Revoke is irreversible — the
+      // confirmation modal makes that obvious + collects an audit
+      // reason in one step (replaces the older confirm() + prompt()
+      // double-dialog flow).
+      const opts = {
+        suspend: {
+          eyebrow: 'Suspend license',
+          title: 'Suspend this license?',
+          message:
+            'The buyer\'s app will fail validation immediately ("suspended"). ' +
+            'Reversible — you can unsuspend later.',
+          confirmLabel: 'Suspend',
+          confirmVariant: 'danger',
+        },
+        unsuspend: {
+          eyebrow: 'Unsuspend license',
+          title: 'Unsuspend this license?',
+          message: 'License returns to active. Buyer\'s validate calls succeed again.',
+          confirmLabel: 'Unsuspend',
+          confirmVariant: 'primary',
+        },
+        revoke: {
+          eyebrow: 'Revoke license',
+          title: 'Revoke this license?',
+          message:
+            'Irreversible. Validate calls return "revoked" forever. ' +
+            'Use Suspend instead if you want a reversible block.',
+          warning: 'This action cannot be undone.',
+          confirmLabel: 'Revoke',
+          confirmVariant: 'danger',
+        },
+      }[op]
+      const reason = await reasonModal(opts)
+      if (reason === null) return
+      try {
+        await api('/v1/admin/licenses/' + l.id + '/' + op, {
+          method: 'POST', body: { reason: reason || '' },
+        })
+        loadLicenses()
+      } catch (e) { alert(e.message) }
+    }
+
+    function buildRowsFor(licenses) {
+      return licenses.map((l) => el('tr', null, [
+        el('td', null, clickToCopy(l.id, shortId(l.id))),
+        el('td', null, l.product_slug
+          ? el('code', { title: l.product_id }, l.product_slug)
+          : el('span', { class: 'muted' }, shortId(l.product_id))),
+        el('td', null, l.policy_slug
+          ? el('div', null, [
+              el('div', { style: 'font-weight:500; color:var(--navy-950)' },
+                l.policy_name || l.policy_slug),
+              l.policy_name
+                ? el('div', { class: 'muted', style: 'font-size:11.5px; font-family:var(--font-mono)' }, l.policy_slug)
+                : null,
+            ])
+          : el('span', { class: 'muted' }, '–')),
+        el('td', null, entitlementsCell(l.entitlements, productCatalogFor(l))),
+        el('td', null, statusBadge(l.status)),
+        el('td', null, relativeDate(l.issued_at)),
+        el('td', null, l.expires_at
+          ? relativeDate(l.expires_at, { muted: false })
+          : el('span', { class: 'badge b-gold' }, 'perpetual')),
+        el('td', { class: 'muted' }, l.buyer_email || '–'),
+        el('td', null, el('div', { class: 'actions-row' }, [
+          l.status !== 'revoked'
+            ? el('button', {
+                class: 'btn sm secondary',
+                title: 'Move this license to a different policy/tier',
+                onclick: () => openChangeTier(l),
+              }, 'Change tier')
+            : null,
+          l.status !== 'revoked' && l.status !== 'suspended'
+            ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'suspend') }, 'Suspend')
+            : null,
+          l.status === 'suspended'
+            ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'unsuspend') }, 'Unsuspend')
+            : null,
+          l.status !== 'revoked'
+            ? el('button', { class: 'btn sm danger', onclick: () => actLicense(l, 'revoke') }, 'Revoke')
+            : null,
+        ])),
+      ]))
+    }
+
+    function buildLicensesTable(licenses, title, subtitle, emptyMsg) {
+      return tableCard(
+        title,
+        subtitle,
+        ['ID', 'Product', 'Policy', 'Entitlements', 'Status', 'Issued', 'Expires', 'Buyer', ''],
+        buildRowsFor(licenses),
+        emptyMsg,
+      )
+    }
+
+    function renderProductPills() {
+      productPillRow.innerHTML = ''
+      const byProduct = {}
+      allLicenses.forEach((l) => {
+        byProduct[l.product_id] = (byProduct[l.product_id] || 0) + 1
+      })
+      const pills = [{ id: '', label: 'All products', count: allLicenses.length }]
+      products.forEach((p) => {
+        pills.push({ id: p.id, label: p.name, count: byProduct[p.id] || 0 })
+      })
+      pills.forEach((opt) => {
+        const active = opt.id === currentProductFilter
+        const pill = el('button', {
+          class: 'btn sm ' + (active ? 'primary' : 'secondary'),
+          onclick: () => { currentProductFilter = opt.id; renderProductPills(); render() },
+        }, [
+          opt.label,
+          el('span', { style: 'margin-left:6px; opacity:0.7; font-weight:500' }, '(' + opt.count + ')'),
+        ])
+        productPillRow.appendChild(pill)
+      })
+    }
+
+    function renderStats() {
+      statsRow.innerHTML = ''
+      // Filter by current product first; the row tells the operator
+      // about THIS scope, not the whole instance.
+      const scoped = currentProductFilter
+        ? allLicenses.filter((l) => l.product_id === currentProductFilter)
+        : allLicenses
+      const total = scoped.length
+      const active = scoped.filter((l) => l.status === 'active').length
+      const revoked = scoped.filter((l) => l.status === 'revoked').length
+      const now = Date.now()
+      const expiringSoon = scoped.filter((l) => {
+        if (!l.expires_at) return false
+        const t = new Date(l.expires_at).getTime()
+        return !isNaN(t) && t > now && (t - now) < 30 * 86_400_000
+      }).length
+      function statBox(label, value, helpText) {
+        return el('div', { class: 'stat' }, [
+          el('div', { class: 'stat-label', style: 'display:flex; align-items:center' }, [
+            label,
+            helpText ? helpIcon(helpText) : null,
+          ]),
+          el('div', { class: 'stat-value' }, String(value)),
+        ])
+      }
+      statsRow.appendChild(statBox('Licenses', total, 'Total in this scope (all-time, regardless of status).'))
+      statsRow.appendChild(statBox('Active', active, 'Status = active. Excludes suspended, revoked, expired.'))
+      statsRow.appendChild(statBox('Revoked', revoked, 'Status = revoked. Irreversible.'))
+      statsRow.appendChild(statBox('Expiring < 30d', expiringSoon,
+        'Active or unsuspended licenses with expires_at within the next 30 days. Useful for retention nudges.'))
+    }
+
+    function render() {
+      tableHolder.innerHTML = ''
+      let scoped = allLicenses
+      if (currentProductFilter) scoped = scoped.filter((l) => l.product_id === currentProductFilter)
+
+      // Single-product or product-filtered: flat table.
+      const inSearchMode = lastQuery.length > 0
+      if (products.length <= 1 || currentProductFilter || inSearchMode) {
+        const titleProduct = currentProductFilter
+          ? (productById(currentProductFilter) || { name: 'Product' }).name + ' — '
+          : ''
+        const title = inSearchMode
+          ? 'Search results'
+          : (titleProduct + 'Recent licenses')
+        const subtitle = scoped.length + ' license' + (scoped.length === 1 ? '' : 's') +
+          (inSearchMode ? '' : (scoped.length >= 100 ? ' (most recent 100)' : ''))
+        tableHolder.appendChild(buildLicensesTable(
+          scoped, title, subtitle,
+          inSearchMode
+            ? 'No matches.'
+            : 'No licenses yet — once a buyer purchases or you manually issue, they appear here.',
+        ))
+        renderStats()
+        return
+      }
+
+      // Multi-product: group + collapse empty products.
+      const grouped = products
+        .map((p) => ({ product: p, licenses: scoped.filter((l) => l.product_id === p.id) }))
+        .filter((g) => g.licenses.length > 0)
+
+      if (grouped.length === 0) {
+        tableHolder.appendChild(plainCard([
+          el('p', { class: 'muted', style: 'margin:0' }, 'No licenses match this filter.'),
+        ]))
+        renderStats()
+        return
+      }
+      grouped.forEach(({ product, licenses }) => {
+        const breakdown = {}
+        licenses.forEach((l) => { breakdown[l.status] = (breakdown[l.status] || 0) + 1 })
+        const breakdownTxt = Object.keys(breakdown).sort().map((k) => breakdown[k] + ' ' + k).join(' · ')
+        const card = el('div', { class: 'card', style: 'margin-bottom:14px' }, [
+          el('div', { class: 'card-head' }, [
+            el('h3', null, product.name + ' — ' + product.slug),
+            el('span', { class: 'sub' }, breakdownTxt),
+          ]),
+          buildLicensesTable(licenses, '', '', '(none)'),
+        ])
+        tableHolder.appendChild(card)
+      })
+      renderStats()
+    }
 
     async function loadLicenses() {
       const q = queryInput.value.trim()
+      lastQuery = q
+      lastQueryField = fieldSel.value
       tableHolder.innerHTML = ''
-      tableHolder.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, q ? 'Searching…' : 'Loading recent licenses…')))
+      tableHolder.appendChild(plainCard([el('p', { class: 'muted', style: 'margin:0' },
+        q ? 'Searching…' : 'Loading recent licenses…')]))
       try {
-        let url = '/v1/admin/licenses/search'
-        if (q) {
-          const params = new URLSearchParams()
-          params.set(fieldSel.value, q)
-          url += '?' + params.toString()
-        }
-        const j = await api(url)
-        const lic = j.licenses || []
-        function entitlementsCell(ents) {
-          if (!ents || ents.length === 0) {
-            return el('span', { class: 'muted' }, '–')
-          }
-          const wrap = el('div', { style: 'display:flex; flex-wrap:wrap; gap:4px;' })
-          ents.forEach((e) => {
-            wrap.appendChild(el('span', {
-              class: 'badge',
-              style: 'font-size:10.5px; padding:2px 7px; background:var(--cream-200); color:var(--ink-700); font-family:var(--font-mono); font-weight:500;',
-              title: e,
-            }, e))
-          })
-          return wrap
-        }
-        const rows = lic.map((l) => el('tr', null, [
-          el('td', null, el('code', null, shortId(l.id))),
-          el('td', null, l.product_slug
-            ? el('code', { title: l.product_id }, l.product_slug)
-            : shortId(l.product_id)),
-          el('td', null, l.policy_slug
-            // Display name primary, slug secondary (smaller + muted)
-            // so operators see what the buyer sees ("Pro") without
-            // losing the technical identifier they need for SDK calls.
-            ? el('div', null, [
-                el('div', { style: 'font-weight:500; color:var(--navy-950)' },
-                  l.policy_name || l.policy_slug),
-                l.policy_name
-                  ? el('div', { class: 'muted', style: 'font-size:11.5px; font-family:var(--font-mono)' }, l.policy_slug)
-                  : null,
-              ])
-            : el('span', { class: 'muted' }, '–')),
-          el('td', null, entitlementsCell(l.entitlements)),
-          el('td', null, statusBadge(l.status)),
-          el('td', { class: 'muted' }, fmtDate(l.issued_at)),
-          el('td', { class: 'muted' }, l.expires_at ? fmtDate(l.expires_at) : el('span', { class: 'badge b-gold' }, 'perpetual')),
-          el('td', { class: 'muted' }, l.buyer_email || '–'),
-          el('td', null, el('div', { class: 'actions-row' }, [
-            l.status !== 'revoked'
-              ? el('button', {
-                  class: 'btn sm secondary',
-                  title: 'Move this license to a different policy/tier',
-                  onclick: () => openChangeTier(l),
-                }, 'Change tier')
-              : null,
-            l.status !== 'revoked' && l.status !== 'suspended'
-              ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'suspend') }, 'Suspend')
-              : null,
-            l.status === 'suspended'
-              ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'unsuspend') }, 'Unsuspend')
-              : null,
-            l.status !== 'revoked'
-              ? el('button', { class: 'btn sm danger', onclick: () => actLicense(l, 'revoke') }, 'Revoke')
-              : null,
-          ])),
-        ]))
-        const title = q ? 'Search results' : 'Recent licenses'
-        const subtitle = lic.length + ' license' + (lic.length === 1 ? '' : 's') +
-          (q ? '' : (lic.length >= 100 ? ' (most recent 100)' : ''))
-        tableHolder.innerHTML = ''
-        tableHolder.appendChild(tableCard(
-          title,
-          subtitle,
-          ['ID', 'Product', 'Policy', 'Entitlements', 'Status', 'Issued', 'Expires', 'Buyer', ''],
-          rows,
-          q ? 'No matches.' : 'No licenses issued yet — once a buyer purchases or redeems, they appear here.'
-        ))
+        const params = q ? '?' + new URLSearchParams({ [lastQueryField]: q }).toString() : ''
+        const [productsResp, licResp] = await Promise.all([
+          api('/v1/products').catch(() => ({ products: [] })),
+          api('/v1/admin/licenses/search' + params),
+        ])
+        products = productsResp.products || []
+        allLicenses = licResp.licenses || []
+        renderProductPills()
+        render()
       } catch (e) {
         tableHolder.innerHTML = ''
         tableHolder.appendChild(plainCard([err(e.message)]))
       }
-    }
-
-    async function actLicense(l, op) {
-      if (op === 'revoke' && !confirm('Revoke this license? This is irreversible.')) return
-      const reason = prompt('Reason (optional):') || ''
-      try {
-        await api('/v1/admin/licenses/' + l.id + '/' + op, { method: 'POST', body: { reason } })
-        loadLicenses()
-      } catch (e) { alert(e.message) }
     }
 
     queryInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') loadLicenses() })
@@ -3314,11 +3805,23 @@ The request will be refused if there are licenses or invoices tied to it — use
       }
 
       const productOptions = products.map((p) => ({ value: p.slug, label: p.name + ' (' + p.slug + ')' }))
-      const productSel = formSelect('issue_product', 'Product', productOptions, { required: true })
-      const policySel = formSelect('issue_policy', 'Policy', [{ value: '', label: '— loading —' }], { required: true })
-      const policyHint = el('div', { class: 'hint', style: 'margin-top:-6px; margin-bottom:12px;' }, 'Pick a tier; the license inherits its entitlements + duration + max_machines.')
-      const noteField = formInput('issue_note', 'Internal note (optional)', { hint: 'e.g. "comp", "press", "self-issue Pro for dogfood".' })
-      const emailField = formInput('issue_email', 'Buyer email (optional)', { type: 'email' })
+      const productSel = formSelect('issue_product', 'Product', productOptions, {
+        required: true,
+        help: 'Which product the license is for. Determines the buyer\'s available policies (tiers) below.',
+      })
+      const policySel = formSelect('issue_policy', 'Policy', [{ value: '', label: '— loading —' }], {
+        required: true,
+        help: 'Tier the license inherits from — entitlements, duration, max_machines, trial flag all come from here.',
+      })
+      const noteField = formInput('issue_note', 'Internal note', {
+        help: 'Free-form note attached to the audit log. Examples: "comp", "press", "self-issue Pro for dogfood". Not visible to the buyer.',
+        placeholder: 'optional',
+      })
+      const emailField = formInput('issue_email', 'Buyer email', {
+        type: 'email',
+        help: 'Optional. Stored on the license + invoice. Used by buyer self-service recovery if they later lose their key.',
+        placeholder: 'optional',
+      })
 
       // Populate policy dropdown when product changes.
       async function refreshPolicies() {
@@ -3372,7 +3875,6 @@ The request will be refused if there are licenses or invoices tied to it — use
 
       body.appendChild(productSel)
       body.appendChild(policySel)
-      body.appendChild(policyHint)
       body.appendChild(emailField)
       body.appendChild(noteField)
       body.appendChild(submitBtn)
@@ -3426,8 +3928,13 @@ The request will be refused if there are licenses or invoices tied to it — use
     }
 
     target.appendChild(plainCard([
-      el('p', { class: 'muted', style: 'margin:0 0 16px' },
-        'Showing the 100 most recently issued licenses by default. Search by buyer email, Nostr npub, or BTCPay invoice id to filter.'),
+      el('p', { class: 'muted', style: 'margin:0 0 16px' }, [
+        'Showing the 100 most recently issued licenses by default. Search by buyer email, Nostr npub, or BTCPay invoice id to filter. ',
+        helpIcon(
+          'Multi-product instances render as per-product sections. Use the product pills above to filter to a single product. ' +
+          'Search results bypass the per-product grouping (search is global across all products).',
+        ),
+      ]),
       el('div', { class: 'toolbar' }, [
         fieldSel,
         queryInput,
@@ -3443,6 +3950,8 @@ The request will be refused if there are licenses or invoices tied to it — use
       ]),
       issueDisclosure,
     ]))
+    target.appendChild(productPillRow)
+    target.appendChild(statsRow)
     target.appendChild(tableHolder)
     buildIssueForm()
     if (window.lucide) lucide.createIcons()
