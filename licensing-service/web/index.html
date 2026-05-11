@@ -1160,7 +1160,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           style: 'font-family:var(--font-display); font-weight:700; font-size:15px; color:var(--navy-950); margin-bottom:4px; letter-spacing:-0.01em;',
         }, 'Embed your public key'),
         el('p', { style: 'font-size:13px; color:var(--ink-700); margin:0 0 12px; line-height:1.5' },
-          'Paste this into your app’s source so it verifies signatures offline. The key is also available at /v1/issuer/public-key.'),
+          'Paste this into your product’s source code so it verifies signatures offline. The key is also available at /v1/issuer/public-key.'),
         el('div', {
           style: 'background:var(--navy-950); color:var(--cream-50); padding:10px 12px; border-radius:7px; font-family:var(--font-mono); font-size:12px; display:flex; gap:10px; align-items:center; justify-content:space-between;',
         }, [
@@ -4501,11 +4501,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     // ---- Search row ----
     const queryInput = el('input', {
       class: 'input', type: 'text',
-      placeholder: 'email, npub, or invoice id (leave blank for recent)',
+      placeholder: 'email or invoice id (leave blank for recent)',
     })
+    // npub search is wired on the backend but the purchase flow doesn't
+    // capture a buyer npub yet, so there are no npub rows to find. Hide
+    // the option from the UI until that part of the flow ships.
     const fieldSel = el('select', { class: 'select' }, [
       el('option', { value: 'email' }, 'Email'),
-      el('option', { value: 'npub' }, 'Nostr npub'),
       el('option', { value: 'invoice' }, 'BTCPay invoice id'),
     ])
 
@@ -4975,7 +4977,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' }, [
-        'Showing the 100 most recently issued licenses by default. Search by buyer email, Nostr npub, or BTCPay invoice id to filter. ',
+        'Showing the 100 most recently issued licenses by default. Search by buyer email or BTCPay invoice id to filter. ',
         helpIcon(
           'Multi-product instances render as per-product sections. Use the product pills above to filter to a single product. ' +
           'Search results bypass the per-product grouping (search is global across all products).',

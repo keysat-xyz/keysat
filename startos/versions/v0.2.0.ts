@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:30 — **Two small copy fixes.** "Embed your public key" tip now says "your product\'s source code" (not "your app\'s source") — clearer for operators distributing libraries, services, or anything that isn\'t literally an app. And the Licenses search row drops the Nostr npub mention from the placeholder, the description, and the search-field dropdown, since the purchase flow doesn\'t capture buyer npubs yet so the option has nothing to find. The npub search code-path on the backend stays — we\'ll bring the UI option back when buyer npub capture lands in the purchase flow.',
+  '',
   '0.2.0:29 — **Tier-card cross-card horizontal alignment via CSS subgrid.** Visually equivalent sections (names, prices, first feature bullet, Select button) now line up horizontally across all visible tier cards. Cards with fewer / shorter sections get extra whitespace in the rows they don\'t fill — the explicit tradeoff the operator asked for, in service of a cleaner grid.',
   '',
   '**How.** Each `.tier` card is now a CSS subgrid that shares row tracks with the parent `.tiers` grid. Eight named rows: launch-meta → name → original-price → price → meta-block → description → features (1fr) → button. Each section in the card emits with an explicit `grid-row`, so omitted sections (e.g. Creator has no struck-through original-price line) just leave the row empty while still preserving the alignment across siblings. The features row is `1fr` so it absorbs vertical slack, pinning the Select button to the bottom of every card.',
@@ -456,7 +458,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:29',
+  version: '0.2.0:30',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
