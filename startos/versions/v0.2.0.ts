@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:25 — **Discount-code policy pills match the admin UI palette.** Cosmetic-only fix. The "Restrict to policies" multi-pickers on both the Create and Edit forms were rendering selected pills as dark navy with gold text, which clashed with the gold-filled / cream-outlined pill convention used everywhere else in the admin (entitlements bubble picker, marketing-bullets position, etc.). Aligned both pickers to that shared style. No data or behavior change — purely a CSS swap.',
+  '',
   '0.2.0:24 — **Per-entitlement "hide on buy page" toggle.** Decouples "what the license grants" (functional) from "what the buyer sees on the tier card" (marketing). The entitlement is still issued — only its display is filtered.',
   '',
   '**Why.** A common pattern: Pro inherits everything from Creator. On the buy page, instead of duplicating "Self-host on Start9 ✓" on every tier, the operator wants to write "Everything in Creator, plus:" as a marketing bullet and hide the duplicate entitlement from Pro\'s card. Before :24, the only way was to either drop the entitlement from the policy (breaks the license) or accept the duplication.',
@@ -400,7 +402,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:24',
+  version: '0.2.0:25',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

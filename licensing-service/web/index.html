@@ -3831,14 +3831,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       }
       policyMultiHost._available.forEach((p) => {
         const on = policyMultiHost._selected.has(p.slug)
+        // Match the gold-filled pill convention used by
+        // entitlementBubblePicker so the admin UI looks consistent.
         const pill = el('button', {
           type: 'button',
           'data-policy-slug': p.slug,
-          style: 'font-size:12px; padding:4px 12px; border-radius:999px; cursor:pointer; ' +
-            'border:1.5px solid ' + (on ? 'var(--gold-700)' : 'var(--border-1)') + '; ' +
-            'background:' + (on ? 'var(--navy-950)' : 'var(--cream-100)') + '; ' +
-            'color:' + (on ? 'var(--gold-500)' : 'var(--ink-700)') + '; ' +
-            'font-weight:' + (on ? '600' : '500') + ';',
+          style: 'font-size:13px; padding:6px 12px; border-radius:999px; cursor:pointer; ' +
+            'font-family:var(--font-body); font-weight:500; transition:all 100ms; ' +
+            (on
+              ? 'background:var(--gold-500); color:var(--navy-950); border:1px solid var(--gold-500);'
+              : 'background:transparent; color:var(--ink-700); border:1px solid var(--border-2);'),
         }, p.name)
         pill.addEventListener('click', () => {
           if (policyMultiHost._selected.has(p.slug)) policyMultiHost._selected.delete(p.slug)
@@ -4220,14 +4222,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         }
         editPolicies.forEach((p) => {
           const on = editPolicyHost._selected.has(p.id)
+          // Match the gold-filled pill convention used by
+          // entitlementBubblePicker so the admin UI looks consistent.
           const pill = el('button', {
             type: 'button',
             'data-policy-id': p.id,
-            style: 'font-size:12px; padding:4px 12px; border-radius:999px; cursor:pointer; ' +
-              'border:1.5px solid ' + (on ? 'var(--gold-700)' : 'var(--border-1)') + '; ' +
-              'background:' + (on ? 'var(--navy-950)' : 'var(--cream-100)') + '; ' +
-              'color:' + (on ? 'var(--gold-500)' : 'var(--ink-700)') + '; ' +
-              'font-weight:' + (on ? '600' : '500') + ';',
+            style: 'font-size:13px; padding:6px 12px; border-radius:999px; cursor:pointer; ' +
+              'font-family:var(--font-body); font-weight:500; transition:all 100ms; ' +
+              (on
+                ? 'background:var(--gold-500); color:var(--navy-950); border:1px solid var(--gold-500);'
+                : 'background:transparent; color:var(--ink-700); border:1px solid var(--border-2);'),
           }, p.name)
           pill.addEventListener('click', () => {
             if (editPolicyHost._selected.has(p.id)) editPolicyHost._selected.delete(p.id)
