@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:13 — **CORS on public endpoints.** Small, surgical release. Adds permissive cross-origin headers (`Access-Control-Allow-Origin: *`, all methods, all headers) to every public route so browsers can fetch from any origin. Unblocks a few things the static keysat.xyz / docs.keysat.xyz pages want to do directly without proxying:',
+  '',
+  '- The pricing page on docs.keysat.xyz fetches the live tier list from `licensing.keysat.xyz/v1/products/keysat/policies` so it always reflects what\'s actually configured on the master Keysat. No more out-of-sync static copies.',
+  '- The agent-friendly pitch on keysat.xyz can now link to `licensing.keysat.xyz/v1/openapi.json` and have agents fetch it in-browser without setup.',
+  '- Third-party tooling (SDK demos, integration sandboxes) can call `/v1/validate` from a browser without a server-side proxy.',
+  '',
+  '**Security posture is unchanged.** `Access-Control-Allow-Credentials` is deliberately OFF. That combination — `ACAO: *` plus no-credentials — means a cross-origin page can read public responses but cannot ride a logged-in admin session cookie to hit `/v1/admin/*`. Admin endpoints still require an explicit Bearer token; that token isn\'t auto-attached by browsers; nothing changes for operators.',
+  '',
+  '**Test count: 85** (was 83 — +2 new CORS regression tests covering both the ACAO header on public endpoints and OPTIONS preflight handling).',
+  '',
+  '**Upgrade path.** v0.2.0:12 → v0.2.0:13 is a drop-in. No schema migrations, no SDK changes, no admin-side behavior change. The only operator-visible difference is that browser-side scripts fetching public endpoints from a different origin start working.',
+  '',
   '0.2.0:12 — **Settings tab + agent-friendly operator API.** Major release that consolidates operator configuration into the admin UI and ships first-class agent / AI-automation support: OpenAPI 3.1 spec, scoped API keys, agent integration guide. Plus a slate of UX cleanups carried over from operator testing.',
   '',
   '**New Settings tab in the admin UI.** Three subsections in one place:',
@@ -264,7 +276,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:12',
+  version: '0.2.0:13',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

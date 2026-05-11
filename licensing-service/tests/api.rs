@@ -3044,3 +3044,63 @@ async fn zaprite_connect_gated_by_pro_entitlement() {
     assert!(body["upgrade_url"].as_str().expect("upgrade_url").contains("/buy/keysat"));
 }
 
+/// CORS — the public read-only endpoints answer cross-origin requests
+/// from any browser origin so docs.keysat.xyz can fetch live pricing
+/// from licensing.keysat.xyz without proxying. `allow_credentials` is
+/// intentionally OFF: pages can read public responses but cannot ride
+/// a logged-in admin session cookie to hit /v1/admin/*.
+#[tokio::test]
+async fn cors_allows_cross_origin_on_public_endpoints() {
+    let (state, _tmp) = make_test_state().await;
+    let req = build_request(
+        "GET",
+        "/v1/openapi.json",
+        &[("origin", "https://docs.keysat.xyz")],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let acao = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(acao, "*", "public endpoints should set ACAO: *");
+    // Credentials must NOT be allowed — combining `*` origin with
+    // credentials is rejected by browsers, and disabling it means a
+    // hostile cross-origin page can't ride a session cookie.
+    let acac = resp.headers().get("access-control-allow-credentials");
+    assert!(acac.is_none(), "credentials must not be allowed");
+}
+
+/// CORS preflight (OPTIONS) is handled by the CorsLayer directly and
+/// never reaches the session-bridge or any handler. This is the path
+/// browsers take before issuing an actual cross-origin POST.
+#[tokio::test]
+async fn cors_preflight_returns_2xx_without_auth() {
+    let (state, _tmp) = make_test_state().await;
+    let req = build_request(
+        "OPTIONS",
+        "/v1/admin/products",
+        &[
+            ("origin", "https://example.com"),
+            ("access-control-request-method", "POST"),
+            ("access-control-request-headers", "authorization,content-type"),
+        ],
+        None,
+    );
+    let resp = send(&state, req).await;
+    // CorsLayer answers preflight with 200 (or 204). No auth required.
+    assert!(
+        resp.status().is_success() || resp.status() == StatusCode::NO_CONTENT,
+        "preflight should be 2xx, got {}",
+        resp.status()
+    );
+    let acao = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(acao, "*");
+}
+

@@ -96,6 +96,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -483,12 +484,35 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/login/status", get(auth::login_status))
         .route("/v1/admin/web-password", post(auth::set_password))
         // Bridge cookie-based sessions onto the existing API-key require_admin
-        // guard. Has to be the last layer so it runs first (axum applies
-        // layers in reverse-of-declaration order).
+        // guard. Layers apply in reverse-of-declaration order, so this runs
+        // AFTER the CorsLayer below (i.e. session-bridge is "inside" CORS).
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             session_layer::session_to_bearer,
         ))
+        // CORS. Declared last so it's the OUTERMOST layer at runtime,
+        // which means:
+        //  (a) Preflight OPTIONS requests get answered directly by the
+        //      CorsLayer and never hit the session-bridge or any handler.
+        //      Without this, OPTIONS to /v1/admin/* would 401 because
+        //      browsers don't send credentials on preflights.
+        //  (b) `allow_credentials` is NOT enabled. That's deliberate —
+        //      `Access-Control-Allow-Origin: *` combined with credentials
+        //      is rejected by browsers, AND keeping it off means a hostile
+        //      cross-origin page can't piggy-back on a logged-in admin
+        //      session cookie. Bearer-token auth on /v1/admin/* still
+        //      works (the agent / SDK supplies the token explicitly).
+        //
+        // Net effect: public endpoints like /v1/products/:slug/policies,
+        // /v1/openapi.json, /v1/validate, /v1/issuer/public-key can be
+        // called from any origin (docs.keysat.xyz, keysat.xyz, third-
+        // party tools). Admin endpoints stay closed without a token.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 
