@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:17 — **Discount Codes form usability.** Three concrete improvements to make the Discount Codes tab less type-heavy and more discoverable.',
+  '',
+  '**Product + policy scope as dropdowns, not free-text.** The create form previously had a "Restrict to product slug (optional)" text input that required operators to remember slugs exactly. Now it\'s a dropdown populated from the product list — pick "Any product" or any specific product. A second dependent dropdown appears for "Restrict to policy" once a product is chosen; it loads that product\'s policies on the fly. Both default to "Any" so the previous "no scope = global" behavior is preserved.',
+  '',
+  '**Datetime picker on expires_at.** The "Expires at (RFC3339)" text input is now a native `datetime-local` picker on both create and edit forms. Operators get a calendar + time spinner UI instead of having to hand-type `2026-12-31T23:59:59Z`. Submit converts back to RFC3339 (UTC) automatically. Empty stays empty (no expiry).',
+  '',
+  '**Edit form shows current scope read-only.** Previously the Edit modal didn\'t surface which product or policy a code was scoped to — operators reviewing a code couldn\'t tell at a glance. Now the top of the edit form shows "Applies to: [product] → [policy]" (or "Applies to: all products on this instance" for global codes) as a muted info block. Scope is still immutable (disable + create new to change), but at least it\'s visible.',
+  '',
+  '**Test count: 87** (unchanged — UI-only release).',
+  '',
+  '**Upgrade path.** v0.2.0:16 → v0.2.0:17 is a drop-in. No schema, no SDK, no behavior change for buyers. The admin form fields persist the same way they always did (`product_slug`, `policy_slug` strings sent to the existing endpoints).',
+  '',
   '0.2.0:16 — **Launch-special discount codes + marketing bullets + discount codes per-product UI.** Operators can now run public promotional discounts that auto-apply on the buy page, plus author marketing-copy bullets on tiers that don\'t map to real entitlements.',
   '',
   '**Launch-special (featured) discount codes (migration 0017).** Flag a discount code as `featured` and three things happen automatically: (1) the buy page renders a diagonal "LAUNCH SPECIAL" gold ribbon on every tier the code applies to; (2) the original price is struck through and replaced with the discounted price; (3) the purchase endpoint auto-applies the discount for buyers who don\'t type any code. Operator-typed codes still win — a buyer who pastes a different code in the form gets that code instead. When a featured code exhausts its `max_uses` cap (e.g. "first 100 buyers"), the ribbon disappears automatically and pricing reverts to standard. Expiry dates work the same way. New repo helper `find_applicable_featured_discount` picks the most specific match (policy > product > global) with operator priority by created_at.',
@@ -314,7 +326,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:16',
+  version: '0.2.0:17',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

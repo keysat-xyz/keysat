@@ -3656,6 +3656,45 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       return ''
     }
 
+    // Pre-fetch products so the create form's scope-picker dropdowns
+    // can populate. The codes table render below reuses the same fetch
+    // (`productsForCreate`) — see the Promise.all in the table block.
+    const productsForCreate = (await api('/v1/products').catch(() => ({ products: [] }))).products || []
+
+    // Product picker: "Any product" + one option per product.
+    const productOptions = [{ value: '', label: '— Any product —' }]
+    productsForCreate.forEach((p) => productOptions.push({ value: p.slug, label: p.name }))
+    const productScopeField = formSelect('product_slug', 'Restrict to product (optional)',
+      productOptions, { value: '' })
+
+    // Policy picker: populated on-demand when a product is selected.
+    // Disabled when "Any product" is selected (a policy-scoped code
+    // requires a product scope per the server contract).
+    const policyScopeField = formSelect('policy_slug', 'Restrict to policy (optional)',
+      [{ value: '', label: '— Any policy —' }], { value: '' })
+    const policySel = policyScopeField.querySelector('select')
+    policySel.disabled = true
+
+    productScopeField.querySelector('select').addEventListener('change', async (e) => {
+      const slug = e.target.value
+      policySel.innerHTML = ''
+      policySel.appendChild(el('option', { value: '' }, '— Any policy —'))
+      if (!slug) {
+        policySel.disabled = true
+        return
+      }
+      policySel.disabled = false
+      try {
+        const r = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(slug) +
+          '&include_inactive=true')
+        const pols = r.policies || []
+        pols.forEach((p) => policySel.appendChild(el('option', { value: p.slug }, p.name)))
+      } catch (_) {
+        // Silent: operator can still create a product-scoped code
+        // without a policy if the policy fetch fails.
+      }
+    })
+
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new code'),
       el('div', { class: 'body' }, [
@@ -3676,13 +3715,14 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             { value: 'EUR', label: 'EUR (€)' },
           ], { value: 'SAT', hint: 'matters for "fixed amount off" and "set flat price" — ignored for percent / free.' }),
         ]),
+        // Scope: product picker + dependent policy picker, side-by-side.
+        // Both default to "Any" — a code with no scope applies to every
+        // product on this instance.
+        el('div', { class: 'row-2' }, [productScopeField, policyScopeField]),
+        // Limits: max-uses + expires-at on the same row.
         el('div', { class: 'row-2' }, [
           formInput('max_uses', 'Max uses (0 = unlimited)', { type: 'number', value: '0' }),
-          el('div'), // spacer to keep the row balanced
-        ]),
-        el('div', { class: 'row-2' }, [
-          formInput('expires_at', 'Expires at (RFC3339, optional)', { hint: 'e.g. 2026-12-31T23:59:59Z' }),
-          formInput('product_slug', 'Restrict to product slug (optional)'),
+          formInput('expires_at', 'Expires at', { type: 'datetime-local', hint: 'Leave blank for no expiry.' }),
         ]),
         formInput('referrer_label', 'Referrer / campaign label (optional)'),
         formInput('description', 'Description (internal note)', { textarea: true }),
@@ -3701,10 +3741,6 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             const kind = create.querySelector('[name=kind]').value
             const currency = create.querySelector('[name=discount_currency]').value
             const rawAmount = parseFloat(create.querySelector('[name=amount]').value) || 0
-            // For percent: stored as basis points (50% → 5000).
-            // For SAT-currency fixed/set: stored as sats (whole number).
-            // For USD/EUR fixed/set: stored as cents (1.00 main unit → 100).
-            // Free license: amount ignored (we send 0).
             let amount
             if (kind === 'percent') amount = Math.round(rawAmount * 100)
             else if (kind === 'free_license') amount = 0
@@ -3718,10 +3754,19 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             }
             const mu = parseInt(create.querySelector('[name=max_uses]').value, 10) || 0
             if (mu > 0) body.max_uses = mu
-            const exp = create.querySelector('[name=expires_at]').value.trim()
-            if (exp) body.expires_at = exp
+            // datetime-local returns "2026-12-31T23:59" (local time, no
+            // seconds, no timezone). Convert to RFC3339 by appending
+            // ":00Z" — that pins it to UTC. Operators expecting local
+            // time should use a future picker upgrade; for now this
+            // matches the server-side parser (chrono RFC3339).
+            const expRaw = create.querySelector('[name=expires_at]').value.trim()
+            if (expRaw) {
+              body.expires_at = expRaw.length === 16 ? (expRaw + ':00Z') : expRaw
+            }
             const ps = create.querySelector('[name=product_slug]').value.trim()
             if (ps) body.product_slug = ps
+            const pol = create.querySelector('[name=policy_slug]').value.trim()
+            if (pol) body.policy_slug = pol
             const rl = create.querySelector('[name=referrer_label]').value.trim()
             if (rl) body.referrer_label = rl
             const featured = create.querySelector('[name=featured]').checked
@@ -3730,7 +3775,6 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             status.replaceWith(ok('Created. Reloading…'))
             setTimeout(routes.codes, 600)
           } catch (e) {
-            // Tier-cap 402 → upgrade modal; everything else → inline status pill.
             if (handleTierCap(e)) status.remove()
             else status.replaceWith(err(e.message))
           }
@@ -3765,9 +3809,32 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const editPanel = el('div', { id: 'edit-code-panel', style: 'display:none; margin:16px 0;' })
     target.appendChild(editPanel)
 
-    function openEdit(c) {
+    async function openEdit(c) {
       editPanel.innerHTML = ''
       editPanel.style.display = 'block'
+
+      // Resolve scope names (read-only display — scope can't be edited).
+      // Product name comes from the products list we already fetched.
+      // Policy name requires fetching the product's policies, done
+      // lazily here when an actual policy_id is bound.
+      let scopeLabel = 'Applies to: all products on this instance'
+      if (c.applies_to_product_id) {
+        const prod = productsForCreate.find((p) => p.id === c.applies_to_product_id)
+        const productName = prod ? prod.name : c.applies_to_product_id
+        if (c.applies_to_policy_id && prod) {
+          let policyName = c.applies_to_policy_id
+          try {
+            const r = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(prod.slug) +
+              '&include_inactive=true')
+            const pol = (r.policies || []).find((p) => p.id === c.applies_to_policy_id)
+            if (pol) policyName = pol.name + ' (' + pol.slug + ')'
+          } catch (_) {}
+          scopeLabel = 'Applies to: ' + productName + ' → ' + policyName
+        } else {
+          scopeLabel = 'Applies to: ' + productName + ' (any policy)'
+        }
+      }
+
       const amtField = formInput('e_amount', 'Amount', {
         type: 'number',
         value: c.kind === 'percent' ? String(c.amount / 100) : String(c.amount),
@@ -3780,8 +3847,21 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         value: c.max_uses == null ? '0' : String(c.max_uses),
         hint: c.used_count > 0 ? 'cannot go below current used_count (' + c.used_count + ').' : null,
       })
-      const expField = formInput('e_expires_at', 'Expires at (RFC3339, blank to clear)', {
-        value: c.expires_at || '',
+      // Convert RFC3339 → datetime-local format (YYYY-MM-DDTHH:MM) so
+      // the native picker can render. On submit we reverse: append
+      // ":00Z" for UTC. Empty stays empty (= clear the field).
+      const expValueInit = (() => {
+        if (!c.expires_at) return ''
+        try {
+          const d = new Date(c.expires_at)
+          if (Number.isNaN(d.getTime())) return ''
+          return d.toISOString().slice(0, 16) // strip seconds + Z
+        } catch (_) { return '' }
+      })()
+      const expField = formInput('e_expires_at', 'Expires at', {
+        type: 'datetime-local',
+        value: expValueInit,
+        hint: 'Blank to clear.',
       })
       const refField = formInput('e_referrer_label', 'Referrer / campaign label (blank to clear)', {
         value: c.referrer_label || '',
@@ -3820,8 +3900,11 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           }
           const muRaw = parseInt(editPanel.querySelector('[name=e_max_uses]').value, 10) || 0
           body.max_uses = muRaw > 0 ? muRaw : null
+          // datetime-local → RFC3339 by appending ":00Z" for UTC.
+          // Empty → null (clear the field).
           const expRaw = editPanel.querySelector('[name=e_expires_at]').value.trim()
-          body.expires_at = expRaw === '' ? null : expRaw
+          body.expires_at = expRaw === '' ? null
+            : (expRaw.length === 16 ? (expRaw + ':00Z') : expRaw)
           const refRaw = editPanel.querySelector('[name=e_referrer_label]').value.trim()
           body.referrer_label = refRaw === '' ? null : refRaw
           body.description = editPanel.querySelector('[name=e_description]').value || ''
@@ -3840,12 +3923,21 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       }, 'Cancel')
 
       editPanel.appendChild(plainCard([
-        el('div', { style: 'display:flex; align-items:baseline; justify-content:space-between; margin-bottom:12px' }, [
+        el('div', { style: 'display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px' }, [
           el('strong', null, 'Editing code '),
           el('code', { style: 'font-size:14px' }, c.code),
         ]),
+        // Read-only scope display — the data the operator most often
+        // needs to see when reviewing a code. Distinct from the
+        // editable fields below.
+        el('div', {
+          style:
+            'padding:8px 12px; margin-bottom:12px; ' +
+            'background:var(--cream-100); border-radius:6px; ' +
+            'font-size:12.5px; color:var(--ink-700);',
+        }, scopeLabel),
         el('p', { class: 'muted', style: 'margin:0 0 16px; font-size:13px' },
-          'Editable: amount, max uses, expiry, referrer label, description. The code string, kind, and product/policy scope cannot be changed — disable + create a new code instead.'),
+          'Editable: amount, max uses, expiry, referrer label, description, featured flag. The code string, kind, and product/policy scope cannot be changed — disable + create a new code instead.'),
         el('div', { class: 'row-2' }, [amtField, muField]),
         el('div', { class: 'row-2' }, [expField, refField]),
         descField,
@@ -3856,12 +3948,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     }
 
     try {
-      // Fetch products + codes in parallel so we can group codes by product.
-      const [productsResp, codesResp] = await Promise.all([
-        api('/v1/products').catch(() => ({ products: [] })),
-        api('/v1/admin/discount-codes?include_inactive=true'),
-      ])
-      const products = productsResp.products || []
+      // Reuse the products list we fetched above for the create form's
+      // scope pickers — no need to re-fetch.
+      const products = productsForCreate
+      const codesResp = await api('/v1/admin/discount-codes?include_inactive=true')
       const codes = codesResp.codes || []
       const productById = {}
       products.forEach((p) => { productById[p.id] = p })
