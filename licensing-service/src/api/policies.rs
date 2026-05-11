@@ -277,6 +277,11 @@ pub struct ListPoliciesQuery {
     pub product_slug: String,
     #[serde(default)]
     pub include_inactive: bool,
+    /// When true, archived policies (those with a non-null `archived_at`)
+    /// are included. Default false — admin grid hides archived unless the
+    /// "Show archived" toggle is on.
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 pub async fn list(
@@ -288,7 +293,13 @@ pub async fn list(
     let product = repo::get_product_by_slug(&state.db, &q.product_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("product '{}'", q.product_slug)))?;
-    let rows = repo::list_policies_by_product(&state.db, &product.id, !q.include_inactive).await?;
+    let rows = repo::list_policies_by_product_with_archived(
+        &state.db,
+        &product.id,
+        !q.include_inactive,
+        q.include_archived,
+    )
+    .await?;
     Ok(Json(json!({ "policies": rows })))
 }
 
@@ -322,6 +333,43 @@ pub async fn set_active(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SetArchivedReq {
+    pub archived: bool,
+}
+
+/// PATCH `/v1/admin/policies/:id/archived` — toggle the soft-archive flag.
+///
+/// Archived policies are hidden from the admin grid (unless "Show archived"
+/// is on) and from the public `/buy/<slug>` page. Existing licenses keep
+/// validating because their entitlements are signed into the key. Active
+/// recurring subscriptions tied to an archived policy will stop renewing
+/// (renewal worker treats archived as a hard stop and surfaces a clear
+/// event in the audit log).
+pub async fn set_archived(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetArchivedReq>,
+) -> AppResult<Json<Value>> {
+    let actor_hash = require_admin(&state, &headers)?;
+    let (ip, ua) = request_context(&headers);
+    repo::set_policy_archived(&state.db, &id, req.archived).await?;
+    let _ = repo::insert_audit(
+        &state.db,
+        "admin_api_key",
+        Some(&actor_hash),
+        if req.archived { "policy.archive" } else { "policy.unarchive" },
+        Some("policy"),
+        Some(&id),
+        ip.as_deref(),
+        ua.as_deref(),
+        &json!({ "archived": req.archived }),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true, "archived": req.archived })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PolicyDeleteOpts {
     #[serde(default)]
     pub force: bool,
@@ -348,6 +396,7 @@ pub async fn delete(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("policy '{id}'")))?;
 
+    // Total counts (for cascade reporting).
     let invoice_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE policy_id = ?")
             .bind(&id)
@@ -358,64 +407,111 @@ pub async fn delete(
             .bind(&id)
             .fetch_one(&state.db)
             .await?;
-    if !opts.force && invoice_count + license_count > 0 {
+
+    // "Live" references that would actually block a safe-delete: a
+    // non-revoked license, a settled invoice (real audit history), or
+    // an active/past_due subscription. Revoked-license tombstones and
+    // non-settled invoices (pending/expired/invalid) are dead weight
+    // that the safe-delete can sweep up — they hold no operator value.
+    let live_license_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM licenses
+         WHERE policy_id = ? AND COALESCE(status,'active') != 'revoked'",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    let settled_invoice_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoices WHERE policy_id = ? AND status = 'settled'",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    let active_sub_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM subscriptions
+         WHERE policy_id = ? AND status IN ('active', 'past_due')",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !opts.force && (live_license_count + settled_invoice_count + active_sub_count) > 0 {
         return Err(AppError::Conflict(format!(
-            "cannot delete policy '{}' — it has {} invoice(s) and {} license(s) \
-             referencing it. Disable it via the active toggle, or hide it from the \
-             buy page via the public toggle, instead. To override and wipe all \
-             references, use ?force=true.",
-            policy.slug, invoice_count, license_count
+            "cannot delete policy '{}' — it has {} live license(s), {} settled invoice(s), \
+             and {} active subscription(s) referencing it. Archive it to hide it from \
+             the admin grid and the buy page, revoke any outstanding licenses to free \
+             the safe-delete path, or use ?force=true to cascade through everything.",
+            policy.slug, live_license_count, settled_invoice_count, active_sub_count
         )));
     }
 
-    let machine_count: i64 = if opts.force {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM machines WHERE license_id IN
-             (SELECT id FROM licenses WHERE policy_id = ?)",
-        )
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await?
-    } else {
-        0
-    };
-    let redemption_count: i64 = if opts.force {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM discount_redemptions WHERE invoice_id IN
-             (SELECT id FROM invoices WHERE policy_id = ?)",
-        )
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await?
-    } else {
-        0
-    };
+    // Even in safe-delete mode we cascade through tombstones (revoked
+    // licenses, dead invoices, machines/redemptions tied to them) since
+    // the operator has signalled intent to fully delete. Compute the
+    // counts for the audit log either way.
+    let machine_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM machines WHERE license_id IN
+         (SELECT id FROM licenses WHERE policy_id = ?)",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    let redemption_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM discount_redemptions WHERE invoice_id IN
+         (SELECT id FROM invoices WHERE policy_id = ?)",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
 
+    // Cascade order matters — children before parents to satisfy FKs.
+    // Safe-delete + force-delete share the cascade body now; the only
+    // difference is the eligibility check above.
     let mut tx = state.db.begin().await?;
-    if opts.force {
-        sqlx::query(
-            "DELETE FROM machines WHERE license_id IN
-             (SELECT id FROM licenses WHERE policy_id = ?)",
-        )
+    sqlx::query(
+        "DELETE FROM machines WHERE license_id IN
+         (SELECT id FROM licenses WHERE policy_id = ?)",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM discount_redemptions WHERE invoice_id IN
+         (SELECT id FROM invoices WHERE policy_id = ?)",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    // tier_changes references both from_policy_id + to_policy_id — wipe
+    // any row touching this policy on either side.
+    sqlx::query(
+        "DELETE FROM tier_changes WHERE from_policy_id = ? OR to_policy_id = ?",
+    )
+    .bind(&id)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    // discount_codes.applies_to_policy_id references this policy. Null
+    // it out rather than delete the code — codes can target multiple
+    // policies in future and surviving codes are useful audit material.
+    sqlx::query(
+        "UPDATE discount_codes SET applies_to_policy_id = NULL
+         WHERE applies_to_policy_id = ?",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM subscriptions WHERE policy_id = ?")
         .bind(&id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "DELETE FROM discount_redemptions WHERE invoice_id IN
-             (SELECT id FROM invoices WHERE policy_id = ?)",
-        )
+    sqlx::query("DELETE FROM licenses WHERE policy_id = ?")
         .bind(&id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM licenses WHERE policy_id = ?")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM invoices WHERE policy_id = ?")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-    }
+    sqlx::query("DELETE FROM invoices WHERE policy_id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM policies WHERE id = ?")
         .bind(&id)
         .execute(&mut *tx)
@@ -435,8 +531,8 @@ pub async fn delete(
             "slug": policy.slug,
             "name": policy.name,
             "force": opts.force,
-            "cascaded_licenses": if opts.force { license_count } else { 0 },
-            "cascaded_invoices": if opts.force { invoice_count } else { 0 },
+            "cascaded_licenses": license_count,
+            "cascaded_invoices": invoice_count,
             "cascaded_machines": machine_count,
             "cascaded_redemptions": redemption_count,
         }),
@@ -446,8 +542,8 @@ pub async fn delete(
         "ok": true,
         "deleted": policy.slug,
         "force": opts.force,
-        "cascaded_licenses": if opts.force { license_count } else { 0 },
-        "cascaded_invoices": if opts.force { invoice_count } else { 0 },
+        "cascaded_licenses": license_count,
+        "cascaded_invoices": invoice_count,
         "cascaded_machines": machine_count,
         "cascaded_redemptions": redemption_count,
     })))

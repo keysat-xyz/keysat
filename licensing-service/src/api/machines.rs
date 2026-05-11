@@ -236,11 +236,24 @@ pub async fn deactivate(
 
 // ---------- Admin endpoints ----------
 
+/// Query for the admin Machines list. All filters are optional and
+/// conjunctive — leaving them all blank returns every machine across
+/// every license, default-sorted by most-recent heartbeat. The admin UI
+/// Machines tab uses this default-no-filter form to render a global
+/// view; the Licenses-tab drill-down sets `license_id`.
 #[derive(Debug, Deserialize)]
 pub struct AdminListQuery {
-    pub license_id: String,
+    #[serde(default)]
+    pub license_id: Option<String>,
+    #[serde(default)]
+    pub product_id: Option<String>,
+    #[serde(default)]
+    pub product_slug: Option<String>,
     #[serde(default)]
     pub include_inactive: bool,
+    /// Cap on result size; defaults to 500. Admin UI paginates client-side.
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 pub async fn admin_list(
@@ -249,11 +262,28 @@ pub async fn admin_list(
     Query(q): Query<AdminListQuery>,
 ) -> AppResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let machines = if q.include_inactive {
-        repo::list_all_machines(&state.db, &q.license_id).await?
+
+    // Resolve product_slug → product_id if the caller passed the slug
+    // form. Either works; product_id takes precedence on conflict.
+    let resolved_product_id: Option<String> = if let Some(pid) = q.product_id.as_deref() {
+        Some(pid.to_string())
+    } else if let Some(slug) = q.product_slug.as_deref() {
+        match repo::get_product_by_slug(&state.db, slug).await? {
+            Some(p) => Some(p.id),
+            None => return Err(AppError::NotFound(format!("product '{slug}'"))),
+        }
     } else {
-        repo::list_active_machines(&state.db, &q.license_id).await?
+        None
     };
+
+    let machines = repo::list_machines_admin(
+        &state.db,
+        resolved_product_id.as_deref(),
+        q.license_id.as_deref(),
+        q.include_inactive,
+        q.limit.unwrap_or(500).clamp(1, 5000),
+    )
+    .await?;
     Ok(Json(json!({ "machines": machines })))
 }
 

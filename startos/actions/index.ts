@@ -1,56 +1,37 @@
 // Register actions with StartOS.
 //
-// As of v0.1.0:11 the StartOS Actions tab is intentionally minimal —
-// only setup-time operations live here:
+// The StartOS Actions tab is kept intentionally minimal — only the
+// four operations that need to happen outside the admin web UI:
 //
-//   - General        → Set operator name
-//   - BTCPay         → Connect / Check / Disconnect
-//   - License        → Activate Keysat license / Show license status
-//   - Credentials    → Show admin API key
+//   - Set web UI password — needed for password recovery (you can't
+//     reset the password from inside the web UI if you can't log in)
+//   - Activate Keysat license — first-install bootstrap for paid
+//     customers, and recovery if /data/keysat-license.txt gets lost
+//   - Show license status — sanity-check the self-license state
+//     without logging into the admin UI
+//   - Show credentials — find the admin API key on first install,
+//     before you've logged into the admin UI for the first time
 //
-// Everything else (products, policies, discount codes, licenses,
-// machines, webhooks, audit log) lives in the embedded admin web UI
-// at /admin/. The action source files remain in this directory for
-// reference — and the underlying admin HTTP API is unchanged — but
-// they're no longer registered as StartOS UI buttons. This keeps the
-// dashboard from feeling like an undifferentiated wall of buttons.
-//
-// The web UI uses the same /v1/admin/* endpoints those actions used to
-// call, so functionality is identical; only the UI surface changed.
+// Everything else — operator name, payment provider connect / activate,
+// scoped API keys, products, policies, licenses, codes, machines,
+// webhooks, audit log — lives in the embedded admin web UI under the
+// Settings tab and the workspace sidebar. The action source files for
+// those operations remain in this directory for reference, but they're
+// no longer registered as StartOS UI buttons. This keeps the dashboard
+// from feeling like an undifferentiated wall of buttons and aligns with
+// "everything in one place" — the web UI.
 
 import { sdk } from '../sdk'
 import { activateLicense, showLicenseStatus } from './activateLicense'
-import { switchPaymentProvider } from './activatePaymentProvider'
-import { btcpayStatus, configureBtcpay, disconnectBtcpay } from './configureBtcpay'
-import {
-  configureZaprite,
-  disconnectZaprite,
-  showZapriteWebhookSetup,
-  zapriteStatus,
-} from './configureZaprite'
-import { setOperatorName } from './setOperatorName'
 import { setWebUiPassword } from './setWebUiPassword'
 import { showCredentials } from './showCredentials'
 
 export const actions = sdk.Actions.of()
-  // General
-  .addAction(setOperatorName)
+  // First-install / recovery essentials.
   .addAction(setWebUiPassword)
-  // BTCPay setup (Bitcoin-only payments via your own BTCPay Server)
-  .addAction(configureBtcpay)
-  .addAction(btcpayStatus)
-  .addAction(disconnectBtcpay)
-  // Zaprite setup (Bitcoin + fiat-card payments via Zaprite's broker)
-  .addAction(configureZaprite)
-  .addAction(zapriteStatus)
-  .addAction(showZapriteWebhookSetup)
-  .addAction(disconnectZaprite)
-  // Single unified switch action — flips active provider via a
-  // dropdown so operators don't see two confusing "Activate X"
-  // actions side-by-side, each appearing to override the other.
-  .addAction(switchPaymentProvider)
-  // Keysat self-license (Keysat-licenses-Keysat)
+  .addAction(showCredentials)
+  // Keysat self-license (Keysat-licenses-Keysat). Required for paid
+  // customers to activate their self-license on first install. The
+  // license string itself is provided by your seller.
   .addAction(activateLicense)
   .addAction(showLicenseStatus)
-  // Credentials
-  .addAction(showCredentials)

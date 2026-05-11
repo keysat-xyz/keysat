@@ -399,6 +399,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       <div class="group-label">System</div>
       <a class="nav" data-route="webhooks"><i data-lucide="webhook"></i>Webhooks</a>
       <a class="nav" data-route="audit"><i data-lucide="scroll-text"></i>Audit log</a>
+      <a class="nav" data-route="settings"><i data-lucide="settings"></i>Settings</a>
       <!-- Tier banner: persistent. Shows current tier + next-tier CTA. -->
       <div id="tier-banner" style="
         margin-top:auto; margin-bottom:8px;
@@ -560,11 +561,37 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   ///   pathBase    — '/v1/admin/products/<id>' or '/v1/admin/policies/<id>'
   ///   onSuccess   — called after a successful delete (typically a route reload)
   async function safeOrForceDelete(opts) {
-    const { kind, slug, pathBase, onSuccess } = opts
-    // Try safe path first.
+    const { kind, slug, pathBase, onSuccess, licenseCount } = opts
+    const isPolicy = kind === 'policy'
+    const hasRefs = typeof licenseCount === 'number' && licenseCount > 0
+    let message, bullets
+    if (hasRefs) {
+      message = licenseCount + ' license' + (licenseCount === 1 ? '' : 's') +
+        ' reference' + (licenseCount === 1 ? 's' : '') + ' this ' + kind +
+        '. This action cannot be undone.'
+      bullets = isPolicy
+        ? [
+            'Revoked licenses + non-settled invoices are swept away by the safe-delete cascade — they hold no value once you’re deleting the tier.',
+            'Live (non-revoked) licenses, settled invoices, or active subscriptions will block the safe-delete. Use Archive to hide the tier instead, revoke outstanding licenses first, or pick Force delete to wipe everything.',
+          ]
+        : [
+            'Every policy, license, and invoice under this product will be affected.',
+            'The request will be refused at the server if there are live references. You’ll get a force-delete option that cascades through them.',
+          ]
+    } else {
+      message = 'This cannot be undone.'
+      bullets = null
+    }
+    const ok = await confirmModal({
+      eyebrow: 'Delete ' + kind,
+      title: 'Delete ' + kind + ' “' + slug + '”?',
+      message: message,
+      bullets: bullets,
+      confirmLabel: 'Delete',
+      confirmVariant: 'danger',
+    })
+    if (!ok) return
     try {
-      if (!confirm(`Permanently delete ${kind} "${slug}"? This cannot be undone. \
-The request will be refused if there are licenses or invoices tied to it — use force-delete in that case.`)) return
       await api(pathBase, { method: 'DELETE' })
       onSuccess()
       return
@@ -838,7 +865,7 @@ The request will be refused if there are licenses or invoices tied to it — use
           class: 'badge b-warning',
           style: 'display:block; padding:8px 12px; margin-bottom:12px; font-size:12px',
         }, opts.warning) : null,
-        el('label', { class: 'lbl', style: 'display:flex; align-items:center; font-size:12.5px' }, [
+        el('label', { class: 'lbl', style: 'display:flex; align-items:center; gap:6px; font-size:12.5px; margin:6px 0 6px;' }, [
           opts.reasonLabel || 'Reason (optional)',
           helpIcon(opts.reasonHelp || 'Free-form note. Stored on the audit log; not user-visible.'),
         ]),
@@ -863,6 +890,81 @@ The request will be refused if there are licenses or invoices tied to it — use
       overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null) })
       document.body.appendChild(overlay)
       setTimeout(() => textarea.focus(), 0)
+    })
+  }
+
+  /**
+   * Branded replacement for window.confirm(). Returns a promise that
+   * resolves true on confirm, false on cancel / overlay-click / Esc.
+   *
+   *   if (!await confirmModal({
+   *     title: 'Delete policy?',
+   *     message: 'This cannot be undone.',
+   *     confirmLabel: 'Delete',
+   *     confirmVariant: 'danger',
+   *   })) return
+   *
+   * `bullets`: optional list of strings rendered as a small bullet list
+   * under the message — handy for spelling out side-effects.
+   */
+  function confirmModal(opts) {
+    opts = opts || {}
+    return new Promise((resolve) => {
+      let resolved = false
+      function done(value) {
+        if (resolved) return
+        resolved = true
+        document.removeEventListener('keydown', onKey)
+        overlay.remove()
+        resolve(value)
+      }
+      function onKey(e) {
+        if (e.key === 'Escape') done(false)
+        else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) done(true)
+      }
+      const overlay = el('div', {
+        style:
+          'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+          'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+      })
+      const confirmBtn = el('button', {
+        class: 'btn ' + (opts.confirmVariant === 'danger' ? 'danger' : 'primary'),
+      }, opts.confirmLabel || 'Confirm')
+      confirmBtn.addEventListener('click', () => done(true))
+      const cancelBtn = el('button', { class: 'btn secondary' }, opts.cancelLabel || 'Cancel')
+      cancelBtn.addEventListener('click', () => done(false))
+      const bulletList = Array.isArray(opts.bullets) && opts.bullets.length
+        ? el('ul', {
+          class: 'muted',
+          style: 'margin:0 0 14px 18px; padding:0; font-size:13px; line-height:1.55;',
+        }, opts.bullets.map((b) => el('li', null, b)))
+        : null
+      const card = el('div', {
+        style:
+          'background:var(--cream-50); border:1px solid var(--border-1); ' +
+          'border-radius:12px; max-width:480px; width:100%; padding:24px; ' +
+          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+      }, [
+        el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, opts.eyebrow || 'Confirm'),
+        el('h3', {
+          style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 6px; color:var(--navy-950);',
+        }, opts.title || 'Are you sure?'),
+        opts.message ? el('p', {
+          class: 'muted',
+          style: 'margin:0 0 ' + (bulletList ? '10px' : '14px') + '; font-size:13.5px; line-height:1.55;',
+        }, opts.message) : null,
+        bulletList,
+        opts.warning ? el('div', {
+          class: 'badge b-warning',
+          style: 'display:block; padding:8px 12px; margin-bottom:12px; font-size:12px',
+        }, opts.warning) : null,
+        el('div', { style: 'display:flex; gap:10px;' }, [confirmBtn, cancelBtn]),
+      ])
+      overlay.appendChild(card)
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) done(false) })
+      document.body.appendChild(overlay)
+      document.addEventListener('keydown', onKey)
+      setTimeout(() => confirmBtn.focus(), 0)
     })
   }
 
@@ -945,6 +1047,7 @@ The request will be refused if there are licenses or invoices tied to it — use
     licenses:  { title: 'Licenses',         crumb: 'Workspace · Licenses' },
     machines:  { title: 'Machines',         crumb: 'Workspace · Machines' },
     webhooks:  { title: 'Webhooks',         crumb: 'System · Webhooks' },
+    settings:  { title: 'Settings',         crumb: 'System · Settings' },
     audit:     { title: 'Audit log',        crumb: 'System · Audit log' },
   }
 
@@ -997,24 +1100,6 @@ The request will be refused if there are licenses or invoices tied to it — use
       ]),
     ])
     target.appendChild(revCard)
-
-    // Welcome / instructions card
-    target.appendChild(card('Welcome', null, [
-      el('p', { class: 'muted' }, [
-        'This is your Keysat admin dashboard. Use the sidebar to manage products, policies, discount codes, and the licenses you have issued. ',
-        'Setup actions — setting your operator name, connecting BTCPay, and viewing your admin credentials — live in your StartOS service ',
-        el('strong', null, 'Actions'), ' tab.',
-      ]),
-      el('p', { class: 'muted', style: 'margin-bottom:0' }, [
-        'Service: ',
-        el('code', { class: 'mono', style: 'font-family:var(--font-mono); font-size:12.5px; color:var(--navy-900)' }, [
-          serviceInfo ? (serviceInfo.service + ' v' + serviceInfo.version) : '–',
-        ]),
-        ' · Operator: ',
-        el('code', { class: 'mono', style: 'font-family:var(--font-mono); font-size:12.5px; color:var(--navy-900)' },
-          (serviceInfo && serviceInfo.operator) || '(unset)'),
-      ]),
-    ]))
 
     // Public key tip card (matches the design system 'Embed your public key' tip)
     const pubkeyTip = el('div', {
@@ -1100,7 +1185,7 @@ The request will be refused if there are licenses or invoices tied to it — use
     // doesn't compete with the operator's actual workspace cards. The
     // "what's sent" disclosure expands inline; details deliberately
     // tucked behind a click so the default view stays calm.
-    const analyticsStrip = el('div', { style: 'margin-top:24px' })
+    const analyticsStrip = el('div')
     target.appendChild(analyticsStrip)
     renderAnalyticsCard(analyticsStrip)
 
@@ -1166,24 +1251,33 @@ The request will be refused if there are licenses or invoices tied to it — use
       style: 'font-size:12px; margin-left:6px',
     }, 'what gets sent?')
     const oneLine = el('label', {
-      style: 'display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--ink-500); cursor:pointer'
+      style: 'display:inline-flex; align-items:center; gap:8px; font-size:13.5px; color:var(--ink-700); cursor:pointer; line-height:1.5'
     }, [
       checkbox,
-      el('span', null, 'Send anonymous usage stats so we can show real adoption numbers on the public dashboard.'),
+      el('span', null, 'Send an anonymous daily heartbeat to help size the Keysat self-host community.'),
     ])
 
     const inlineRow = el('div', {
-      style: 'display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding:10px 14px; background:#fbf6e9; border:1px dashed #d6cdb8; border-radius:6px'
+      class: 'card',
+      style: 'background:var(--cream-100); border-style:dashed;'
     }, [
-      el('div', null, [oneLine, detailsLink]),
+      el('div', {
+        class: 'card-body',
+        style: 'display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;',
+      }, [
+        el('div', null, [oneLine, detailsLink]),
+      ]),
     ])
     host.appendChild(inlineRow)
 
     // Expanded details (collector URL, JSON preview, reset). Hidden
     // by default; toggled by the "what gets sent?" link.
     const details = el('div', {
-      style: 'display:none; margin-top:10px; padding:14px; background:#fbf6e9; border:1px dashed #d6cdb8; border-radius:6px'
+      class: 'card',
+      style: 'display:none; background:var(--cream-100); border-style:dashed; margin-top:10px;',
     })
+    const detailsBody = el('div', { class: 'card-body' })
+    details.appendChild(detailsBody)
     host.appendChild(details)
     detailsLink.addEventListener('click', (e) => {
       e.preventDefault()
@@ -1200,16 +1294,16 @@ The request will be refused if there are licenses or invoices tied to it — use
       value: s.collector_url || '',
       style: 'width:100%; box-sizing:border-box; font-size:12px; padding:6px 10px',
     })
-    details.appendChild(el('label', { style: 'display:block; font-size:11px; font-weight:600; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.05em' }, 'Collector URL'))
-    details.appendChild(urlInput)
-    details.appendChild(el('p', { class: 'muted', style: 'margin:4px 0 12px; font-size:11px' },
+    detailsBody.appendChild(el('label', { style: 'display:block; font-size:11px; font-weight:600; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.05em' }, 'Collector URL'))
+    detailsBody.appendChild(urlInput)
+    detailsBody.appendChild(el('p', { class: 'muted', style: 'margin:4px 0 12px; font-size:11px' },
       'Leave blank to opt in but not send. Once keysat.xyz/community is live, the default URL will populate on upgrade.'))
 
     // The exact JSON the daemon would POST. Live preview, not a
     // pretend example — what you see is what would actually be sent.
-    details.appendChild(el('p', { class: 'muted', style: 'margin:0 0 6px; font-size:11px' },
+    detailsBody.appendChild(el('p', { class: 'muted', style: 'margin:0 0 6px; font-size:11px' },
       'Counts are floored to the nearest 5 (anti-fingerprinting). Uptime is bucketed. install_uuid is a random UUIDv4 generated on first opt-in — NOT derived from operator name, store id, or public URL.'))
-    details.appendChild(el('pre', {
+    detailsBody.appendChild(el('pre', {
       style: 'background:#0e1f33; color:#f6f1e7; padding:10px; border-radius:4px; font-size:11px; overflow-x:auto; margin:0 0 8px'
     }, JSON.stringify(s.preview_heartbeat, null, 2)))
 
@@ -1221,13 +1315,19 @@ The request will be refused if there are licenses or invoices tied to it — use
       const resetLink = resetRow.querySelector('a')
       resetLink.addEventListener('click', async (e) => {
         e.preventDefault()
-        if (!confirm('Wipe your anonymous install_uuid? Future heartbeats (if you re-enable) will use a fresh one.')) return
+        if (!await confirmModal({
+          eyebrow: 'Reset analytics ID',
+          title: 'Wipe anonymous install_uuid?',
+          message: 'Future heartbeats (if you re-enable) will use a fresh one. The current ID will be unrecoverable.',
+          confirmLabel: 'Wipe ID',
+          confirmVariant: 'danger',
+        })) return
         try {
           await api('/v1/admin/community-analytics/reset', { method: 'POST' })
           renderAnalyticsCard(host)
         } catch (er) { alert(er.message) }
       })
-      details.appendChild(resetRow)
+      detailsBody.appendChild(resetRow)
     }
 
     // Auto-save: toggling the checkbox or editing the URL persists
@@ -1546,6 +1646,7 @@ The request will be refused if there are licenses or invoices tied to it — use
                 kind: 'product',
                 slug: p.slug,
                 pathBase: '/v1/admin/products/' + p.id,
+                licenseCount: byProduct[p.id] || 0,
                 onSuccess: () => routes.products(),
               })
             },
@@ -1732,7 +1833,13 @@ The request will be refused if there are licenses or invoices tied to it — use
             const reason = (card.querySelector('[name=change_tier_reason]').value || '').trim() || null
             // Confirm on downgrades — operator should explicitly OK
             // before the buyer loses entitlements.
-            if (isDowngrade && !confirm('Confirm downgrade? Buyer loses entitlements without refund.')) {
+            if (isDowngrade && !await confirmModal({
+              eyebrow: 'Downgrade',
+              title: 'Confirm tier downgrade?',
+              message: 'The buyer loses entitlements immediately. No refund will be issued automatically — handle any refund out of band.',
+              confirmLabel: 'Apply downgrade',
+              confirmVariant: 'danger',
+            })) {
               return
             }
             buttonRow.querySelectorAll('button').forEach((b) => b.disabled = true)
@@ -2130,24 +2237,35 @@ The request will be refused if there are licenses or invoices tied to it — use
           ])
         }))
 
-    // Status pills row (active vs disabled, public vs private, trial).
+    const isArchived = !!pol.archived_at
+
+    // Status pills row (active vs disabled, public vs private, trial,
+    // archived).
     const pillsRow = el('div', {
       style: 'display:flex; flex-wrap:wrap; gap:5px; margin:6px 0',
     }, [
-      pol.active
-        ? el('span', { class: 'badge b-success', style: 'font-size:10.5px; padding:2px 7px' }, 'active')
-        : el('span', { class: 'badge b-neutral', style: 'font-size:10.5px; padding:2px 7px' }, 'disabled'),
-      pol.public
+      isArchived
+        ? el('span', {
+            class: 'badge b-neutral',
+            style: 'font-size:10.5px; padding:2px 7px; background:var(--ink-700); color:var(--cream-50)',
+            title: 'Hidden from admin grid + buy page. Existing licenses keep validating.',
+          }, 'archived')
+        : (pol.active
+            ? el('span', { class: 'badge b-success', style: 'font-size:10.5px; padding:2px 7px' }, 'active')
+            : el('span', { class: 'badge b-neutral', style: 'font-size:10.5px; padding:2px 7px' }, 'disabled')),
+      !isArchived && pol.public
         ? el('span', {
             class: 'badge b-gold',
             style: 'font-size:10.5px; padding:2px 7px',
             title: 'Visible on /buy/' + product.slug + ' tier picker',
           }, 'public')
-        : el('span', {
-            class: 'badge b-neutral',
-            style: 'font-size:10.5px; padding:2px 7px',
-            title: 'Hidden from public buy page; admin-only',
-          }, 'private'),
+        : (!isArchived
+            ? el('span', {
+                class: 'badge b-neutral',
+                style: 'font-size:10.5px; padding:2px 7px',
+                title: 'Hidden from public buy page; admin-only',
+              }, 'private')
+            : null),
       pol.is_trial
         ? el('span', { class: 'badge b-warning', style: 'font-size:10.5px; padding:2px 7px' }, 'trial flag')
         : null,
@@ -2160,36 +2278,84 @@ The request will be refused if there are licenses or invoices tied to it — use
         : null,
     ].filter(Boolean))
 
-    // Action row.
+    async function setArchived(archived) {
+      try {
+        await api('/v1/admin/policies/' + pol.id + '/archived', {
+          method: 'PATCH', body: { archived: archived },
+        })
+        onMutate && onMutate()
+      } catch (e) { alert(e.message) }
+    }
+
+    // Action row. Archived policies have a slimmed set: Unarchive +
+    // Delete. Live policies expose Edit / Hide-Show / Archive / Delete.
     const actions = el('div', {
       style: 'display:flex; flex-wrap:wrap; gap:6px; margin-top:auto; padding-top:10px; border-top:1px solid var(--border-1)',
-    }, [
-      el('button', {
-        class: 'btn sm secondary',
-        onclick: () => openEditPolicy(pol, product),
-      }, 'Edit'),
-      el('button', {
-        class: 'btn sm secondary',
-        title: pol.public ? 'Hide from /buy/' + product.slug : 'Show on /buy/' + product.slug,
-        onclick: async () => {
-          try {
-            await api('/v1/admin/policies/' + pol.id + '/public', {
-              method: 'PATCH', body: { public: !pol.public },
-            })
-            onMutate && onMutate()
-          } catch (e) { alert(e.message) }
-        },
-      }, pol.public ? 'Hide' : 'Show'),
-      el('button', {
-        class: 'btn sm danger',
-        onclick: () => safeOrForceDelete({
-          kind: 'policy',
-          slug: pol.slug,
-          pathBase: '/v1/admin/policies/' + pol.id,
-          onSuccess: onMutate,
-        }),
-      }, 'Delete'),
-    ])
+    }, isArchived
+      ? [
+          el('button', {
+            class: 'btn sm secondary',
+            title: 'Restore this tier — it becomes visible in the admin grid and on /buy/' + product.slug + ' (if public).',
+            onclick: () => setArchived(false),
+          }, 'Unarchive'),
+          el('button', {
+            class: 'btn sm danger',
+            onclick: () => safeOrForceDelete({
+              kind: 'policy',
+              slug: pol.slug,
+              pathBase: '/v1/admin/policies/' + pol.id,
+              licenseCount: pol._license_count || 0,
+              onSuccess: onMutate,
+            }),
+          }, 'Delete'),
+        ]
+      : [
+          el('button', {
+            class: 'btn sm secondary',
+            onclick: () => openEditPolicy(pol, product),
+          }, 'Edit'),
+          el('button', {
+            class: 'btn sm secondary',
+            title: pol.public ? 'Hide from /buy/' + product.slug : 'Show on /buy/' + product.slug,
+            onclick: async () => {
+              try {
+                await api('/v1/admin/policies/' + pol.id + '/public', {
+                  method: 'PATCH', body: { public: !pol.public },
+                })
+                onMutate && onMutate()
+              } catch (e) { alert(e.message) }
+            },
+          }, pol.public ? 'Hide' : 'Show'),
+          el('button', {
+            class: 'btn sm secondary',
+            title: 'Hide this tier from the admin grid + buy page. Existing licenses keep validating. Reversible.',
+            onclick: async () => {
+              if (!await confirmModal({
+                eyebrow: 'Archive tier',
+                title: 'Archive “' + pol.slug + '”?',
+                message: 'Reversible. Hides this tier from the admin grid and from /buy/' + product.slug + '.',
+                bullets: [
+                  'Existing licenses keep validating — entitlements are signed into the key.',
+                  'New purchases of this tier will be refused.',
+                  'Active recurring subscriptions tied to this tier will stop renewing.',
+                ],
+                confirmLabel: 'Archive',
+                confirmVariant: 'primary',
+              })) return
+              setArchived(true)
+            },
+          }, 'Archive'),
+          el('button', {
+            class: 'btn sm danger',
+            onclick: () => safeOrForceDelete({
+              kind: 'policy',
+              slug: pol.slug,
+              pathBase: '/v1/admin/policies/' + pol.id,
+              licenseCount: pol._license_count || 0,
+              onSuccess: onMutate,
+            }),
+          }, 'Delete'),
+        ])
 
     return el('div', {
       class: 'tier-card',
@@ -2198,7 +2364,8 @@ The request will be refused if there are licenses or invoices tied to it — use
         'border:' + (highlighted ? '2px solid var(--gold-500)' : '1px solid var(--border-1)') + '; ' +
         'border-radius:12px; padding:' + (highlighted ? '21px 19px 16px' : '22px 20px 16px') + '; ' +
         'display:flex; flex-direction:column; gap:6px; min-height:280px;' +
-        (highlighted ? ' box-shadow:0 0 0 3px rgba(191,160,104,0.12);' : ''),
+        (highlighted && !isArchived ? ' box-shadow:0 0 0 3px rgba(191,160,104,0.12);' : '') +
+        (isArchived ? ' opacity:0.55; background:repeating-linear-gradient(135deg, var(--cream-50) 0 10px, rgba(14,31,51,0.025) 10px 20px);' : ''),
     }, [
       popularPill,
       el('div', {
@@ -2525,6 +2692,10 @@ The request will be refused if there are licenses or invoices tied to it — use
       ]))
       return
     }
+
+    // "Show archived" persists across navigations so the operator
+    // doesn't have to re-toggle on every visit.
+    const showArchived = localStorage.getItem('ks_show_archived_policies') === '1'
 
     // Duration presets — operators rarely think in seconds. Custom drops
     // them back to a raw-seconds field so power users still have it.
@@ -2883,9 +3054,25 @@ The request will be refused if there are licenses or invoices tied to it — use
     // comparison. Advanced fields (tip recipient, custom grace
     // seconds, tier rank) live on the Edit modal of an existing
     // tier card; create the basics first, then click Edit.
+    const archivedToggle = el('input', {
+      type: 'checkbox',
+      id: 'showArchivedPolicies',
+      style: 'margin:0 6px 0 0; vertical-align:middle',
+    })
+    archivedToggle.checked = showArchived
+    archivedToggle.addEventListener('change', () => {
+      localStorage.setItem('ks_show_archived_policies', archivedToggle.checked ? '1' : '0')
+      routes.policies()
+    })
     target.appendChild(plainCard([
-      el('p', { class: 'muted', style: 'margin:0' },
-        'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance. Click the dashed "+ Add tier" card under any product to author a new policy in place — multiple drafts can coexist for side-by-side comparison.'),
+      el('div', { style: 'display:flex; align-items:center; gap:14px; flex-wrap:wrap' }, [
+        el('p', { class: 'muted', style: 'margin:0; flex:1; min-width:280px' },
+          'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance. Click the dashed "+ Add tier" card under any product to author a new policy in place.'),
+        el('label', {
+          for: 'showArchivedPolicies',
+          style: 'font-size:12.5px; color:var(--ink-700); white-space:nowrap; cursor:pointer',
+        }, [archivedToggle, 'Show archived']),
+      ]),
     ]))
     // Intentionally not used: `create` (legacy disclosure-form
     // create-policy flow). Kept around as dead code for one release
@@ -2926,7 +3113,9 @@ The request will be refused if there are licenses or invoices tied to it — use
 
     for (const p of products) {
       try {
-        const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(p.slug))
+        const archivedQuery = showArchived ? '&include_archived=true' : ''
+        const j = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(p.slug) +
+          '&include_inactive=true' + archivedQuery)
         const policies = j.policies || []
         const hasPublicPolicy = policies.some((pol) => pol.public && pol.active)
         const previewBtn = hasPublicPolicy
@@ -3466,10 +3655,17 @@ The request will be refused if there are licenses or invoices tied to it — use
             el('button', {
               class: 'btn sm danger',
               onclick: async function () {
-                const usedNote = c.used_count > 0
-                  ? '\n\nThis code has been redeemed ' + c.used_count + ' time(s). Delete will be refused (audit trail). Use Disable instead.'
-                  : ''
-                if (!confirm('Permanently delete code "' + c.code + '"? This cannot be undone.' + usedNote)) return
+                const bullets = c.used_count > 0
+                  ? ['This code has been redeemed ' + c.used_count + ' time(s). The delete will be refused (audit trail). Use Disable instead.']
+                  : null
+                if (!await confirmModal({
+                  eyebrow: 'Delete discount code',
+                  title: 'Delete code “' + c.code + '”?',
+                  message: 'This cannot be undone.',
+                  bullets: bullets,
+                  confirmLabel: 'Delete',
+                  confirmVariant: 'danger',
+                })) return
                 try {
                   await api('/v1/admin/discount-codes/' + c.id, { method: 'DELETE' })
                   routes.codes()
@@ -3622,6 +3818,17 @@ The request will be refused if there are licenses or invoices tied to it — use
                 onclick: () => openChangeTier(l),
               }, 'Change tier')
             : null,
+          el('a', {
+            class: 'btn sm secondary',
+            href: '#machines?license=' + encodeURIComponent(l.id),
+            onclick: (e) => {
+              e.preventDefault()
+              location.hash = '#machines?license=' + encodeURIComponent(l.id)
+              routes.machines()
+            },
+            title: 'See the machines this license has activated',
+            style: 'text-decoration:none',
+          }, 'Machines'),
           l.status !== 'revoked' && l.status !== 'suspended'
             ? el('button', { class: 'btn sm secondary', onclick: () => actLicense(l, 'suspend') }, 'Suspend')
             : null,
@@ -3962,60 +4169,256 @@ The request will be refused if there are licenses or invoices tied to it — use
   }
 
   // -------- Machines --------
+  // -------- Machines --------
+  // Global per-product view: every machine across every license, grouped by
+  // product when multiple products exist. Matches the Licenses + Subscriptions
+  // tab format — product filter pills + status filter pills + quick-stats row.
+  // Drill-into-a-single-license is supported via the ?license= query string.
   routes.machines = async function () {
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
-    const idIn = el('input', { class: 'input mono', type: 'text', placeholder: 'license id (UUID)' })
-    const out = el('div')
+    // State.
+    let products = []
+    let allMachines = []
+    let currentProductFilter = ''     // '' = all
+    let currentStatusFilter = 'active' // 'active' | 'deactivated' | 'all'
+    const drillLicenseId = (new URLSearchParams(location.hash.split('?')[1] || '')).get('license') || ''
+
+    const productPillRow = el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0' })
+    const statusPillRow = el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; margin:0 0 14px' })
+    const statsRow = el('div', { class: 'stats', style: 'margin:0 0 14px' })
+    const tableHolder = el('div')
+
+    function productById(id) {
+      return products.find((p) => p.id === id)
+    }
+
+    function statusBadge(m) {
+      if (m.active) {
+        return el('span', {
+          class: 'badge b-success',
+          style: 'font-size:10.5px; padding:2px 7px',
+          title: 'Heartbeat seen recently; this seat is consuming a slot on its license.',
+        }, [el('span', { class: 'dot ok' }), 'active'])
+      }
+      return el('span', {
+        class: 'badge b-neutral',
+        style: 'font-size:10.5px; padding:2px 7px',
+        title: 'Operator or buyer deactivated this seat. Slot is free.' +
+          (m.deactivation_reason ? ' Reason: ' + m.deactivation_reason : ''),
+      }, 'deactivated')
+    }
+
+    function licenseStatusPill(s) {
+      const map = {
+        active:    { cls: 'b-success', tip: 'License is active.' },
+        revoked:   { cls: 'b-danger',  tip: 'License is revoked. Machine seat is moot.' },
+        suspended: { cls: 'b-warning', tip: 'License is suspended. Validate calls fail; reversible.' },
+      }
+      const info = map[s] || { cls: 'b-neutral', tip: s }
+      return el('span', {
+        class: 'badge ' + info.cls,
+        style: 'font-size:10.5px; padding:2px 7px',
+        title: info.tip,
+      }, s)
+    }
+
+    function machineRow(m) {
+      const deactivateBtn = m.active
+        ? el('button', {
+            class: 'btn sm danger',
+            onclick: async () => {
+              if (!await confirmModal({
+                eyebrow: 'Deactivate machine',
+                title: 'Force-deactivate this machine?',
+                message: 'It will free the seat for this license. The machine will be denied on its next validate call.',
+                confirmLabel: 'Deactivate',
+                confirmVariant: 'danger',
+              })) return
+              try {
+                await api('/v1/admin/machines/' + m.id + '/deactivate', { method: 'POST', body: { reason: 'admin' } })
+                load()
+              } catch (e) { alert(e.message) }
+            },
+          }, 'Deactivate')
+        : null
+      return el('tr', null, [
+        el('td', null, [
+          clickToCopy(m.id),
+        ]),
+        el('td', null, m.buyer_email || el('span', { class: 'muted' }, '–')),
+        el('td', null, [
+          el('span', { class: 'mono', style: 'font-size:11.5px' }, shortId(m.license_id)),
+          ' ',
+          licenseStatusPill(m.license_status),
+        ]),
+        el('td', null, m.hostname || el('span', { class: 'muted' }, '–')),
+        el('td', null, m.platform || el('span', { class: 'muted' }, '–')),
+        el('td', null, m.ip_last_seen || el('span', { class: 'muted' }, '–')),
+        el('td', null, relativeDate(m.last_heartbeat_at)),
+        el('td', null, statusBadge(m)),
+        el('td', null, deactivateBtn),
+      ])
+    }
+
+    function buildTable(machines, title, sub, empty) {
+      const rows = machines.map(machineRow)
+      return tableCard(
+        title, sub,
+        ['Machine ID', 'Buyer', 'License', 'Hostname', 'Platform', 'Last IP', 'Last heartbeat', 'Status', ''],
+        rows, empty,
+      )
+    }
+
+    function renderProductPills() {
+      productPillRow.innerHTML = ''
+      // "All" pill.
+      productPillRow.appendChild(el('button', {
+        class: 'btn sm ' + (currentProductFilter === '' ? 'primary' : 'secondary'),
+        onclick: () => { currentProductFilter = ''; render() },
+      }, 'All products (' + allMachines.length + ')'))
+      // Per-product pills, only for products that have machines in the dataset.
+      const byProduct = new Map()
+      allMachines.forEach((m) => {
+        if (!byProduct.has(m.product_id)) byProduct.set(m.product_id, 0)
+        byProduct.set(m.product_id, byProduct.get(m.product_id) + 1)
+      })
+      products.forEach((p) => {
+        const n = byProduct.get(p.id) || 0
+        if (n === 0) return
+        productPillRow.appendChild(el('button', {
+          class: 'btn sm ' + (currentProductFilter === p.id ? 'primary' : 'secondary'),
+          onclick: () => { currentProductFilter = p.id; render() },
+        }, p.name + ' (' + n + ')'))
+      })
+    }
+
+    function renderStatusPills() {
+      statusPillRow.innerHTML = ''
+      const counts = { active: 0, deactivated: 0 }
+      allMachines.forEach((m) => { counts[m.active ? 'active' : 'deactivated']++ })
+      ;[['active', 'Active'], ['deactivated', 'Deactivated'], ['all', 'All']].forEach(([key, label]) => {
+        const count = key === 'all' ? allMachines.length : counts[key]
+        statusPillRow.appendChild(el('button', {
+          class: 'btn sm ' + (currentStatusFilter === key ? 'primary' : 'secondary'),
+          onclick: () => { currentStatusFilter = key; load() }, // reload — server filter
+        }, label + ' (' + count + ')'))
+      })
+    }
+
+    function renderStats(scoped) {
+      statsRow.innerHTML = ''
+      const total = scoped.length
+      const active = scoped.filter((m) => m.active).length
+      const platforms = {}
+      scoped.forEach((m) => {
+        const p = m.platform || 'unknown'
+        platforms[p] = (platforms[p] || 0) + 1
+      })
+      const topPlatform = Object.entries(platforms).sort((a, b) => b[1] - a[1])[0]
+      statsRow.appendChild(stat('Machines', String(total), null))
+      statsRow.appendChild(stat('Active', String(active),
+        total > 0 ? Math.round(100 * active / total) + '% of total' : null, true))
+      statsRow.appendChild(stat('Top platform',
+        topPlatform ? topPlatform[0] : '–',
+        topPlatform ? topPlatform[1] + ' machine' + (topPlatform[1] === 1 ? '' : 's') : null))
+    }
+
+    function render() {
+      tableHolder.innerHTML = ''
+      let scoped = allMachines
+      if (currentProductFilter) scoped = scoped.filter((m) => m.product_id === currentProductFilter)
+      renderStats(scoped)
+
+      // Single-product or filtered: flat table.
+      if (products.length <= 1 || currentProductFilter || drillLicenseId) {
+        const titleProduct = currentProductFilter
+          ? (productById(currentProductFilter) || { name: 'Product' }).name + ' — '
+          : ''
+        const title = drillLicenseId
+          ? 'Machines on license ' + shortId(drillLicenseId)
+          : (titleProduct + 'Machines')
+        const sub = scoped.length + ' machine' + (scoped.length === 1 ? '' : 's')
+        tableHolder.appendChild(buildTable(scoped, title, sub,
+          'No machines yet — once buyers run apps that call /v1/validate with a fingerprint, they appear here.'))
+        return
+      }
+
+      // Multi-product grouping.
+      const grouped = products
+        .map((p) => ({ product: p, machines: scoped.filter((m) => m.product_id === p.id) }))
+        .filter((g) => g.machines.length > 0)
+      if (grouped.length === 0) {
+        tableHolder.appendChild(plainCard([
+          el('p', { class: 'muted', style: 'margin:0' }, 'No machines match this filter.'),
+        ]))
+        return
+      }
+      grouped.forEach(({ product, machines }) => {
+        const activeCount = machines.filter((m) => m.active).length
+        const breakdown = activeCount + ' active' + (machines.length > activeCount
+          ? (' · ' + (machines.length - activeCount) + ' deactivated')
+          : '')
+        const card = el('div', { class: 'card', style: 'margin-bottom:14px' }, [
+          el('div', { class: 'card-head' }, [
+            el('h3', null, product.name + ' — ' + product.slug),
+            el('span', { class: 'sub' }, breakdown),
+          ]),
+          buildTable(machines, '', '', '(none)'),
+        ])
+        tableHolder.appendChild(card)
+      })
+    }
 
     async function load() {
-      out.innerHTML = ''
-      out.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Loading…')))
+      tableHolder.innerHTML = ''
+      tableHolder.appendChild(plainCard([el('p', { class: 'muted', style: 'margin:0' }, 'Loading machines…')]))
       try {
-        const j = await api('/v1/admin/machines?license_id=' + encodeURIComponent(idIn.value.trim()))
-        const ms = j.machines || []
-        const rows = ms.map((m) => el('tr', null, [
-          el('td', null, el('code', null, shortId(m.id))),
-          el('td', null, m.hostname || '–'),
-          el('td', null, m.platform || '–'),
-          el('td', { class: 'muted' }, fmtDate(m.last_heartbeat_at)),
-          el('td', null, (m.active === true || m.active === 1)
-            ? el('span', { class: 'badge b-success' }, [el('span', { class: 'dot ok' }), 'active'])
-            : el('span', { class: 'badge b-neutral' }, 'inactive')),
-          el('td', null, (m.active === true || m.active === 1)
-            ? el('button', { class: 'btn sm danger', onclick: async () => {
-                if (!confirm('Force-deactivate this machine? It will free the seat.')) return
-                try {
-                  await api('/v1/admin/machines/' + m.id + '/deactivate', { method: 'POST', body: { reason: 'admin' } })
-                  load()
-                } catch (e) { alert(e.message) }
-              }}, 'Deactivate')
-            : null),
-        ]))
-        out.innerHTML = ''
-        out.appendChild(tableCard(
-          'Machines',
-          ms.length + ' bound',
-          ['ID', 'Hostname', 'Platform', 'Last heartbeat', 'Status', ''],
-          rows,
-          'No machines bound to that license.'
-        ))
+        const params = new URLSearchParams()
+        if (currentStatusFilter !== 'active') params.set('include_inactive', 'true')
+        if (drillLicenseId) params.set('license_id', drillLicenseId)
+        const [productsResp, machinesResp] = await Promise.all([
+          api('/v1/products').catch(() => ({ products: [] })),
+          api('/v1/admin/machines' + (params.toString() ? '?' + params.toString() : '')),
+        ])
+        products = productsResp.products || []
+        let raw = machinesResp.machines || []
+        // Apply status filter client-side too (server returns active-only by default,
+        // include_inactive returns everything; client distinguishes deactivated-only).
+        if (currentStatusFilter === 'deactivated') raw = raw.filter((m) => !m.active)
+        else if (currentStatusFilter === 'active') raw = raw.filter((m) => m.active)
+        allMachines = raw
+        renderProductPills()
+        renderStatusPills()
+        render()
       } catch (e) {
-        out.innerHTML = ''
-        out.appendChild(plainCard([err(e.message)]))
+        tableHolder.innerHTML = ''
+        tableHolder.appendChild(plainCard([err(e.message)]))
       }
     }
 
     target.appendChild(plainCard([
-      el('p', { class: 'muted', style: 'margin:0 0 16px' },
-        'Show or deactivate machines bound to a specific license. Provide the license id (find it via Licenses → search).'),
-      el('div', { class: 'toolbar' }, [
-        idIn,
-        el('button', { class: 'btn primary', onclick: load }, 'Load'),
-      ]),
+      el('p', { class: 'muted', style: 'margin:0' }, drillLicenseId
+        ? [
+            'Machines on a single license. ',
+            el('a', {
+              href: '#machines',
+              onclick: (e) => {
+                e.preventDefault()
+                location.hash = '#machines'
+                routes.machines()
+              },
+              style: 'color:var(--navy-800); font-weight:500',
+            }, 'View all machines →'),
+          ]
+        : 'One row per active install across every license. Rows are created by /v1/validate calls that carry a fingerprint. Use the pills to filter by product or status; click "Deactivate" to force-free a seat.'),
     ]))
-    target.appendChild(out)
+    target.appendChild(productPillRow)
+    target.appendChild(statusPillRow)
+    target.appendChild(statsRow)
+    target.appendChild(tableHolder)
+    load()
   }
 
   // -------- Webhooks --------
@@ -4061,7 +4464,13 @@ The request will be refused if there are licenses or invoices tied to it — use
             try { await api('/v1/admin/webhook-endpoints/' + e.id + '/active', { method: 'PATCH', body: { active: !e.active } }); routes.webhooks() } catch (er) { alert(er.message) }
           }}, e.active ? 'Disable' : 'Enable'),
           el('button', { class: 'btn sm danger', onclick: async () => {
-            if (!confirm('Delete this webhook subscription?')) return
+            if (!await confirmModal({
+              eyebrow: 'Delete webhook',
+              title: 'Delete this webhook subscription?',
+              message: 'New events will no longer be delivered to this endpoint. Past delivery history is preserved.',
+              confirmLabel: 'Delete',
+              confirmVariant: 'danger',
+            })) return
             try { await api('/v1/admin/webhook-endpoints/' + e.id, { method: 'DELETE' }); routes.webhooks() } catch (er) { alert(er.message) }
           }}, 'Delete'),
         ])),
@@ -4217,6 +4626,409 @@ The request will be refused if there are licenses or invoices tied to it — use
     load()
   }
 
+  // -------- Settings --------
+  // Three subsections:
+  //  1. Operator name — the human-readable name on /buy/<slug> + thank-you.
+  //  2. Payment providers — BTCPay + Zaprite connect / activate. Zaprite
+  //     is gated on the `zaprite_payments` self-tier entitlement (Pro+).
+  //  3. API keys — scoped tokens for agents / bots. Each key carries a
+  //     role (read-only / license-issuer / support / full-admin).
+  routes.settings = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0' },
+        'Operator-facing configuration. Display name, payment provider connections, and scoped API keys for agent / automation access.'),
+    ]))
+
+    const opNameHost = el('div', { style: 'margin-top:18px' })
+    target.appendChild(opNameHost)
+    renderOperatorNameCard(opNameHost)
+
+    const paymentHost = el('div', { style: 'margin-top:18px' })
+    target.appendChild(paymentHost)
+    renderPaymentProvidersCard(paymentHost)
+
+    const apiHost = el('div', { style: 'margin-top:18px' })
+    target.appendChild(apiHost)
+    renderApiKeysCard(apiHost)
+  }
+
+  async function renderOperatorNameCard(host) {
+    host.innerHTML = ''
+    let stored = '', effective = '', fallbackEnv = ''
+    try {
+      const r = await api('/v1/admin/operator-name').catch(() => null)
+      if (r) {
+        stored = r.stored || ''
+        effective = r.effective || ''
+        fallbackEnv = r.fallback_env || ''
+      }
+    } catch {}
+    const input = el('input', {
+      class: 'input',
+      type: 'text',
+      value: stored,
+      placeholder: fallbackEnv || 'Your business or display name',
+      style: 'max-width:380px',
+    })
+    const status = el('span', { class: 'muted', style: 'margin-left:10px; font-size:12.5px' }, '')
+    const saveBtn = el('button', { class: 'btn primary', onclick: async () => {
+      saveBtn.disabled = true
+      status.textContent = 'Saving…'
+      try {
+        await api('/v1/admin/operator-name', {
+          method: 'POST',
+          body: { name: input.value.trim() },
+        })
+        status.textContent = 'Saved.'
+        setTimeout(() => { renderOperatorNameCard(host) }, 600)
+      } catch (e) {
+        status.textContent = 'Failed: ' + e.message
+        saveBtn.disabled = false
+      }
+    } }, 'Save')
+    const noteChildren = [
+      el('p', { class: 'muted', style: 'margin:0 0 12px' },
+        'Shown on /buy/<slug> pages and the post-purchase thank-you page. Anything you want buyers to see as the seller.'),
+    ]
+    if (effective) {
+      noteChildren.push(el('p', { class: 'muted', style: 'margin:10px 0 0; font-size:12px' }, [
+        'Buyers currently see: ',
+        el('code', { style: 'font-family:var(--font-mono); font-size:12px; color:var(--navy-900)' }, effective),
+      ]))
+    }
+    host.appendChild(card('Operator name', null, [
+      ...noteChildren.slice(0, 1),
+      el('div', { style: 'display:flex; align-items:center; gap:10px; flex-wrap:wrap' },
+        [input, saveBtn, status]),
+      ...noteChildren.slice(1),
+    ]))
+  }
+
+  async function renderPaymentProvidersCard(host) {
+    host.innerHTML = ''
+    let btcpayConfigured = false, zapriteConfigured = false, activeProvider = '', tier = null
+    try {
+      const r = await api('/v1/admin/payment-provider/status').catch(() => null)
+      if (r) {
+        btcpayConfigured = !!r.btcpay_configured
+        zapriteConfigured = !!r.zaprite_configured
+        activeProvider = r.active || ''
+      }
+    } catch {}
+    try {
+      tier = await api('/v1/admin/tier').catch(() => null)
+    } catch {}
+    const zapriteAllowed = tier && Array.isArray(tier.entitlements) &&
+      tier.entitlements.indexOf('zaprite_payments') >= 0
+
+    function providerRow(name, label, configured, isActive, lockedReason) {
+      const statusPill = lockedReason
+        ? el('span', {
+            class: 'badge b-neutral',
+            style: 'font-size:10.5px; padding:2px 7px',
+            title: lockedReason,
+          }, 'locked')
+        : isActive
+          ? el('span', { class: 'badge b-success', style: 'font-size:10.5px; padding:2px 7px' }, 'active')
+          : (configured
+              ? el('span', { class: 'badge b-neutral', style: 'font-size:10.5px; padding:2px 7px' }, 'configured')
+              : el('span', { class: 'badge b-neutral', style: 'font-size:10.5px; padding:2px 7px' }, 'not connected'))
+      const buttons = []
+      if (lockedReason) {
+        const upgradeBtn = el('a', {
+          class: 'btn sm primary',
+          href: 'https://licensing.keysat.xyz/buy/keysat?policy=pro',
+          target: '_blank',
+          rel: 'noopener',
+          style: 'text-decoration:none',
+        }, 'Upgrade to Pro →')
+        buttons.push(upgradeBtn)
+      } else if (configured) {
+        if (!isActive) {
+          buttons.push(el('button', {
+            class: 'btn sm secondary',
+            onclick: async () => {
+              try {
+                await api('/v1/admin/payment-provider/activate', { method: 'POST', body: { provider: name } })
+                renderPaymentProvidersCard(host)
+              } catch (e) { alert(e.message) }
+            },
+          }, 'Activate'))
+        }
+        buttons.push(el('button', {
+          class: 'btn sm danger',
+          onclick: async () => {
+            if (!await confirmModal({
+              eyebrow: 'Disconnect',
+              title: 'Disconnect ' + label + '?',
+              message: 'The stored API key will be wiped. Any active purchases through this provider will stop being processable until you reconnect.',
+              confirmLabel: 'Disconnect',
+              confirmVariant: 'danger',
+            })) return
+            try {
+              await api('/v1/admin/' + name + '/disconnect', { method: 'POST' })
+              renderPaymentProvidersCard(host)
+            } catch (e) { alert(e.message) }
+          },
+        }, 'Disconnect'))
+      } else {
+        buttons.push(el('button', {
+          class: 'btn sm primary',
+          onclick: () => openConnectModal(name, label, () => renderPaymentProvidersCard(host)),
+        }, 'Connect'))
+      }
+      return el('div', {
+        style: 'display:flex; align-items:center; gap:12px; padding:14px 0; border-top:1px solid var(--border-1)' +
+          (lockedReason ? '; opacity:0.65' : ''),
+      }, [
+        el('div', { style: 'flex:1' }, [
+          el('div', { style: 'font-weight:600; color:var(--navy-950); margin-bottom:4px; display:flex; align-items:center; gap:8px' },
+            [label, statusPill]),
+          el('div', { class: 'muted', style: 'font-size:12.5px; line-height:1.45' },
+            name === 'btcpay'
+              ? 'Bitcoin / Lightning via self-hosted BTCPay. Free on every tier.'
+              : 'Cards, Apple Pay, bank transfers, and Bitcoin via Zaprite\'s hosted gateway. Pro tier required.'),
+        ]),
+        el('div', { style: 'display:flex; gap:6px; flex-shrink:0' }, buttons),
+      ])
+    }
+
+    const rows = el('div', { style: 'margin-top:6px' }, [
+      providerRow('btcpay', 'BTCPay Server',
+        btcpayConfigured,
+        activeProvider === 'btcpay',
+        null),
+      providerRow('zaprite', 'Zaprite payment gateway',
+        zapriteConfigured,
+        activeProvider === 'zaprite',
+        zapriteAllowed ? null : 'Zaprite requires Pro or Patron tier (zaprite_payments entitlement).'),
+    ])
+
+    host.appendChild(card('Payment providers', null, [
+      el('p', { class: 'muted', style: 'margin:0 0 4px' },
+        'Connect one or both providers, then pick which is active. The active provider is what /buy/<slug> uses for new purchases.'),
+      rows,
+    ]))
+  }
+
+  // Connect modal for BTCPay / Zaprite.
+  function openConnectModal(provider, displayLabel, onSuccess) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+    })
+    const fields = el('div', { style: 'display:flex; flex-direction:column; gap:10px; margin-top:10px;' })
+    const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px; min-height:18px' }, '')
+    const fieldMap = {}
+    function addField(name, label, opts) {
+      opts = opts || {}
+      const inp = el('input', {
+        class: 'input',
+        type: opts.type || 'text',
+        placeholder: opts.placeholder || '',
+        value: opts.value || '',
+      })
+      fieldMap[name] = inp
+      const labelChildren = [label]
+      if (opts.help) labelChildren.push(helpIcon(opts.help))
+      fields.appendChild(el('label', { class: 'lbl', style: 'display:flex; align-items:center; gap:6px; font-size:12.5px' }, labelChildren))
+      fields.appendChild(inp)
+    }
+    if (provider === 'btcpay') {
+      addField('base_url', 'Base URL', { placeholder: 'https://btcpay.example.com', help: 'Your self-hosted BTCPay server URL. Include https://.' })
+      addField('api_key',  'API key',  { help: 'Generate a Greenfield API key from BTCPay → Account → Manage Account → API Keys with btcpay.store.canmodifyinvoices permission.' })
+      addField('store_id', 'Store id', { help: 'BTCPay → Stores → your store → General → Store id.' })
+      addField('webhook_secret', 'Webhook secret (optional)', { help: 'If you set up a webhook in BTCPay pointing at /v1/btcpay/webhook, paste the secret here so Keysat can verify signatures.' })
+    } else if (provider === 'zaprite') {
+      addField('api_key', 'API key', { help: 'Generate at app.zaprite.com → Settings → API. Needs the default scopes.' })
+    }
+    const connectBtn = el('button', { class: 'btn primary' }, 'Connect')
+    connectBtn.addEventListener('click', async () => {
+      const body = {}
+      for (const k in fieldMap) {
+        const v = fieldMap[k].value.trim()
+        if (v) body[k] = v
+      }
+      connectBtn.disabled = true
+      status.textContent = 'Validating…'
+      try {
+        await api('/v1/admin/' + provider + '/connect', { method: 'POST', body })
+        overlay.remove()
+        onSuccess && onSuccess()
+      } catch (e) {
+        status.textContent = e.message
+        connectBtn.disabled = false
+      }
+    })
+    const cancelBtn = el('button', { class: 'btn secondary' }, 'Cancel')
+    cancelBtn.addEventListener('click', () => overlay.remove())
+    const cardEl = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); border-radius:12px; max-width:540px; width:100%; padding:24px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+    }, [
+      el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Connect'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 6px; color:var(--navy-950);' },
+        'Connect ' + displayLabel),
+      fields,
+      status,
+      el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [connectBtn, cancelBtn]),
+    ])
+    overlay.appendChild(cardEl)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+  }
+
+  async function renderApiKeysCard(host) {
+    host.innerHTML = ''
+    let keys = []
+    try {
+      const r = await api('/v1/admin/api-keys').catch(() => ({ api_keys: [] }))
+      keys = r.api_keys || []
+    } catch {}
+
+    const createBtn = el('button', { class: 'btn sm primary', onclick: () => openCreateApiKeyModal(() => renderApiKeysCard(host)) }, '+ Generate key')
+    const rows = keys.map((k) => {
+      const isRevoked = !!k.revoked_at
+      return el('tr', null, [
+        el('td', null, [
+          el('span', { style: 'font-weight:600; color:var(--navy-950)' }, k.label),
+          isRevoked ? el('span', { class: 'muted', style: 'margin-left:8px; font-size:11.5px' }, '(revoked)') : null,
+        ]),
+        el('td', null, el('code', { style: 'font-size:11.5px' }, k.role)),
+        el('td', { class: 'muted' }, fmtDate(k.created_at)),
+        el('td', { class: 'muted' }, k.last_used_at ? relativeDate(k.last_used_at) : 'never'),
+        el('td', null, isRevoked
+          ? el('span', { class: 'muted', style: 'font-size:11.5px' }, '—')
+          : el('button', {
+              class: 'btn sm danger',
+              onclick: async () => {
+                if (!await confirmModal({
+                  eyebrow: 'Revoke API key',
+                  title: 'Revoke "' + k.label + '"?',
+                  message: 'Any agent or script using this key stops working immediately. Irreversible — generate a new key if needed.',
+                  confirmLabel: 'Revoke',
+                  confirmVariant: 'danger',
+                })) return
+                try {
+                  await api('/v1/admin/api-keys/' + k.id, { method: 'DELETE' })
+                  renderApiKeysCard(host)
+                } catch (e) { alert(e.message) }
+              },
+            }, 'Revoke')),
+      ])
+    })
+
+    host.appendChild(card('Scoped API keys', null, [
+      el('p', { class: 'muted', style: 'margin:0 0 8px' }, [
+        'Additional Bearer tokens with bounded permissions, for agents / bots / partner scripts. The master admin API key (set in your StartOS config) stays full-access. ',
+        el('a', {
+          href: 'https://docs.keysat.xyz/agent-guide',
+          target: '_blank',
+          rel: 'noopener',
+          style: 'color:var(--navy-800); font-weight:500',
+        }, 'Agent integration guide →'),
+      ]),
+      el('div', { style: 'display:flex; align-items:center; gap:10px; margin-bottom:10px' }, [createBtn]),
+      keys.length === 0
+        ? el('div', { class: 'empty', style: 'padding:24px; text-align:center; color:var(--ink-500); font-size:13.5px' },
+            'No scoped API keys yet. Generate one to give an agent or bot bounded access.')
+        : tableCard('', null,
+            ['Label', 'Role', 'Created', 'Last used', ''],
+            rows, ''),
+    ]))
+  }
+
+  function openCreateApiKeyModal(onSuccess) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+    })
+    const labelInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. Recap support bot' })
+    const roleSelect = el('select', { class: 'input' }, [
+      el('option', { value: 'read-only' }, 'Read-only — list everything; mutate nothing'),
+      el('option', { value: 'license-issuer' }, 'License issuer — read + issue / revoke / change-tier licenses'),
+      el('option', { value: 'support' }, 'Support — license issuer + cancel subs + deactivate machines'),
+      el('option', { value: 'full-admin' }, 'Full admin — every scope (use sparingly)'),
+    ])
+    const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px; min-height:18px' }, '')
+    const generateBtn = el('button', { class: 'btn primary' }, 'Generate')
+    const cancelBtn = el('button', { class: 'btn secondary' }, 'Cancel')
+    cancelBtn.addEventListener('click', () => overlay.remove())
+    generateBtn.addEventListener('click', async () => {
+      const label = labelInput.value.trim()
+      if (!label) { status.textContent = 'Label required.'; return }
+      generateBtn.disabled = true
+      status.textContent = 'Generating…'
+      try {
+        const r = await api('/v1/admin/api-keys', {
+          method: 'POST',
+          body: { label: label, role: roleSelect.value },
+        })
+        overlay.remove()
+        showTokenOnceModal(r.token, r.label, r.role, onSuccess)
+      } catch (e) {
+        status.textContent = e.message
+        generateBtn.disabled = false
+      }
+    })
+    const cardEl = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); border-radius:12px; max-width:540px; width:100%; padding:24px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+    }, [
+      el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'New API key'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 14px; color:var(--navy-950);' },
+        'Generate a scoped API key'),
+      el('label', { class: 'lbl', style: 'font-size:12.5px; margin-bottom:6px; display:block' }, 'Label'),
+      labelInput,
+      el('label', { class: 'lbl', style: 'font-size:12.5px; margin:14px 0 6px; display:block' }, 'Role'),
+      roleSelect,
+      status,
+      el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [generateBtn, cancelBtn]),
+    ])
+    overlay.appendChild(cardEl)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+    setTimeout(() => labelInput.focus(), 0)
+  }
+
+  function showTokenOnceModal(token, label, role, onClose) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+    })
+    const copyBtn = el('button', {
+      class: 'btn primary',
+      onclick: async function () {
+        try {
+          await navigator.clipboard.writeText(token)
+          this.textContent = 'Copied'
+          setTimeout(() => { this.textContent = 'Copy token' }, 1400)
+        } catch {}
+      },
+    }, 'Copy token')
+    const closeBtn = el('button', { class: 'btn secondary' }, 'I\'ve saved it — close')
+    closeBtn.addEventListener('click', () => { overlay.remove(); onClose && onClose() })
+    const cardEl = el('div', {
+      style: 'background:var(--cream-50); border:2px solid var(--gold-500); border-radius:12px; max-width:600px; width:100%; padding:28px 26px; ' +
+        'box-shadow:0 16px 32px rgba(14,31,51,0.20);',
+    }, [
+      el('div', { class: 'eyebrow', style: 'color:var(--gold-700); margin-bottom:8px' }, 'Save this token now'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:700; font-size:20px; margin:0 0 12px; color:var(--navy-950);' },
+        '"' + label + '" — ' + role),
+      el('p', { style: 'font-size:13.5px; line-height:1.55; color:var(--ink-700); margin:0 0 14px' },
+        'This is the only time the full token will be shown. Copy it now into your password manager or the agent that will use it. If you lose it you can\'t recover it — only revoke and generate a new one.'),
+      el('div', {
+        style: 'background:var(--navy-950); color:var(--cream-50); padding:14px 16px; border-radius:8px; ' +
+          'font-family:var(--font-mono); font-size:13px; word-break:break-all; margin-bottom:14px;',
+      }, token),
+      el('div', { style: 'display:flex; gap:10px;' }, [copyBtn, closeBtn]),
+    ])
+    overlay.appendChild(cardEl)
+    document.body.appendChild(overlay)
+  }
+
   // ---------- form helpers ----------
   function formInput(name, label, opts) {
     opts = opts || {}
@@ -4331,7 +5143,7 @@ The request will be refused if there are licenses or invoices tied to it — use
       el('div', { class: 'muted', style: 'font-size:12px; margin-bottom:8px' },
         'Declare the entitlements this product offers (e.g. "core", "ai_summaries"). ' +
         'Policies will pick from this list — buyers see the display name + description, ' +
-        'never the raw slug. Leave empty to use the legacy free-text mode (any string allowed).'),
+        'never the raw slug. Leave empty to allow any free-text entitlement on this product\'s policies.'),
       rowsHost,
       addBtn,
     ])
@@ -4443,9 +5255,7 @@ The request will be refused if there are licenses or invoices tied to it — use
     try {
       const t = await api('/v1/admin/tier')
       // Tier label header.
-      current.textContent = t.tier === 'unlicensed'
-        ? 'Unlicensed'
-        : (t.tier_name || 'Creator') + ' tier'
+      current.textContent = (t.tier_name || 'Creator') + ' tier'
       // Body copy + CTA based on tier.
       if (t.tier === 'patron') {
         msg.innerHTML = 'You’re a Patron — thank you for funding development.'
@@ -4455,23 +5265,16 @@ The request will be refused if there are licenses or invoices tied to it — use
         cta.textContent = 'Become a Patron →'
         cta.href = t.upgrade_url
         cta.style.display = 'inline-block'
-      } else if (t.tier === 'creator') {
+      } else {
+        // Creator tier (default — no self-license, or paid entitlements absent).
         const productCap = (t.caps && t.caps.products) || 5
         const productUsed = (t.usage && t.usage.products) || 0
         msg.innerHTML = 'Up to ' + productCap + ' products, ' + productCap +
-          ' policies/product, ' + ((t.caps && t.caps.active_codes) || 5) +
+          ' policies/product, ' + ((t.caps && t.caps.active_codes) || 10) +
           ' active codes. Currently using ' + productUsed + '/' + productCap + ' products. ' +
-          'Upgrade for unlimited products, recurring billing, and Zaprite.'
+          'Upgrade to Pro for unlimited products + policies + codes, recurring billing, and the Zaprite payment gateway (cards, Apple Pay, bank transfers).'
         cta.textContent = 'Upgrade to Pro →'
         cta.href = t.upgrade_url
-        cta.style.display = 'inline-block'
-      } else {
-        // Unlicensed.
-        msg.innerHTML = 'Running without a Keysat license. You’re limited to ' +
-          ((t.caps && t.caps.products) || 5) + ' products. ' +
-          'Get a Creator license (free codes available) or upgrade to Pro for unlimited.'
-        cta.textContent = 'Get Keysat license →'
-        cta.href = 'https://licensing.keysat.xyz/buy/keysat'
         cta.style.display = 'inline-block'
       }
       wrap.style.display = 'block'

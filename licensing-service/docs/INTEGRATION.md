@@ -219,4 +219,4 @@ Whatever you pick, hash it before sending if you want to avoid exposing the unde
 
 ## Tor / `.onion` support
 
-Since licensing-service runs on Start9, it automatically gets a Tor `.onion` address. If you ship a Tor transport in your client, you get censorship-resistant validation for free, which is particularly valuable given the whole stack is Bitcoin-paid and privacy-adjacent.
+Since licensing-service runs on Start9, it automatically gets a Tor `.onion` address. If you ship a Tor transport in your client, you get censorship-resistant validation for free, which is particularly valuable given the whole stack is Bitcoin-native and privacy-adjacent.

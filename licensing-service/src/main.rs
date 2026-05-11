@@ -39,13 +39,12 @@ async fn main() -> anyhow::Result<()> {
 
     // --- self-license tier (Keysat-licenses-Keysat) ---
     // Verifies any /data/keysat-license.txt against the embedded master
-    // pubkey. In permissive builds (default) a missing/invalid license
-    // logs a warning and we continue. In enforce builds (compiled with
-    // KEYSAT_LICENSE_ENFORCE=1) a missing/invalid license refuses to
-    // start. Result is held in app state so the admin UI can surface it.
+    // pubkey. Missing/invalid licenses fall back to the Creator (free)
+    // tier — the daemon always boots. Result is held in app state so
+    // the admin UI can surface it.
     let self_tier = Arc::new(tokio::sync::RwLock::new(
         license_self::check_at_boot()
-            .context("Keysat self-license check failed (enforce mode)")?,
+            .context("Keysat self-license boot check")?,
     ));
 
     // --- database ---

@@ -838,7 +838,7 @@ const POLICY_COLS: &str = "id, product_id, name, slug, duration_seconds, grace_s
                            max_machines, is_trial, price_sats_override,
                            entitlements_json, metadata_json, active, public,
                            is_recurring, renewal_period_days, grace_period_days, trial_days,
-                           tier_rank,
+                           tier_rank, archived_at,
                            created_at, updated_at";
 
 /// Bundles the recurring-subscription knobs so we don't keep growing
@@ -962,25 +962,43 @@ pub async fn list_policies_by_product(
     product_id: &str,
     only_active: bool,
 ) -> AppResult<Vec<Policy>> {
-    let sql = if only_active {
-        format!("SELECT {POLICY_COLS} FROM policies WHERE product_id = ? AND active = 1 ORDER BY name")
-    } else {
-        format!("SELECT {POLICY_COLS} FROM policies WHERE product_id = ? ORDER BY name")
-    };
+    list_policies_by_product_with_archived(pool, product_id, only_active, false).await
+}
+
+/// Variant of `list_policies_by_product` that lets the caller include
+/// archived rows. Admin UI passes `include_archived = true` when the
+/// "Show archived" toggle is on.
+pub async fn list_policies_by_product_with_archived(
+    pool: &SqlitePool,
+    product_id: &str,
+    only_active: bool,
+    include_archived: bool,
+) -> AppResult<Vec<Policy>> {
+    let mut clauses: Vec<&str> = vec!["product_id = ?"];
+    if only_active {
+        clauses.push("active = 1");
+    }
+    if !include_archived {
+        clauses.push("archived_at IS NULL");
+    }
+    let where_clause = clauses.join(" AND ");
+    let sql = format!(
+        "SELECT {POLICY_COLS} FROM policies WHERE {where_clause} ORDER BY name"
+    );
     let rows = sqlx::query(&sql).bind(product_id).fetch_all(pool).await?;
     Ok(rows.into_iter().map(row_to_policy).collect())
 }
 
-/// Public-buyer view: only active+public policies. Sorted by ascending
-/// effective price so the cheapest tier renders leftmost. The buy page
-/// is the only caller; admin should use `list_policies_by_product`.
+/// Public-buyer view: only active+public+non-archived policies. Sorted by
+/// ascending effective price so the cheapest tier renders leftmost. The
+/// buy page is the only caller; admin should use `list_policies_by_product`.
 pub async fn list_public_policies_by_product(
     pool: &SqlitePool,
     product_id: &str,
 ) -> AppResult<Vec<Policy>> {
     let sql = format!(
         "SELECT {POLICY_COLS} FROM policies
-         WHERE product_id = ? AND active = 1 AND public = 1
+         WHERE product_id = ? AND active = 1 AND public = 1 AND archived_at IS NULL
          ORDER BY COALESCE(price_sats_override, 0) ASC, name ASC"
     );
     let rows = sqlx::query(&sql).bind(product_id).fetch_all(pool).await?;
@@ -1154,6 +1172,28 @@ pub async fn set_policy_active(pool: &SqlitePool, id: &str, active: bool) -> App
     Ok(())
 }
 
+/// Soft-archive a policy. Idempotent: re-archiving stamps a new
+/// timestamp without erroring. Pass `archived = false` to un-archive.
+pub async fn set_policy_archived(
+    pool: &SqlitePool,
+    id: &str,
+    archived: bool,
+) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    let archived_at: Option<&str> = if archived { Some(now.as_str()) } else { None };
+    let rows = sqlx::query("UPDATE policies SET archived_at = ?, updated_at = ? WHERE id = ?")
+        .bind(archived_at)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("policy {id}")));
+    }
+    Ok(())
+}
+
 fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
     let entitlements_json: String = row.get("entitlements_json");
     let entitlements: Vec<String> =
@@ -1181,6 +1221,12 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
         .try_get::<Option<i64>, _>("tier_rank")
         .ok()
         .flatten();
+    // archived_at lands in migration 0015. Same pattern as tier_rank —
+    // nullable column, fall back to None if missing entirely.
+    let archived_at: Option<String> = row
+        .try_get::<Option<String>, _>("archived_at")
+        .ok()
+        .flatten();
     Policy {
         id: row.get("id"),
         product_id: row.get("product_id"),
@@ -1203,6 +1249,7 @@ fn row_to_policy(row: sqlx::sqlite::SqliteRow) -> Policy {
         grace_period_days,
         trial_days,
         tier_rank,
+        archived_at,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -1369,6 +1416,99 @@ pub async fn list_all_machines(pool: &SqlitePool, license_id: &str) -> AppResult
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(row_to_machine).collect())
+}
+
+/// One row of the admin Machines tab. Joins `machines` against
+/// `licenses` + `products` so the operator sees buyer_email + product
+/// slug + status without an N+1 fetch from the client.
+#[derive(Debug, serde::Serialize)]
+pub struct MachineEnriched {
+    pub id: String,
+    pub license_id: String,
+    pub product_id: String,
+    pub product_slug: String,
+    pub product_name: String,
+    pub buyer_email: Option<String>,
+    pub license_status: String,
+    pub hostname: Option<String>,
+    pub platform: Option<String>,
+    pub ip_last_seen: Option<String>,
+    pub activated_at: String,
+    pub last_heartbeat_at: String,
+    pub deactivated_at: Option<String>,
+    pub deactivation_reason: Option<String>,
+    pub active: bool,
+}
+
+/// Global admin list with optional filters. Used by the Machines tab to
+/// render every machine across every license — grouped client-side by
+/// product. Filters are optional, all conjunctive (AND).
+///
+/// - `product_id`: scope to a single product
+/// - `license_id`: scope to a single license (used by drill-down view)
+/// - `include_inactive`: include rows where deactivated_at IS NOT NULL
+/// - `limit`: cap result size; default 500 (admin grid is paginated UX-side)
+pub async fn list_machines_admin(
+    pool: &SqlitePool,
+    product_id: Option<&str>,
+    license_id: Option<&str>,
+    include_inactive: bool,
+    limit: i64,
+) -> AppResult<Vec<MachineEnriched>> {
+    let mut sql = String::from(
+        "SELECT m.id, m.license_id, l.product_id, p.slug AS product_slug, p.name AS product_name,
+                l.buyer_email, l.status AS license_status,
+                m.hostname, m.platform, m.ip_last_seen,
+                m.activated_at, m.last_heartbeat_at,
+                m.deactivated_at, m.deactivation_reason
+         FROM machines m
+         JOIN licenses l ON l.id = m.license_id
+         JOIN products p ON p.id = l.product_id
+         WHERE 1=1",
+    );
+    if !include_inactive {
+        sql.push_str(" AND m.deactivated_at IS NULL");
+    }
+    if product_id.is_some() {
+        sql.push_str(" AND l.product_id = ?");
+    }
+    if license_id.is_some() {
+        sql.push_str(" AND m.license_id = ?");
+    }
+    sql.push_str(" ORDER BY m.last_heartbeat_at DESC LIMIT ?");
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = product_id {
+        q = q.bind(v);
+    }
+    if let Some(v) = license_id {
+        q = q.bind(v);
+    }
+    q = q.bind(limit);
+    let rows = q.fetch_all(pool).await?;
+    let out = rows
+        .into_iter()
+        .map(|row| {
+            let deactivated_at: Option<String> = row.get("deactivated_at");
+            MachineEnriched {
+                id: row.get("id"),
+                license_id: row.get("license_id"),
+                product_id: row.get("product_id"),
+                product_slug: row.get("product_slug"),
+                product_name: row.get("product_name"),
+                buyer_email: row.get("buyer_email"),
+                license_status: row.get("license_status"),
+                hostname: row.get("hostname"),
+                platform: row.get("platform"),
+                ip_last_seen: row.get("ip_last_seen"),
+                activated_at: row.get("activated_at"),
+                last_heartbeat_at: row.get("last_heartbeat_at"),
+                active: deactivated_at.is_none(),
+                deactivated_at,
+                deactivation_reason: row.get("deactivation_reason"),
+            }
+        })
+        .collect();
+    Ok(out)
 }
 
 pub async fn get_active_machine_by_fp(

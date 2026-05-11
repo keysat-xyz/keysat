@@ -3,28 +3,29 @@
 //! Keysat ships in three tiers. The daemon enforces caps based on the
 //! entitlements baked into its own self-license (see `license_self.rs`):
 //!
-//!   - **Creator** (default, also the unlicensed default): caps at 5
-//!     products, 5 policies per product, 5 active discount codes. Buyers
-//!     get a real Keysat brand experience for hobbyist scale. Sold at
-//!     keysat.xyz for ~21,000 sats; also distributable via free codes.
+//!   - **Creator** (free, no self-license required): caps at 5 products,
+//!     5 policies per product, 10 active discount codes. Buyers get a
+//!     real Keysat brand experience for hobbyist scale. Anyone who
+//!     installs Keysat is on Creator out of the box — no signup, no
+//!     trial.
 //!   - **Pro**: unlimited products / policies / codes. Unlocks
-//!     `recurring_billing` and `card_payments` (Zaprite) when those
-//!     features ship in v0.3. Sold at keysat.xyz for ~250,000 sats / yr.
+//!     `recurring_billing` and `zaprite_payments` (Zaprite gateway —
+//!     cards, Apple Pay, bank transfers, in addition to Bitcoin). Sold
+//!     at keysat.xyz for ~250,000 sats / yr.
 //!   - **Patron**: same feature surface as Pro, plus a `patron`
 //!     entitlement that renders a "Patron" badge in the admin topbar.
 //!     Honest upsell — no fake feature gate. Sold for ~500,000 sats / yr.
 //!
-//! "Unlicensed" (no self-license file present) is treated as Creator-tier
-//! caps: operators can install Keysat and start shipping without paying
-//! us a sat. The pull to a paid tier happens organically when they need
-//! more than 5 products or want recurring billing.
+//! The pull from Creator to a paid tier happens organically: operators
+//! hit the 5-product cap, or want recurring billing, or want to accept
+//! cards via Zaprite. All three trigger a 402 with an upgrade URL.
 //!
 //! All tier judgments are derived from the `entitlements` array on the
 //! daemon's self-license. The presence of `unlimited_products` lifts
 //! the product cap; `unlimited_policies` lifts the policy-per-product
-//! cap; `unlimited_codes` lifts the code cap. `recurring_billing` and
-//! `card_payments` gate the Zaprite + recurring features (when those
-//! ship). `patron` is purely cosmetic.
+//! cap; `unlimited_codes` lifts the code cap. `recurring_billing` gates
+//! creating recurring policies; `zaprite_payments` gates Connect/Activate
+//! Zaprite. `patron` is purely cosmetic.
 //!
 //! The cap enforcement returns 402 Payment Required with an `upgrade_url`
 //! pointing at the master Keysat's buy page so the admin SPA can render
@@ -34,14 +35,19 @@ use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::license_self::Tier;
 
-/// Tier-cap ceilings for the entry-level "Creator" tier (and unlicensed
-/// installs, which inherit the same caps). Tunable as we learn more from
-/// real operator usage post-launch — change the constants here. Existing
-/// operators are never retroactively kicked off; the cap fires at
-/// create-time only.
+/// Tier-cap ceilings for the entry-level "Creator" tier — the default
+/// state when no self-license is present and the surfaced label whenever
+/// a license's entitlements don't include `unlimited_products`. Tunable
+/// as we learn more from real operator usage post-launch — change the
+/// constants here. Existing operators are never retroactively kicked
+/// off; the cap fires at create-time only.
 pub const CREATOR_PRODUCT_CAP: i64 = 5;
 pub const CREATOR_POLICY_CAP_PER_PRODUCT: i64 = 5;
-pub const CREATOR_CODE_CAP: i64 = 5;
+/// Creator-tier active-discount-code cap. Sized so a launch operator
+/// can run several concurrent promo campaigns (launch week, early bird,
+/// newsletter, speaker codes, etc.) without conversion-pressure that
+/// doesn't actually map to scale. Disabled codes don't count.
+pub const CREATOR_CODE_CAP: i64 = 10;
 
 /// Where the upgrade banner / 402 error sends an operator to buy a
 /// higher tier. Hard-coded to the canonical master Keysat. Eventually
@@ -54,11 +60,11 @@ pub const UPGRADE_URL_PATRON: &str = "https://licensing.keysat.xyz/buy/keysat?po
 /// for UI consumption.
 #[derive(Debug, Clone)]
 pub struct TierInfo {
-    /// Coarse label: "creator" | "pro" | "patron" | "unlicensed".
+    /// Coarse label: "creator" | "pro" | "patron".
     pub label: &'static str,
-    /// Display-friendly name: "Creator" | "Pro" | "Patron" | "Unlicensed".
+    /// Display-friendly name: "Creator" | "Pro" | "Patron".
     pub display_name: &'static str,
-    /// The full entitlement set baked into the self-license, or empty if unlicensed.
+    /// The full entitlement set baked into the self-license; empty for Creator.
     pub entitlements: Vec<String>,
 }
 
@@ -77,6 +83,11 @@ impl TierInfo {
 /// Read the daemon's self-tier and project to a TierInfo for tier-aware
 /// code paths. Async because state.self_tier is wrapped in a tokio RwLock
 /// (allows `Activate Keysat license` to swap it without a daemon restart).
+///
+/// A missing self-license surfaces as Creator (the free tier) — the daemon
+/// always boots, the Creator caps apply, and the admin UI shows "Creator"
+/// rather than "Unlicensed" to avoid the implication that something needs
+/// to be fixed.
 pub async fn current(state: &AppState) -> TierInfo {
     let tier = state.self_tier.read().await;
     let entitlements = match &*tier {
@@ -93,12 +104,10 @@ pub async fn current(state: &AppState) -> TierInfo {
     } else if entitlements.iter().any(|e| e == "unlimited_products") {
         label = "pro";
         display_name = "Pro";
-    } else if entitlements.iter().any(|e| e == "self_host") {
+    } else {
+        // No paid entitlements present (or no self-license at all) → Creator.
         label = "creator";
         display_name = "Creator";
-    } else {
-        label = "unlicensed";
-        display_name = "Unlicensed";
     }
     TierInfo {
         label,
@@ -142,7 +151,7 @@ pub async fn admin_status(
         },
     });
     let next_tier = match tier.label {
-        "creator" | "unlicensed" => "pro",
+        "creator" => "pro",
         "pro" => "patron",
         _ => "patron",
     };
@@ -226,6 +235,32 @@ pub async fn enforce_recurring_feature(state: &AppState) -> AppResult<()> {
         message: format!(
             "Recurring subscriptions require Pro or Patron. You're on {}. \
              Upgrade to enable monthly/annual billing.",
+            tier.display_name
+        ),
+        upgrade_url: UPGRADE_URL_PRO.to_string(),
+    })
+}
+
+/// Refuse to connect or activate Zaprite unless the operator's self-tier
+/// carries the `zaprite_payments` entitlement. Pro and Patron tiers have
+/// it; Creator does not. Zaprite is the buyer-side optionality story —
+/// cards, Apple Pay, bank transfers, plus Bitcoin — so this gate is the
+/// upgrade pressure for operators who want to accept payment methods
+/// beyond Bitcoin / Lightning via BTCPay. Called from both the initial
+/// Connect Zaprite flow and the Activate-Zaprite switch, so an operator
+/// can't sneak past by connecting on Pro and downgrading later (the
+/// downgrade flow doesn't auto-disconnect Zaprite, but a switch attempt
+/// after downgrade is refused).
+pub async fn enforce_zaprite_feature(state: &AppState) -> AppResult<()> {
+    let tier = current(state).await;
+    if tier.has("zaprite_payments") {
+        return Ok(());
+    }
+    Err(AppError::PaymentRequired {
+        message: format!(
+            "Zaprite payment gateway (cards, Apple Pay, bank transfers, and more) \
+             requires Pro or Patron. You're on {}. BTCPay (Bitcoin / Lightning) \
+             remains available on every tier.",
             tier.display_name
         ),
         upgrade_url: UPGRADE_URL_PRO.to_string(),

@@ -14,7 +14,7 @@
 //!   identity, store id, or any user-supplied value. Resetting
 //!   analytics opt-in regenerates it.
 //! - `daemon_version` — e.g. `"0.1.0:46"`.
-//! - `tier` — `"unlicensed" | "creator" | "pro" | "patron"`.
+//! - `tier` — `"creator" | "pro" | "patron"`.
 //! - `counts` — rounded down to the nearest 5 to prevent
 //!   fingerprinting an operator by exact license count.
 //! - `uptime_seconds` — bucketed to "<1d" / "1-7d" / "1-4w" / ">4w".

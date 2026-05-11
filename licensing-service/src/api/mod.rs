@@ -55,7 +55,9 @@
 
 pub mod admin;
 pub mod admin_ui;
+pub mod api_keys;
 pub mod auth;
+pub mod openapi;
 pub mod btcpay_authorize;
 pub mod discount_codes;
 pub mod machines;
@@ -326,6 +328,10 @@ pub fn router(state: AppState) -> Router {
             patch(policies::set_public),
         )
         .route(
+            "/v1/admin/policies/:id/archived",
+            patch(policies::set_archived),
+        )
+        .route(
             "/v1/admin/policies/:id/tip",
             patch(policies::set_tip),
         )
@@ -335,6 +341,14 @@ pub fn router(state: AppState) -> Router {
             get(policies::list_public_policies),
         )
         .route("/v1/admin/tips", get(policies::list_tips))
+        // Scoped API keys — additional credentials with bounded permissions.
+        // Master admin_api_key gates the management endpoints; the scoped
+        // keys themselves are accepted on endpoints that call require_scope.
+        .route(
+            "/v1/admin/api-keys",
+            get(api_keys::list).post(api_keys::create),
+        )
+        .route("/v1/admin/api-keys/:id", axum::routing::delete(api_keys::revoke))
         // Subscriptions (recurring billing) — admin list + cancel.
         .route(
             "/v1/admin/subscriptions",
@@ -457,6 +471,10 @@ pub fn router(state: AppState) -> Router {
         // Public read of the issuer's signing public key — used by the
         // admin Overview "Embed your public key" tip and by SDK consumers.
         .route("/v1/issuer/public-key", get(issuer_key::public))
+        // OpenAPI 3.1 spec — public, no auth. Drives agent discovery and
+        // SDK code generation. Curated subset of the full route surface;
+        // see crate::api::openapi for the inline definition.
+        .route("/v1/openapi.json", get(openapi::spec))
         // Tier model — drives the admin sidebar's persistent upgrade banner.
         .route("/v1/admin/tier", get(tier::admin_status))
         // Web-UI password auth (v0.1.0:28+).
@@ -741,7 +759,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 </div>
 
 <footer class="kfooter">
-  <span>Powered by <a href="https://keysat.xyz" target="_blank" rel="noopener">Keysat</a> &middot; Bitcoin-paid software licensing</span>
+  <span>Powered by <a href="https://keysat.xyz" target="_blank" rel="noopener">Keysat</a> &middot; Bitcoin-native self-hosted software licensing</span>
 </footer>
 
 <script>
@@ -817,8 +835,8 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   function waitingCopy(status) {{
     const min = Math.floor(elapsedMs / 60000);
     if (status === 'pending' || status === 'processing') {{
-      if (min < 2) return 'invoice ' + status + ' — should settle within a block (~10 min).';
-      if (min < 10) return 'invoice ' + status + ' — waiting for block confirmation. Safe to leave this tab open or bookmark this URL and come back.';
+      if (min < 2) return 'invoice ' + status + ' — Lightning settles in seconds; on-chain takes a block (~10 min).';
+      if (min < 10) return 'invoice ' + status + ' — looks like an on-chain payment, waiting for block confirmation. Safe to leave this tab open or bookmark this URL.';
       return 'invoice ' + status + ' — slow block. Still polling. Bookmark this URL and refresh later if you close the tab.';
     }}
     return 'invoice status: ' + (status || 'pending');

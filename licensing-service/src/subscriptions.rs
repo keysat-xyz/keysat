@@ -577,6 +577,55 @@ async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
         );
     }
 
+    // 0a. Refuse to renew an archived policy. The operator has
+    //     explicitly taken this tier out of circulation. We dispatch a
+    //     clear webhook + audit event so the operator can decide
+    //     whether to unarchive or accept the lapse. The sub is left in
+    //     its current state — the lapsing worker will eventually move
+    //     it to `lapsed` when its grace period expires.
+    let policy_for_check =
+        crate::db::repo::get_policy_by_id(&state.db, &sub.policy_id).await?;
+    if let Some(policy) = policy_for_check.as_ref() {
+        if policy.archived_at.is_some() {
+            tracing::warn!(
+                sub_id = %sub.id,
+                policy_id = %sub.policy_id,
+                policy_slug = %policy.slug,
+                "skipping renewal: policy is archived",
+            );
+            let _ = crate::db::repo::insert_audit(
+                &state.db,
+                "renewal_worker",
+                None,
+                "subscription.renewal_skipped_archived",
+                Some("subscription"),
+                Some(&sub.id),
+                None,
+                None,
+                &json!({
+                    "policy_id": sub.policy_id,
+                    "policy_slug": policy.slug,
+                    "reason": "policy_archived",
+                }),
+            )
+            .await;
+            crate::webhooks::dispatch(
+                state,
+                "subscription.renewal_skipped",
+                &json!({
+                    "subscription_id": sub.id,
+                    "license_id": sub.license_id,
+                    "product_id": sub.product_id,
+                    "policy_id": sub.policy_id,
+                    "policy_slug": policy.slug,
+                    "reason": "policy_archived",
+                }),
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     // 1. Convert listed price to sats. SAT-currency subs are an
     //    identity (no rate fetcher hit); fiat subs re-quote each
     //    cycle (per MULTI_CURRENCY_DESIGN.md decision).

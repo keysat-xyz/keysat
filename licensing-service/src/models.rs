@@ -228,6 +228,12 @@ pub struct Policy {
     /// policy. See TIER_UPGRADES_DESIGN.md for the full semantics.
     #[serde(default)]
     pub tier_rank: Option<i64>,
+    /// Soft-archive timestamp (migration 0015). `None` = live. `Some(ts)` =
+    /// archived: hidden from admin grid by default, hidden from /buy/<slug>,
+    /// renewal worker refuses to renew. Existing licenses keep validating
+    /// regardless (entitlements are signed into the key).
+    #[serde(default)]
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -7,22 +7,20 @@
 //! customer licenses, and verify its signature against the master
 //! public key.
 //!
-//! Two modes:
-//!   - `Permissive` (default for dev builds): missing or invalid
-//!     licenses log a warning and the daemon starts in
-//!     `Tier::Unlicensed`. No features are gated yet — that's a
-//!     future v0.2.x flip.
-//!   - `Enforce`: missing or invalid licenses cause the daemon to
-//!     refuse to start. Set at compile time via the
-//!     `KEYSAT_LICENSE_ENFORCE=1` env var. Marketplace builds set
-//!     this; local dev builds don't.
+//! Missing or invalid self-licenses log a warning and the daemon starts in
+//! `Tier::Unlicensed`, which the admin UI labels "Creator" — the free tier
+//! with the Creator caps applied (5 products, 5 policies per product, 10
+//! active codes). The daemon is always functional out of the box; paying
+//! lifts the caps and unlocks `recurring_billing` + `zaprite_payments`.
 //!
-//! The master pubkey is the *public* half of an Ed25519 keypair held
-//! offline by the keysat.xyz team. It is not secret — embedding it in
-//! source on GitHub is fine. Anyone with the *private* half can mint
-//! Keysat self-licenses; the private half lives on paper backup +
-//! hardware-token storage and never touches a connected machine
-//! except briefly when a master Keysat instance is being initialized.
+//! The master pubkey is the *public* half of an Ed25519 keypair held by
+//! the operator who issues Keysat-product licenses. It is not secret —
+//! embedding it in source on GitHub is fine. Anyone with the *private*
+//! half can mint Keysat self-licenses. On the master Keysat instance
+//! that owner runs, the private half doubles as the per-instance
+//! license-signing key (stored in the `server_keys` table); on every
+//! other Keysat install the private half doesn't exist and the daemon
+//! only ever verifies, never signs.
 
 use crate::crypto::{parse_key, verify_payload};
 use anyhow::{bail, Context, Result};
@@ -45,28 +43,12 @@ MCowBQYDK2VwAyEAgsromMy4osMJplX1rY0fd4ouS6wfkm/vfeY2gXEQHkA=
 /// persistent data volume so it survives package upgrades.
 pub const SELF_LICENSE_PATH: &str = "/data/keysat-license.txt";
 
-/// Build-time enforcement toggle. `KEYSAT_LICENSE_ENFORCE=1` at
-/// `cargo build` time enables enforce mode.
-const ENFORCE_FLAG: Option<&str> = option_env!("KEYSAT_LICENSE_ENFORCE");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Missing/invalid license logs a warning and continues. Default.
-    Permissive,
-    /// Missing/invalid license refuses to start the daemon.
-    Enforce,
-}
-
-pub fn mode() -> Mode {
-    match ENFORCE_FLAG {
-        Some("1") | Some("true") | Some("yes") => Mode::Enforce,
-        _ => Mode::Permissive,
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Tier {
-    /// No license configured, or license verify failed in permissive mode.
+    /// No self-license file, or verify failed. Surfaces as "Creator"
+    /// in the admin UI — the free tier with the Creator caps applied.
+    /// `reason` is for logs and the admin `/v1/admin/tier` payload, not
+    /// shown to end users.
     Unlicensed { reason: String },
     /// Valid license verified against the trust-root.
     Licensed {
@@ -79,34 +61,30 @@ pub enum Tier {
 }
 
 impl Tier {
+    /// String form for log / metrics labels. `Unlicensed` surfaces as
+    /// "creator" since that's how the admin UI presents it — operators
+    /// see one consistent name across logs and dashboard.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Tier::Unlicensed { .. } => "unlicensed",
+            Tier::Unlicensed { .. } => "creator",
             Tier::Licensed { .. } => "licensed",
         }
     }
 }
 
-/// Boot-time check. In permissive mode this always returns `Ok`; in
-/// enforce mode it returns `Err` on missing / invalid / expired
-/// licenses, which causes `main` to bail out before we open any
-/// network sockets.
+/// Boot-time check. Always returns `Ok` — Keysat boots into the Creator
+/// (free) tier when no valid self-license is present, never refuses to
+/// start. Logs a one-line info or warn line for operator visibility.
 pub fn check_at_boot() -> Result<Tier> {
-    let mode = mode();
-    tracing::info!(
-        mode = mode.as_str(),
-        "Keysat self-license check (mode={})",
-        mode.as_str()
-    );
-
     let license_str = match read_license_string() {
         Some(s) => s,
         None => {
             let reason = format!(
-                "no license at {} or KEYSAT_LICENSE env var",
+                "no license at {} or KEYSAT_LICENSE env var; running Creator (free) tier",
                 SELF_LICENSE_PATH
             );
-            return handle_missing_or_invalid(mode, reason, None);
+            tracing::info!(tier = "creator", "Keysat self-license: {}", reason);
+            return Ok(Tier::Unlicensed { reason });
         }
     };
 
@@ -116,36 +94,11 @@ pub fn check_at_boot() -> Result<Tier> {
             Ok(tier)
         }
         Err(e) => {
-            let reason = format!("verification failed: {e:#}");
-            handle_missing_or_invalid(mode, reason, Some(e))
-        }
-    }
-}
-
-fn handle_missing_or_invalid(
-    mode: Mode,
-    reason: String,
-    err: Option<anyhow::Error>,
-) -> Result<Tier> {
-    match mode {
-        Mode::Permissive => {
-            tracing::warn!(
-                tier = "unlicensed",
-                "Keysat self-license: {} — running unlicensed (permissive build)",
-                reason
+            let reason = format!(
+                "verification failed: {e:#} — falling back to Creator (free) tier"
             );
+            tracing::warn!(tier = "creator", "Keysat self-license: {}", reason);
             Ok(Tier::Unlicensed { reason })
-        }
-        Mode::Enforce => {
-            tracing::error!(
-                "Keysat self-license: {} — refusing to start. \
-                 Activate via StartOS → Keysat → Actions → Activate Keysat license.",
-                reason
-            );
-            match err {
-                Some(e) => Err(e.context("self-license invalid (enforce mode)")),
-                None => bail!("self-license missing (enforce mode): {reason}"),
-            }
         }
     }
 }
@@ -243,15 +196,6 @@ fn log_licensed(tier: &Tier) {
             product = %product_id,
             "Keysat self-license: VERIFIED — {exp}, entitlements={ents}"
         );
-    }
-}
-
-impl Mode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Mode::Permissive => "permissive",
-            Mode::Enforce => "enforce",
-        }
     }
 }
 

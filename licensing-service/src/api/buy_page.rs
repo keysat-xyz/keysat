@@ -532,7 +532,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 </div>
 
 <footer class="kfooter">
-  <span>Powered by <a href="https://keysat.xyz" target="_blank" rel="noopener">Keysat</a> &middot; Bitcoin-paid software licensing</span>
+  <span>Powered by <a href="https://keysat.xyz" target="_blank" rel="noopener">Keysat</a> &middot; Bitcoin-native self-hosted software licensing</span>
 </footer>
 
 <script>

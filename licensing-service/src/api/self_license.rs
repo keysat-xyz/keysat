@@ -1,7 +1,7 @@
 //! Admin endpoints for managing the daemon's own self-license
 //! (Keysat-licenses-Keysat).
 //!
-//! - `GET /v1/admin/self-license`   — current tier (licensed / unlicensed)
+//! - `GET /v1/admin/self-license`   — current tier (licensed / Creator)
 //! - `POST /v1/admin/self-license`  — activate a new license. Validates
 //!     against the embedded master pubkey, writes the file to
 //!     `SELF_LICENSE_PATH`, and swaps the runtime tier in app state.
@@ -12,6 +12,8 @@
 use crate::api::AppState;
 use crate::error::AppResult;
 use crate::license_self::{self, Tier};
+// `license_self::mode` was removed when enforce mode was retired; this
+// module retains its own `Tier` re-export for the admin response shape.
 use axum::{
     extract::State,
     http::StatusCode,
@@ -25,7 +27,6 @@ use serde::{Deserialize, Serialize};
 pub enum TierStatus {
     Unlicensed {
         reason: String,
-        mode: &'static str,
     },
     Licensed {
         license_id: String,
@@ -33,19 +34,13 @@ pub enum TierStatus {
         /// Unix seconds; 0 means perpetual.
         expires_at: i64,
         entitlements: Vec<String>,
-        mode: &'static str,
     },
 }
 
 fn tier_to_status(tier: &Tier) -> TierStatus {
-    let mode = match license_self::mode() {
-        license_self::Mode::Permissive => "permissive",
-        license_self::Mode::Enforce => "enforce",
-    };
     match tier {
         Tier::Unlicensed { reason } => TierStatus::Unlicensed {
             reason: reason.clone(),
-            mode,
         },
         Tier::Licensed {
             license_id,
@@ -57,7 +52,6 @@ fn tier_to_status(tier: &Tier) -> TierStatus {
             product_id: product_id.to_string(),
             expires_at: *expires_at,
             entitlements: entitlements.clone(),
-            mode,
         },
     }
 }

@@ -99,6 +99,7 @@ pub async fn activate(
             state.set_payment_provider(provider).await;
         }
         ProviderKind::Zaprite => {
+            crate::api::tier::enforce_zaprite_feature(&state).await?;
             let cfg = payment::zaprite::config::load(&state.db)
                 .await
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("{e:#}")))?

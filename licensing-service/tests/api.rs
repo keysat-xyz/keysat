@@ -1224,6 +1224,26 @@ async fn payment_provider_preference_round_trip() {
     let (state, _tmp) = make_test_state().await;
     let auth = format!("Bearer {}", TEST_ADMIN_KEY);
 
+    // Zaprite activation requires the `zaprite_payments` entitlement
+    // (Pro tier and above). Pin the daemon's self-tier to a Licensed
+    // tier carrying that entitlement so the activate path doesn't
+    // 402. BTCPay is unconditional and works at every tier.
+    {
+        let mut guard = state.self_tier.write().await;
+        *guard = keysat::license_self::Tier::Licensed {
+            license_id: uuid::Uuid::new_v4(),
+            product_id: uuid::Uuid::new_v4(),
+            expires_at: 0,
+            entitlements: vec![
+                "unlimited_products".to_string(),
+                "unlimited_policies".to_string(),
+                "unlimited_codes".to_string(),
+                "recurring_billing".to_string(),
+                "zaprite_payments".to_string(),
+            ],
+        };
+    }
+
     // Pre-seed both configs as if the operator had run Connect on
     // each at some point. We bypass the actual Connect endpoints
     // because they call out to BTCPay / Zaprite to validate the
@@ -2877,3 +2897,150 @@ async fn buyer_cancel_rejects_garbage_key() {
         "garbage key must be 401, not 404 — don't leak which subs exist"
     );
 }
+
+// ---------------------------------------------------------------------
+// 0.2.0:12 — Scoped API keys + OpenAPI spec + Zaprite gate
+// ---------------------------------------------------------------------
+
+/// `GET /v1/openapi.json` — public, no auth. Returns a parseable spec
+/// with the agent-relevant subset of endpoints documented.
+#[tokio::test]
+async fn openapi_spec_serves_valid_json() {
+    let (state, _tmp) = make_test_state().await;
+    let req = build_request("GET", "/v1/openapi.json", &[], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["openapi"], "3.1.0");
+    assert!(v["paths"].as_object().expect("paths is object").len() > 5);
+    // Spot-check that the agent-relevant endpoints are present.
+    assert!(v.pointer("/paths/~1v1~1admin~1api-keys").is_some());
+    assert!(v.pointer("/paths/~1v1~1admin~1licenses").is_some());
+    assert!(v.pointer("/paths/~1v1~1validate").is_some());
+}
+
+/// `POST /v1/admin/api-keys` — master admin creates a scoped key, the
+/// raw token comes back once, and the role is recorded. Subsequent
+/// `GET /v1/admin/api-keys` lists it without the token.
+#[tokio::test]
+async fn scoped_api_key_create_list_revoke_round_trip() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Create with a recognized role.
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({"label": "Smoke test bot", "role": "license-issuer"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let token = body["token"].as_str().expect("token returned");
+    assert!(token.starts_with("ks_"), "scoped token must use ks_ prefix");
+    let key_id = body["id"].as_str().expect("id returned").to_string();
+    assert_eq!(body["role"], "license-issuer");
+
+    // List sees the new key but never the raw token.
+    let req = build_request("GET", "/v1/admin/api-keys", &[("authorization", &auth)], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = body_json(resp).await;
+    let keys = list["api_keys"].as_array().expect("api_keys array");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["label"], "Smoke test bot");
+    assert!(keys[0].get("token").is_none(), "list must not return raw tokens");
+
+    // Revoke. Idempotent on second call.
+    let path = format!("/v1/admin/api-keys/{}", key_id);
+    let req = build_request("DELETE", &path, &[("authorization", &auth)], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let req = build_request("DELETE", &path, &[("authorization", &auth)], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["already_revoked"], true);
+}
+
+/// Create endpoint rejects unknown role with 400.
+#[tokio::test]
+async fn scoped_api_key_create_rejects_unknown_role() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({"label": "bad role", "role": "god-mode"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `POST /v1/admin/api-keys` requires master admin, NOT a scoped
+/// full-admin key — generating other API keys is a self-elevation path
+/// that scoped keys are deliberately denied.
+#[tokio::test]
+async fn scoped_api_key_management_rejects_scoped_full_admin() {
+    let (state, _tmp) = make_test_state().await;
+    let master = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Master creates a full-admin scoped key.
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &master)],
+        Some(json!({"label": "Tries to elevate", "role": "full-admin"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let scoped_token = body["token"].as_str().expect("token").to_string();
+    let scoped_auth = format!("Bearer {}", scoped_token);
+
+    // Scoped full-admin tries to create another key. Should 403 — the
+    // /v1/admin/api-keys handler calls require_admin, not require_scope.
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &scoped_auth)],
+        Some(json!({"label": "Pwn", "role": "read-only"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "scoped keys (even full-admin) must NOT manage other keys"
+    );
+}
+
+/// Zaprite Connect refuses on Creator-tier (no `zaprite_payments`
+/// entitlement) with 402. Switching the daemon's self-tier to a
+/// Pro-flavored Licensed tier lets the Connect-precheck pass (it then
+/// fails downstream on the unreachable test host, but the tier gate is
+/// behind us).
+#[tokio::test]
+async fn zaprite_connect_gated_by_pro_entitlement() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Creator tier (default for test fixture) — Connect should 402.
+    let req = build_request(
+        "POST",
+        "/v1/admin/zaprite/connect",
+        &[("authorization", &auth)],
+        Some(json!({"api_key": "fake-zaprite-key"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "Zaprite Connect must 402 without zaprite_payments entitlement"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "tier_cap");
+    assert!(body["upgrade_url"].as_str().expect("upgrade_url").contains("/buy/keysat"));
+}
+

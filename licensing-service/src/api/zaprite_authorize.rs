@@ -49,6 +49,7 @@ pub async fn connect(
     Json(req): Json<ConnectReq>,
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_admin(&state, &headers)?;
+    crate::api::tier::enforce_zaprite_feature(&state).await?;
     let (ip, ua) = request_context(&headers);
 
     let api_key = req.api_key.trim().to_string();

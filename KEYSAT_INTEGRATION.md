@@ -1218,9 +1218,9 @@ function entitlementLabel(slug: string): string {
 }
 ```
 
-If the operator hasn't defined a catalog (legacy "free-text" mode),
-the array is empty and you fall back to rendering the raw slugs —
-or replacing underscores with spaces yourself for a quick polish.
+If the operator hasn't defined a catalog (free-text mode), the array
+is empty and you fall back to rendering the raw slugs — or replacing
+underscores with spaces yourself for a quick polish.
 
 **Catalog stability rule**: once you ship gating logic that checks
 for entitlement `"export"`, the operator's catalog and policy
@@ -1288,6 +1288,71 @@ and beats up the operator's server.
 errors must degrade to "I can't tell, assume the user is fine" — not
 "app refuses to launch." Otherwise your app's uptime depends on the
 operator's licensing server being up.
+
+---
+
+## 9a. Cross-product safety — read this if the operator sells more than one product
+
+Many operators run a single Keysat instance that issues licenses for multiple
+products (e.g. one Keysat serves both Recap and Notewise). All of those
+licenses are signed by the **same Ed25519 keypair**. Without the right check
+in your app, a license issued for Recap would parse + signature-verify
+successfully inside Notewise — same public key, valid signature. That would
+be a real bug, not a theoretical one.
+
+**The protection exists, but it's your job to use it.** The LIC1 payload
+includes a signed `product_slug` field. Recap's licenses literally carry
+`"product_slug": "recap"` inside the signed bytes; Notewise's carry
+`"product_slug": "notewise"`. The signature covers those bytes, so the
+buyer can't tamper with them — but the SDK won't reject a wrong-product
+license unless you tell it which product you are.
+
+### Rule
+
+- **Online validation:** always pass `product_slug` to `client.validate(...)`.
+  The daemon enforces it and returns `reason: 'product_mismatch'` on mismatch.
+- **Offline verify:** always assert `payload.product_slug === MY_PRODUCT_SLUG`
+  after `parseAndVerify(...)`. The SDK does not do this for you.
+
+### Concrete pattern (TypeScript)
+
+```ts
+const MY_PRODUCT_SLUG = 'recap'  // hard-code; matches what the operator picked
+
+// Online — daemon enforces product_slug for you
+const r = await client.validate(licenseKey, MY_PRODUCT_SLUG, machineFingerprint)
+if (!r.ok) {
+  // r.reason === 'product_mismatch' if a Notewise license was presented
+  reject(r.reason)
+  return
+}
+
+// Offline — you must check yourself
+const payload = parseAndVerify(licenseKey, EMBEDDED_PUBKEY_PEM)
+if (payload.product_slug !== MY_PRODUCT_SLUG) {
+  reject('product_mismatch')
+  return
+}
+```
+
+Same shape in Python / Rust / Go: pass `product_slug` to `validate`,
+check `payload.product_slug` after `parse_and_verify`. Every SDK exposes
+the field on the parsed payload object.
+
+### Why the SDK doesn't auto-reject offline
+
+`ParseAndVerify` is intentionally low-level — it returns the verified
+payload and lets the caller decide what to enforce. A multi-product app
+(unusual but possible) might legitimately accept any product the operator
+signed for; a per-product app must reject mismatches. Making this opt-in
+keeps the SDK honest about what it's checking on your behalf.
+
+### Forgetting to check is a silent failure
+
+If you call `parseAndVerify` without asserting the product, a license
+from any of the operator's products will signature-verify and you'll
+treat it as valid. There is no warning. **Make the check a constant
+in your app and assert it on every code path that loads a license.**
 
 ---
 
@@ -1720,6 +1785,12 @@ ship it.
   against slug `bar`. Typos in the slug constant cause "license valid
   but my code rejects it" head-scratchers. Read the slug from a
   single constant.
+- **Not asserting `product_slug` after offline verify.** `ParseAndVerify`
+  checks the signature, not the product. If the operator sells multiple
+  products from the same Keysat, every product's licenses share the
+  signing key — a license for Product A will signature-verify inside
+  Product B's app. Always assert `payload.product_slug === MY_PRODUCT_SLUG`
+  after the parse. See §9a for the full pattern.
 - **Logging the full license key.** It's a bearer credential — log
   the `license_id` instead.
 - **Refusing to start without a license.** Boot in unlicensed mode and
