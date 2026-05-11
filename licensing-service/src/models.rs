@@ -321,6 +321,12 @@ pub struct DiscountCode {
     pub expires_at: Option<String>,
     pub applies_to_product_id: Option<String>,
     pub applies_to_policy_id: Option<String>,
+    /// Multi-policy scope (migration 0018). When non-empty, the code
+    /// applies only to policies in this list — the legacy singular
+    /// `applies_to_policy_id` is ignored. When empty, behavior falls
+    /// back to the singular column.
+    #[serde(default)]
+    pub applies_to_policy_ids: Vec<String>,
     pub referrer_label: Option<String>,
     pub description: String,
     pub active: bool,
@@ -333,6 +339,27 @@ pub struct DiscountCode {
     pub featured: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl DiscountCode {
+    /// Effective allowed-policy set. Empty = no policy restriction (the
+    /// code applies to any policy in the product/global scope). Non-
+    /// empty = the buyer's chosen policy id must be in this list.
+    ///
+    /// Multi-policy column (0018) takes precedence over the legacy
+    /// singular column; if both are absent the result is empty.
+    pub fn allowed_policy_ids(&self) -> Vec<&str> {
+        if !self.applies_to_policy_ids.is_empty() {
+            self.applies_to_policy_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        } else if let Some(pid) = self.applies_to_policy_id.as_deref() {
+            vec![pid]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// One row per (code, invoice) pair. Status transitions:

@@ -58,6 +58,22 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:20 — **Discount codes can apply to multiple policies, not just one.** Operator picks a subset (e.g. "Patron AND Pro but not Creator") on a single code instead of cloning the code under different names.',
+  '',
+  '**What changed.** Previously, a discount code\'s tier scope was a single policy (`applies_to_policy_id`) or "any policy on this product" / global. To offer the same discount across two of three tiers required creating two codes with distinct strings — operationally messy and harder for buyers. The form now has a tier multi-select pill picker: click tiers to toggle inclusion. 0 picked = "any policy on this product" (unchanged). 1 picked = single-policy scope (writes to the legacy column for clarity). 2+ picked = the code applies if and only if the chosen tier is in the picked set.',
+  '',
+  '**Migration 0018.** Additive: adds one nullable `applies_to_policy_ids_json` column to `discount_codes` for the multi-scope JSON array. Pre-existing codes have the column NULL and behave identically — the legacy singular column is still authoritative when the JSON column is empty.',
+  '',
+  '**Scope enforcement.** Both the public purchase endpoint and the admin "preview discount" endpoint now consult a unified `DiscountCode::allowed_policy_ids()` helper that returns the multi-policy list when non-empty or falls back to the legacy singular column. The featured-discount lookup also handles multi-policy: a featured code listing N policies surfaces correctly on the buy page for any of those tiers.',
+  '',
+  '**Edit form: scope still read-only.** Multi-policy scope is settable on creation and visible on the edit form (e.g. "Applies to: Keysat → Patron (patron), Pro (pro)") but, like all scope fields, isn\'t editable after the fact — operator disables + recreates to re-scope. Same constraint v0.2.0:17 introduced for the singular field; multi-policy follows the same rule to avoid silently invalidating distributed links.',
+  '',
+  '**SDK / API.** `POST /v1/admin/discount-codes` accepts an optional `policy_slugs: string[]` alongside the existing `policy_slug`. When both are present, `policy_slugs` wins. The list/get endpoints now include `applies_to_policy_ids: string[]` on every code (empty array when not multi-scoped). All other endpoints are unchanged; old SDKs that don\'t know about the field continue to work.',
+  '',
+  '**Test count: 87** (unchanged — scope logic is the same shape, just unifies over a Vec instead of a singleton).',
+  '',
+  '**Upgrade path.** v0.2.0:19 → v0.2.0:20 applies migration 0018 (additive). Existing codes keep their existing scope and behavior. No SDK breaking change.',
+  '',
   '0.2.0:19 — **Marketing-bullets position: above or below the entitlements.** Tiny operator-control add: pick where the free-form ✓ checkmark copy renders on each tier card.',
   '',
   '**The change.** Marketing bullets (`metadata.marketing_bullets`) have always rendered ABOVE the entitlement chips. That\'s usually right for "lifestyle" bullets like "Up to 5 products" / "BTCPay integration" — they sell the tier. But for tiers where the entitlements ARE the headline and the marketing bullets are caveats or fine-print, operators want them BELOW. New `metadata.marketing_bullets_position` field (`"above"` default, `"below"` opt-in) controls this per-policy. UI: small dropdown next to the bullets textarea on both create and edit forms. Renders consistently across the admin grid, the buy page, and the public `/v1/products/<slug>/policies` JSON (so SDK consumers stay in sync).',
@@ -346,7 +362,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:19',
+  version: '0.2.0:20',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

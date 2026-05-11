@@ -2071,6 +2071,15 @@ fn row_to_discount_code(row: sqlx::sqlite::SqliteRow) -> DiscountCode {
         .try_get::<i64, _>("featured")
         .map(|v| v != 0)
         .unwrap_or(false);
+    // Multi-policy scope JSON (0018). Parse to Vec<String>; non-array
+    // / malformed JSON / pre-0018 column → empty Vec (caller falls back
+    // to the singular `applies_to_policy_id`).
+    let applies_to_policy_ids: Vec<String> = row
+        .try_get::<Option<String>, _>("applies_to_policy_ids_json")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
     DiscountCode {
         id: row.get("id"),
         code: row.get("code"),
@@ -2081,6 +2090,7 @@ fn row_to_discount_code(row: sqlx::sqlite::SqliteRow) -> DiscountCode {
         expires_at: row.get("expires_at"),
         applies_to_product_id: row.get("applies_to_product_id"),
         applies_to_policy_id: row.get("applies_to_policy_id"),
+        applies_to_policy_ids,
         referrer_label: row.get("referrer_label"),
         description: row.get("description"),
         active: row.get::<i64, _>("active") != 0,
@@ -2128,6 +2138,7 @@ pub async fn create_discount_code(
         expires_at,
         applies_to_product_id,
         applies_to_policy_id,
+        None, // back-compat: legacy single-policy callers can't multi-scope
         referrer_label,
         description,
         false, // not featured by default — backwards-compat for callers
@@ -2155,6 +2166,7 @@ pub async fn create_discount_code_with_currency(
     expires_at: Option<&str>,
     applies_to_product_id: Option<&str>,
     applies_to_policy_id: Option<&str>,
+    applies_to_policy_ids: Option<Vec<String>>,
     referrer_label: Option<&str>,
     description: &str,
     featured: bool,
@@ -2209,12 +2221,17 @@ pub async fn create_discount_code_with_currency(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let stored_amount = if kind == "free_license" { 0 } else { amount };
+    // Persist multi-policy scope as a JSON array. None / empty Vec →
+    // NULL, so reads fall back to the singular `applies_to_policy_id`.
+    let policy_ids_json: Option<String> = applies_to_policy_ids
+        .filter(|v| !v.is_empty())
+        .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()));
     sqlx::query(
         "INSERT INTO discount_codes
          (id, code, kind, amount, discount_currency, max_uses, used_count, expires_at,
-          applies_to_product_id, applies_to_policy_id, referrer_label,
+          applies_to_product_id, applies_to_policy_id, applies_to_policy_ids_json, referrer_label,
           description, active, featured, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&normalized)
@@ -2225,6 +2242,7 @@ pub async fn create_discount_code_with_currency(
     .bind(expires_at)
     .bind(applies_to_product_id)
     .bind(applies_to_policy_id)
+    .bind(policy_ids_json)
     .bind(referrer_label)
     .bind(description)
     .bind(featured as i64)
@@ -2249,7 +2267,7 @@ pub async fn get_discount_code_by_id(
 ) -> AppResult<Option<DiscountCode>> {
     let row = sqlx::query(
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
-                applies_to_product_id, applies_to_policy_id, referrer_label,
+                applies_to_product_id, applies_to_policy_id, applies_to_policy_ids_json, referrer_label,
                 description, active, featured, created_at, updated_at
          FROM discount_codes WHERE id = ?",
     )
@@ -2266,7 +2284,7 @@ pub async fn get_discount_code_by_code(
     let normalized = code.trim().to_uppercase();
     let row = sqlx::query(
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
-                applies_to_product_id, applies_to_policy_id, referrer_label,
+                applies_to_product_id, applies_to_policy_id, applies_to_policy_ids_json, referrer_label,
                 description, active, featured, created_at, updated_at
          FROM discount_codes WHERE code = ?",
     )
@@ -2282,12 +2300,12 @@ pub async fn list_discount_codes(
 ) -> AppResult<Vec<DiscountCode>> {
     let q = if only_active {
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
-                applies_to_product_id, applies_to_policy_id, referrer_label,
+                applies_to_product_id, applies_to_policy_id, applies_to_policy_ids_json, referrer_label,
                 description, active, featured, created_at, updated_at
          FROM discount_codes WHERE active = 1 ORDER BY created_at DESC"
     } else {
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
-                applies_to_product_id, applies_to_policy_id, referrer_label,
+                applies_to_product_id, applies_to_policy_id, applies_to_policy_ids_json, referrer_label,
                 description, active, featured, created_at, updated_at
          FROM discount_codes ORDER BY created_at DESC"
     };
@@ -2312,41 +2330,55 @@ pub async fn find_applicable_featured_discount(
     policy_id: &str,
 ) -> AppResult<Option<DiscountCode>> {
     let now = Utc::now().to_rfc3339();
-    // The SQL filters by featured + active + not-expired +
-    // remaining-uses, scopes to either the policy, the product, or
-    // global, and orders by specificity (policy match first) then
-    // created_at ascending. LIMIT 1 — we only need the winner.
-    let row = sqlx::query(
+    // Fetch all candidate featured codes that could possibly apply
+    // (correct product, or product-wide, or global). Multi-policy scope
+    // narrowing happens in Rust via DiscountCode::allowed_policy_ids()
+    // because the multi-policy JSON column isn't index-friendly. The
+    // candidate set is small (active featured codes only), so this is
+    // cheap.
+    let rows = sqlx::query(
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
-                applies_to_product_id, applies_to_policy_id, referrer_label,
+                applies_to_product_id, applies_to_policy_id, applies_to_policy_ids_json, referrer_label,
                 description, active, featured, created_at, updated_at
          FROM discount_codes
          WHERE featured = 1
            AND active = 1
            AND (expires_at IS NULL OR expires_at > ?)
            AND (max_uses IS NULL OR used_count < max_uses)
-           AND (
-                applies_to_policy_id = ?
-             OR (applies_to_policy_id IS NULL AND applies_to_product_id = ?)
-             OR (applies_to_policy_id IS NULL AND applies_to_product_id IS NULL)
-           )
-         ORDER BY
-           CASE
-             WHEN applies_to_policy_id = ? THEN 0
-             WHEN applies_to_product_id = ? THEN 1
-             ELSE 2
-           END,
-           created_at ASC
-         LIMIT 1",
+           AND (applies_to_product_id = ? OR applies_to_product_id IS NULL)
+         ORDER BY created_at ASC",
     )
     .bind(&now)
-    .bind(policy_id)
     .bind(product_id)
-    .bind(policy_id)
-    .bind(product_id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(row.map(row_to_discount_code))
+    // Score each candidate. Lower score = higher precedence:
+    //   0 = code names this policy explicitly (singular or in multi list)
+    //   1 = code is product-scoped (no policy restriction)
+    //   2 = code is global (no product, no policy)
+    // Within a tier, first-created wins (operator-set priority).
+    let mut best: Option<(u8, DiscountCode)> = None;
+    for row in rows {
+        let code = row_to_discount_code(row);
+        let allowed = code.allowed_policy_ids();
+        let score: u8 = if !allowed.is_empty() {
+            if allowed.iter().any(|p| *p == policy_id) {
+                0
+            } else {
+                continue; // code restricts to other policies; skip
+            }
+        } else if code.applies_to_product_id.is_some() {
+            1
+        } else {
+            2
+        };
+        match &best {
+            None => best = Some((score, code)),
+            Some((prev_score, _)) if score < *prev_score => best = Some((score, code)),
+            _ => {}
+        }
+    }
+    Ok(best.map(|(_, c)| c))
 }
 
 pub async fn set_discount_code_active(
@@ -2383,6 +2415,9 @@ pub async fn update_discount_code(
     description: Option<&str>,
     referrer_label: Option<Option<&str>>,
     featured: Option<bool>,
+    // applies_to_policy_ids: None = no change, Some(vec) = overwrite
+    // (empty vec clears the column, falling back to singular column).
+    applies_to_policy_ids: Option<Vec<String>>,
 ) -> AppResult<DiscountCode> {
     // Re-fetch to validate amount against the existing kind.
     let existing = get_discount_code_by_id(pool, id)
@@ -2446,6 +2481,9 @@ pub async fn update_discount_code(
     if featured.is_some() {
         sets.push("featured = ?");
     }
+    if applies_to_policy_ids.is_some() {
+        sets.push("applies_to_policy_ids_json = ?");
+    }
     if sets.is_empty() {
         return Ok(existing);
     }
@@ -2473,6 +2511,15 @@ pub async fn update_discount_code(
     }
     if let Some(f) = featured {
         q = q.bind(f as i64);
+    }
+    if let Some(ids) = applies_to_policy_ids {
+        // Empty list → store NULL (clear multi-scope). Non-empty → JSON.
+        let stored: Option<String> = if ids.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&ids).ok()
+        };
+        q = q.bind(stored);
     }
     q = q.bind(&now).bind(id);
     q.execute(pool).await?;

@@ -40,8 +40,15 @@ pub struct CreateDiscountCodeReq {
     pub product_slug: Option<String>,
     /// Restrict to a single policy (by slug + product_slug). Omit for any policy.
     /// Requires `product_slug` to be set if specified.
+    /// Superseded by `policy_slugs` when both are present.
     #[serde(default)]
     pub policy_slug: Option<String>,
+    /// Restrict to multiple policies (by slugs + product_slug). Omit
+    /// or pass an empty list for "any policy on the product". Requires
+    /// `product_slug` to be set if specified. Takes precedence over
+    /// `policy_slug` when both are provided.
+    #[serde(default)]
+    pub policy_slugs: Option<Vec<String>>,
     /// Optional free-form tag for tracking, e.g. 'launch-twitter', 'alice@example.com'.
     #[serde(default)]
     pub referrer_label: Option<String>,
@@ -75,22 +82,51 @@ pub async fn create(
     } else {
         None
     };
-    let policy_id = if let Some(slug) = req.policy_slug.as_deref() {
-        let pid = product_id.as_deref().ok_or_else(|| {
-            AppError::BadRequest("policy_slug requires product_slug".into())
-        })?;
-        let policy = repo::get_policy_by_slug(&state.db, pid, slug)
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound(format!(
-                    "policy '{slug}' for product '{}'",
-                    req.product_slug.as_deref().unwrap_or("")
-                ))
+    // Resolve policy scope. `policy_slugs` (multi) takes precedence over
+    // `policy_slug` (singular legacy field). Both require `product_slug`.
+    // Empty `policy_slugs` is treated as "no multi-scope" so the operator
+    // can clear an existing multi-scope by passing [].
+    let (policy_id, policy_ids_for_db): (Option<String>, Option<Vec<String>>) =
+        if let Some(slugs) = req.policy_slugs.as_ref() {
+            if slugs.is_empty() {
+                (None, Some(Vec::new()))
+            } else {
+                let pid = product_id.as_deref().ok_or_else(|| {
+                    AppError::BadRequest("policy_slugs requires product_slug".into())
+                })?;
+                let mut ids = Vec::with_capacity(slugs.len());
+                for slug in slugs {
+                    let policy = repo::get_policy_by_slug(&state.db, pid, slug)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::NotFound(format!(
+                                "policy '{slug}' for product '{}'",
+                                req.product_slug.as_deref().unwrap_or("")
+                            ))
+                        })?;
+                    ids.push(policy.id);
+                }
+                // For a single-policy choice, also populate the legacy
+                // singular column so old readers stay coherent.
+                let singular = if ids.len() == 1 { ids.first().cloned() } else { None };
+                (singular, Some(ids))
+            }
+        } else if let Some(slug) = req.policy_slug.as_deref() {
+            let pid = product_id.as_deref().ok_or_else(|| {
+                AppError::BadRequest("policy_slug requires product_slug".into())
             })?;
-        Some(policy.id)
-    } else {
-        None
-    };
+            let policy = repo::get_policy_by_slug(&state.db, pid, slug)
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "policy '{slug}' for product '{}'",
+                        req.product_slug.as_deref().unwrap_or("")
+                    ))
+                })?;
+            (Some(policy.id), None)
+        } else {
+            (None, None)
+        };
 
     // Validate + normalize discount_currency. Accept SAT (default),
     // USD, EUR. For 'percent' codes the currency is irrelevant (basis
@@ -121,6 +157,7 @@ pub async fn create(
         req.expires_at.as_deref(),
         product_id.as_deref(),
         policy_id.as_deref(),
+        policy_ids_for_db,
         req.referrer_label.as_deref(),
         &req.description,
         req.featured,
@@ -239,6 +276,11 @@ pub async fn update(
         req.description.as_deref(),
         req.referrer_label.as_ref().map(|opt| opt.as_deref()),
         req.featured,
+        // Scope (product/policy) is intentionally not editable — see
+        // doc-comment on UpdateDiscountCodeReq. Disable + recreate to
+        // re-scope a code rather than silently invalidating distributed
+        // links.
+        None,
     )
     .await?;
 
@@ -432,9 +474,10 @@ pub async fn preview(
             })));
         }
     }
-    if let Some(restricted_pid) = &code.applies_to_policy_id {
+    let allowed = code.allowed_policy_ids();
+    if !allowed.is_empty() {
         if let Some(chosen) = &chosen_policy {
-            if restricted_pid != &chosen.id {
+            if !allowed.iter().any(|p| *p == chosen.id) {
                 return Ok(Json(json!({
                     "valid": false,
                     "reason": "wrong_tier",

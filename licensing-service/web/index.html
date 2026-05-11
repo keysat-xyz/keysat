@@ -3757,32 +3757,78 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const productScopeField = formSelect('product_slug', 'Restrict to product (optional)',
       productOptions, { value: '' })
 
-    // Policy picker: populated on-demand when a product is selected.
-    // Disabled when "Any product" is selected (a policy-scoped code
-    // requires a product scope per the server contract).
-    const policyScopeField = formSelect('policy_slug', 'Restrict to policy (optional)',
-      [{ value: '', label: '— Any policy —' }], { value: '' })
-    const policySel = policyScopeField.querySelector('select')
-    policySel.disabled = true
+    // Policy picker: multi-select pill picker populated on-demand when
+    // a product is selected. Operator picks zero or more policies:
+    //   - 0 picked = code applies to any policy on the chosen product
+    //   - 1 picked = code is single-policy scoped (mirrors v0.2.0:19)
+    //   - 2+ picked = code applies to any of the picked policies
+    // Hidden when "Any product" is selected — a policy-scoped code
+    // requires a product scope per the server contract.
+    const policyMultiHost = el('div', {
+      'data-policy-pills': '1',
+      style: 'display:flex; flex-wrap:wrap; gap:6px; min-height:32px; ' +
+        'padding:6px 8px; border:1px solid var(--border-1); border-radius:8px; ' +
+        'background:var(--cream-50);',
+    }, [
+      el('span', { class: 'muted', style: 'font-size:12px; align-self:center' },
+        'Pick a product to choose policies.'),
+    ])
+    const policyScopeField = el('div', { class: 'field' }, [
+      el('label', { class: 'lbl' }, 'Restrict to policies (optional)'),
+      policyMultiHost,
+      el('p', { class: 'muted', style: 'margin:4px 0 0; font-size:11.5px; line-height:1.4' },
+        'Click a tier to toggle. Pick 0 for "any policy on this product"; 2+ to scope the code to a specific subset (e.g. Patron AND Pro but not Creator).'),
+    ])
+    // Stash the current set as a small reactive structure on the host.
+    // Read by the submit handler via `policyMultiHost._selected`.
+    policyMultiHost._selected = new Set()
+    policyMultiHost._available = []
+
+    function renderPolicyPills() {
+      policyMultiHost.innerHTML = ''
+      if (!policyMultiHost._available.length) {
+        policyMultiHost.appendChild(el('span', {
+          class: 'muted', style: 'font-size:12px; align-self:center',
+        }, 'Pick a product to choose policies.'))
+        return
+      }
+      policyMultiHost._available.forEach((p) => {
+        const on = policyMultiHost._selected.has(p.slug)
+        const pill = el('button', {
+          type: 'button',
+          'data-policy-slug': p.slug,
+          style: 'font-size:12px; padding:4px 12px; border-radius:999px; cursor:pointer; ' +
+            'border:1.5px solid ' + (on ? 'var(--gold-700)' : 'var(--border-1)') + '; ' +
+            'background:' + (on ? 'var(--navy-950)' : 'var(--cream-100)') + '; ' +
+            'color:' + (on ? 'var(--gold-500)' : 'var(--ink-700)') + '; ' +
+            'font-weight:' + (on ? '600' : '500') + ';',
+        }, p.name)
+        pill.addEventListener('click', () => {
+          if (policyMultiHost._selected.has(p.slug)) policyMultiHost._selected.delete(p.slug)
+          else policyMultiHost._selected.add(p.slug)
+          renderPolicyPills()
+        })
+        policyMultiHost.appendChild(pill)
+      })
+    }
 
     productScopeField.querySelector('select').addEventListener('change', async (e) => {
       const slug = e.target.value
-      policySel.innerHTML = ''
-      policySel.appendChild(el('option', { value: '' }, '— Any policy —'))
+      policyMultiHost._selected = new Set()
+      policyMultiHost._available = []
       if (!slug) {
-        policySel.disabled = true
+        renderPolicyPills()
         return
       }
-      policySel.disabled = false
       try {
         const r = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(slug) +
           '&include_inactive=true')
-        const pols = r.policies || []
-        pols.forEach((p) => policySel.appendChild(el('option', { value: p.slug }, p.name)))
+        policyMultiHost._available = (r.policies || []).map((p) => ({ slug: p.slug, name: p.name }))
       } catch (_) {
         // Silent: operator can still create a product-scoped code
-        // without a policy if the policy fetch fails.
+        // without picking policies if the policy fetch fails.
       }
+      renderPolicyPills()
     })
 
     const create = el('details', { class: 'disclosure' }, [
@@ -3924,8 +3970,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             }
             const ps = create.querySelector('[name=product_slug]').value.trim()
             if (ps) body.product_slug = ps
-            const pol = create.querySelector('[name=policy_slug]').value.trim()
-            if (pol) body.policy_slug = pol
+            // Multi-policy scope: read from the pill host's _selected set.
+            // 0 picked = "any policy on the product" (omit field).
+            // 1 picked = send as singular policy_slug for legacy clarity.
+            // 2+ picked = send as policy_slugs array (server prefers this).
+            const pickedPolicySlugs = Array.from(policyMultiHost._selected)
+            if (pickedPolicySlugs.length === 1) {
+              body.policy_slug = pickedPolicySlugs[0]
+            } else if (pickedPolicySlugs.length > 1) {
+              body.policy_slugs = pickedPolicySlugs
+            }
             const rl = create.querySelector('[name=referrer_label]').value.trim()
             if (rl) body.referrer_label = rl
             const featured = create.querySelector('[name=featured]').checked
@@ -3982,21 +4036,30 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
       // Resolve scope names (read-only display — scope can't be edited).
       // Product name comes from the products list we already fetched.
-      // Policy name requires fetching the product's policies, done
-      // lazily here when an actual policy_id is bound.
+      // Policy names require fetching the product's policies. We honor
+      // multi-policy scope when present (0.2.0:20+); legacy single-
+      // policy codes display as before.
       let scopeLabel = 'Applies to: all products on this instance'
       if (c.applies_to_product_id) {
         const prod = productsForCreate.find((p) => p.id === c.applies_to_product_id)
         const productName = prod ? prod.name : c.applies_to_product_id
-        if (c.applies_to_policy_id && prod) {
-          let policyName = c.applies_to_policy_id
+        // Multi-policy scope wins over the legacy singular when non-empty.
+        const multi = Array.isArray(c.applies_to_policy_ids) && c.applies_to_policy_ids.length > 0
+        const policyIds = multi
+          ? c.applies_to_policy_ids
+          : (c.applies_to_policy_id ? [c.applies_to_policy_id] : [])
+        if (policyIds.length > 0 && prod) {
+          let resolvedNames = policyIds.slice()
           try {
             const r = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(prod.slug) +
               '&include_inactive=true')
-            const pol = (r.policies || []).find((p) => p.id === c.applies_to_policy_id)
-            if (pol) policyName = pol.name + ' (' + pol.slug + ')'
+            const pols = r.policies || []
+            resolvedNames = policyIds.map((pid) => {
+              const pol = pols.find((p) => p.id === pid)
+              return pol ? pol.name + ' (' + pol.slug + ')' : pid
+            })
           } catch (_) {}
-          scopeLabel = 'Applies to: ' + productName + ' → ' + policyName
+          scopeLabel = 'Applies to: ' + productName + ' → ' + resolvedNames.join(', ')
         } else {
           scopeLabel = 'Applies to: ' + productName + ' (any policy)'
         }

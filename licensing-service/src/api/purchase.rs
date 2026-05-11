@@ -292,13 +292,16 @@ pub async fn start(
                 ));
             }
         }
-        // If the code is restricted to a specific policy and a tier was
-        // selected, they must match. If no tier was selected, the code is
-        // implicitly applied to the product's default policy at issuance
-        // time, which we accept here (v0.1.0:27+).
-        if let Some(restricted_pid) = &code.applies_to_policy_id {
+        // If the code is restricted to one or more policies and a tier
+        // was selected, the chosen tier must be in the allowed set.
+        // `allowed_policy_ids()` unifies the multi-policy column (0018)
+        // and the legacy singular column. If no tier was selected, the
+        // code is implicitly applied to the product's default policy at
+        // issuance time, which we accept here (v0.1.0:27+).
+        let allowed = code.allowed_policy_ids();
+        if !allowed.is_empty() {
             if let Some(chosen) = &chosen_policy {
-                if restricted_pid != &chosen.id {
+                if !allowed.iter().any(|p| *p == chosen.id) {
                     return Err(AppError::BadRequest(
                         "discount code does not apply to the selected tier".into(),
                     ));

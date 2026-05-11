@@ -1,0 +1,30 @@
+-- Migration 0018: multi-policy scope for discount codes
+--
+-- Until now, a discount code could be scoped to exactly one policy
+-- (`applies_to_policy_id`) or "any policy on this product" / global.
+-- That left a real gap: "this code is good for Patron OR Pro but not
+-- Creator" required creating two distinct codes with different code
+-- strings, which is operationally messy.
+--
+-- New column `applies_to_policy_ids_json`: a JSON-encoded array of
+-- policy ids (TEXT uuids). Semantics:
+--
+--   NULL or '[]' → no multi-policy restriction. Fall back to the legacy
+--                  `applies_to_policy_id` (single-policy scope) or, if
+--                  that's also NULL, scope follows `applies_to_product_id`
+--                  (or global if that's NULL too). Identical behavior
+--                  to v0.2.0:19 and earlier.
+--
+--   '["id1","id2",...]' → the code applies if and only if the buyer's
+--                         chosen policy is in this array. Takes
+--                         precedence over `applies_to_policy_id` (the
+--                         legacy singular column is ignored when this
+--                         is non-empty).
+--
+-- Migration is purely additive. Existing rows have the new column NULL,
+-- so all v0.2.0:19-and-earlier discount codes keep working unchanged.
+-- New codes written via the admin API populate this column when the
+-- operator picks 2+ policies; single-policy codes continue to write to
+-- `applies_to_policy_id` for clarity.
+
+ALTER TABLE discount_codes ADD COLUMN applies_to_policy_ids_json TEXT NULL;
