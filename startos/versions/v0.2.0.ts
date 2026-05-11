@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:18 — **Discount Codes form polish: less typing, clearer intent.** Three small admin-UI changes that make the create + edit forms less footgun-prone.',
+  '',
+  '**Max-uses: checkbox + dependent number, not "0 = unlimited".** Previously the form had a single number input with a hint that read `"0 = unlimited"`. That meant the default value was `0`, which displayed as "no cap" but read like "0 uses allowed." Now it\'s a "Limit total uses" checkbox + a number input that only appears when the checkbox is checked (default 100). Unchecked = no cap is sent. Edit form matches.',
+  '',
+  '**Currency dropdown hides for percent + free_license codes.** A "50% off" code has no currency — neither does a free-license code. Previously the form still showed the SAT/USD selector for those kinds, which made buyers wonder what `50% off · SAT` meant. The kind-change listener now hides the currency field for `percent` and `free_license`, shows it for `fixed_amount`. Submit still defaults sensibly so existing forms keep working.',
+  '',
+  '**Featured: pill toggle, not buried checkbox.** The launch-special feature flag was the third checkbox on the form and getting missed. Replaced with a prominent gold-bordered pill toggle that flips to filled gold/navy when on. Click anywhere on the pill to toggle. Edit form matches; the toggle starts in the correct state for codes that were already featured.',
+  '',
+  '**Test count: 87** (unchanged — UI-only release).',
+  '',
+  '**Upgrade path.** v0.2.0:17 → v0.2.0:18 is a drop-in. No schema, no SDK, no behavior change for buyers. Form fields persist the same way they always did.',
+  '',
   '0.2.0:17 — **Discount Codes form usability.** Three concrete improvements to make the Discount Codes tab less type-heavy and more discoverable.',
   '',
   '**Product + policy scope as dropdowns, not free-text.** The create form previously had a "Restrict to product slug (optional)" text input that required operators to remember slugs exactly. Now it\'s a dropdown populated from the product list — pick "Any product" or any specific product. A second dependent dropdown appears for "Restrict to policy" once a product is chosen; it loads that product\'s policies on the fly. Both default to "Any" so the previous "no scope = global" behavior is preserved.',
@@ -326,7 +338,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:17',
+  version: '0.2.0:18',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

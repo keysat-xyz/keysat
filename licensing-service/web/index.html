@@ -324,6 +324,43 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   .topbar { padding:14px 20px; }
 }
 
+/* Featured (launch special) pill toggle — used on the Discount Codes
+   create + edit forms. Click anywhere on the pill to flip the
+   underlying hidden checkbox. Off = muted; on = gold accent. Reads as
+   "this is a deliberate decision," not a passive checkbox. */
+.featured-pill-toggle {
+  display:inline-flex; align-items:center; gap:10px;
+  padding:8px 14px;
+  background:var(--cream-100); color:var(--ink-700);
+  border:1px solid var(--border-2); border-radius:999px;
+  font-family:var(--font-body); font-size:13px;
+  cursor:pointer; transition:all 100ms;
+}
+.featured-pill-toggle:hover {
+  background:var(--cream-200); color:var(--navy-900);
+}
+.featured-pill-toggle > strong {
+  font-weight:600;
+}
+.featured-pill-toggle .state {
+  font-size:11px; font-weight:700; letter-spacing:0.1em;
+  text-transform:uppercase; padding:2px 8px; border-radius:999px;
+  background:var(--cream-50); color:var(--ink-500);
+  border:1px solid var(--border-1);
+}
+.featured-pill-toggle.on {
+  background:var(--gold-500); color:var(--navy-950);
+  border-color:var(--gold-500);
+  box-shadow:0 2px 6px rgba(191,160,104,0.25);
+}
+.featured-pill-toggle.on .state {
+  background:var(--navy-950); color:var(--gold-500);
+  border-color:var(--navy-950);
+}
+.featured-pill-toggle.on:hover {
+  background:var(--gold-400);
+}
+
 /* Tier-card drag affordance — cursor signals draggability on hover,
    the dragging card visibly lifts, and the drop-target receives a
    subtle outline so the operator sees where the card will land. */
@@ -3707,33 +3744,96 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             { value: 'free_license', label: 'Free license (no payment)' },
           ], { required: true, value: 'percent' }),
         ]),
-        el('div', { class: 'row-2' }, [
-          formInput('amount', 'Amount', { type: 'number', step: '1', value: '50', hint: amountHint('percent', 'SAT') }),
-          formSelect('discount_currency', 'Currency', [
+        // Amount + currency. Currency is hidden when the kind doesn't
+        // use it (percent / free_license) — they're currency-agnostic.
+        // The kind-change listener below toggles `display` on the
+        // currency field's wrapper.
+        (() => {
+          const amountField = formInput('amount', 'Amount',
+            { type: 'number', step: '1', value: '50', hint: amountHint('percent', 'SAT') })
+          const currencyField = formSelect('discount_currency', 'Currency', [
             { value: 'SAT', label: 'sats' },
             { value: 'USD', label: 'USD ($)' },
             { value: 'EUR', label: 'EUR (€)' },
-          ], { value: 'SAT', hint: 'matters for "fixed amount off" and "set flat price" — ignored for percent / free.' }),
-        ]),
+          ], { value: 'SAT' })
+          // Stash a marker so the kind-change listener can find this row
+          // and toggle the currency column visibility.
+          currencyField.setAttribute('data-currency-field', '1')
+          return el('div', {
+            class: 'row-2',
+            'data-amount-row': '1',
+          }, [amountField, currencyField])
+        })(),
         // Scope: product picker + dependent policy picker, side-by-side.
         // Both default to "Any" — a code with no scope applies to every
         // product on this instance.
         el('div', { class: 'row-2' }, [productScopeField, policyScopeField]),
-        // Limits: max-uses + expires-at on the same row.
-        el('div', { class: 'row-2' }, [
-          formInput('max_uses', 'Max uses (0 = unlimited)', { type: 'number', value: '0' }),
-          formInput('expires_at', 'Expires at', { type: 'datetime-local', hint: 'Leave blank for no expiry.' }),
-        ]),
+        // Limits: "Limit total uses" checkbox + number input, paired
+        // with the expires-at picker. The number input is hidden when
+        // the checkbox is off (= unlimited). Clearer than the old
+        // "0 = unlimited" sentinel value.
+        (() => {
+          const limitCb = el('input', {
+            type: 'checkbox',
+            name: 'max_uses_enabled',
+            id: 'create_max_uses_cb',
+          })
+          const limitNum = el('input', {
+            class: 'input',
+            type: 'number',
+            min: '1',
+            value: '100',
+            name: 'max_uses',
+            style: 'display:none; max-width:120px',
+          })
+          limitCb.addEventListener('change', () => {
+            limitNum.style.display = limitCb.checked ? 'inline-block' : 'none'
+            if (limitCb.checked) limitNum.focus()
+          })
+          const limitWrap = el('div', { class: 'field' }, [
+            el('label', { class: 'lbl', for: 'create_max_uses_cb' }, 'Use cap'),
+            el('div', {
+              style: 'display:flex; align-items:center; gap:10px; flex-wrap:wrap',
+            }, [
+              el('label', {
+                for: 'create_max_uses_cb',
+                style: 'display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px',
+              }, [limitCb, 'Limit total uses']),
+              limitNum,
+            ]),
+          ])
+          const expiresField = formInput('expires_at', 'Expires at',
+            { type: 'datetime-local', hint: 'Leave blank for no expiry.' })
+          return el('div', { class: 'row-2' }, [limitWrap, expiresField])
+        })(),
         formInput('referrer_label', 'Referrer / campaign label (optional)'),
         formInput('description', 'Description (internal note)', { textarea: true }),
-        el('div', { style: 'display:flex; align-items:flex-start; gap:8px; margin-top:8px' }, [
-          el('input', { type: 'checkbox', name: 'featured', id: 'create_featured_cb', style: 'margin-top:3px' }),
-          el('label', { for: 'create_featured_cb', style: 'font-size:12.5px; line-height:1.45; cursor:pointer' }, [
-            el('strong', null, 'Featured (launch special) '),
-            el('span', { class: 'muted' },
-              '— display on the buy page with a diagonal "LAUNCH SPECIAL" ribbon + the original price struck through. Auto-applies to buyers who don\'t type a code. Operator-typed codes still win when a buyer pastes one.'),
-          ]),
-        ]),
+        // Featured pill toggle — more prominent than a checkbox so it
+        // doesn't get missed. Click anywhere on the pill toggles state.
+        // Hidden state still tracked via a checkbox so existing form
+        // logic (querySelector by name) keeps working.
+        (() => {
+          const hiddenCb = el('input', { type: 'checkbox', name: 'featured', style: 'display:none' })
+          const pill = el('button', {
+            type: 'button',
+            class: 'featured-pill-toggle',
+            onclick: () => {
+              hiddenCb.checked = !hiddenCb.checked
+              pill.classList.toggle('on', hiddenCb.checked)
+              pill.querySelector('[data-state]').textContent = hiddenCb.checked ? 'On' : 'Off'
+            },
+          }, [
+            el('span', null, '★'),
+            el('strong', null, 'Featured (launch special)'),
+            el('span', { 'data-state': '1', class: 'state' }, 'Off'),
+          ])
+          return el('div', { style: 'margin-top:12px' }, [
+            pill,
+            hiddenCb,
+            el('p', { class: 'muted', style: 'margin:6px 0 0; font-size:12.5px; line-height:1.5' },
+              'When on: display on the buy page with a diagonal "LAUNCH SPECIAL" ribbon + the original price struck through. Auto-applies to buyers who don\'t type a code. Operator-typed codes still win when a buyer pastes one.'),
+          ])
+        })(),
         el('button', { class: 'btn primary', onclick: async function () {
           const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
           create.querySelector('.body').appendChild(status)
@@ -3752,8 +3852,14 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               discount_currency: currency,
               description: create.querySelector('[name=description]').value || '',
             }
-            const mu = parseInt(create.querySelector('[name=max_uses]').value, 10) || 0
-            if (mu > 0) body.max_uses = mu
+            // Max uses: only honor the number field if the "Limit total
+            // uses" checkbox is checked. Otherwise leave body.max_uses
+            // absent (server treats absent = unlimited).
+            const limitCb = create.querySelector('[name=max_uses_enabled]')
+            if (limitCb && limitCb.checked) {
+              const mu = parseInt(create.querySelector('[name=max_uses]').value, 10) || 0
+              if (mu > 0) body.max_uses = mu
+            }
             // datetime-local returns "2026-12-31T23:59" (local time, no
             // seconds, no timezone). Convert to RFC3339 by appending
             // ":00Z" — that pins it to UTC. Operators expecting local
@@ -3784,18 +3890,26 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
     // Live-update the amount hint as the operator changes Kind or
     // Currency. Also swap the input's `step` so SAT-currency codes
-    // are integer-only and USD/EUR can take decimals.
+    // are integer-only and USD/EUR can take decimals. AND hide the
+    // currency dropdown when the kind doesn't use it (percent is
+    // currency-agnostic basis points; free_license has no amount).
     const kindSelEl = create.querySelector('[name=kind]')
     const curSelEl = create.querySelector('[name=discount_currency]')
     const amtInputEl = create.querySelector('[name=amount]')
+    const currencyFieldEl = create.querySelector('[data-currency-field]')
     function updateHint() {
       const hintEl = amtInputEl.parentElement.querySelector('.hint')
       if (hintEl) hintEl.textContent = amountHint(kindSelEl.value, curSelEl.value)
       // Toggle decimal entry — sats are integer, fiat goes to cents.
       amtInputEl.step = curSelEl.value === 'SAT' ? '1' : '0.01'
+      // Show currency only when the kind actually consumes it.
+      const usesCurrency = kindSelEl.value === 'fixed_sats' || kindSelEl.value === 'set_price'
+      if (currencyFieldEl) currencyFieldEl.style.display = usesCurrency ? '' : 'none'
     }
     if (kindSelEl) kindSelEl.addEventListener('change', updateHint)
     if (curSelEl) curSelEl.addEventListener('change', updateHint)
+    // Initial render: kind defaults to 'percent', so hide currency.
+    updateHint()
 
     target.appendChild(plainCard([
       el('p', { class: 'muted', style: 'margin:0 0 16px' },
@@ -3842,11 +3956,45 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           ? 'free_license codes have no amount.'
           : amountHint(c.kind) + ' (kind: ' + c.kind + ', not editable)',
       })
-      const muField = formInput('e_max_uses', 'Max uses (0 = unlimited)', {
-        type: 'number',
-        value: c.max_uses == null ? '0' : String(c.max_uses),
-        hint: c.used_count > 0 ? 'cannot go below current used_count (' + c.used_count + ').' : null,
-      })
+      // Max uses — "Limit total uses" checkbox + dependent number
+      // input. Same UX as the create form. Pre-populated based on
+      // the code's current state.
+      const muField = (() => {
+        const hasLimit = c.max_uses != null
+        const cb = el('input', {
+          type: 'checkbox',
+          name: 'e_max_uses_enabled',
+          id: 'e_max_uses_cb',
+        })
+        if (hasLimit) cb.checked = true
+        const num = el('input', {
+          class: 'input',
+          type: 'number',
+          min: '1',
+          value: hasLimit ? String(c.max_uses) : '100',
+          name: 'e_max_uses',
+          style: (hasLimit ? '' : 'display:none; ') + 'max-width:120px',
+        })
+        cb.addEventListener('change', () => {
+          num.style.display = cb.checked ? 'inline-block' : 'none'
+          if (cb.checked) num.focus()
+        })
+        const hint = c.used_count > 0
+          ? el('div', { class: 'hint', style: 'margin-top:4px' },
+              'Cannot go below current used_count (' + c.used_count + ').')
+          : null
+        return el('div', { class: 'field' }, [
+          el('label', { class: 'lbl', for: 'e_max_uses_cb' }, 'Use cap'),
+          el('div', { style: 'display:flex; align-items:center; gap:10px; flex-wrap:wrap' }, [
+            el('label', {
+              for: 'e_max_uses_cb',
+              style: 'display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px',
+            }, [cb, 'Limit total uses']),
+            num,
+          ]),
+          hint,
+        ])
+      })()
       // Convert RFC3339 → datetime-local format (YYYY-MM-DDTHH:MM) so
       // the native picker can render. On submit we reverse: append
       // ":00Z" for UTC. Empty stays empty (= clear the field).
@@ -3870,23 +4018,30 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         textarea: true,
         value: c.description || '',
       })
-      // Featured toggle — same shape as in Create. Pre-populated with
-      // the existing value.
-      const featuredCb = el('input', {
-        type: 'checkbox', name: 'e_featured', id: 'e_featured_cb',
-        style: 'margin-top:3px',
-      })
-      if (c.featured) featuredCb.checked = true
-      const featuredField = el('div', {
-        style: 'display:flex; align-items:flex-start; gap:8px; margin-top:8px',
-      }, [
-        featuredCb,
-        el('label', { for: 'e_featured_cb', style: 'font-size:12.5px; line-height:1.45; cursor:pointer' }, [
-          el('strong', null, 'Featured (launch special) '),
-          el('span', { class: 'muted' },
-            '— display on the buy page with a diagonal ribbon + slashed price. Auto-applies for buyers who don\'t type a code.'),
-        ]),
-      ])
+      // Featured pill toggle — same shape as in Create. Pre-populated.
+      const featuredField = (() => {
+        const hiddenCb = el('input', { type: 'checkbox', name: 'e_featured', style: 'display:none' })
+        if (c.featured) hiddenCb.checked = true
+        const pill = el('button', {
+          type: 'button',
+          class: 'featured-pill-toggle' + (c.featured ? ' on' : ''),
+          onclick: () => {
+            hiddenCb.checked = !hiddenCb.checked
+            pill.classList.toggle('on', hiddenCb.checked)
+            pill.querySelector('[data-state]').textContent = hiddenCb.checked ? 'On' : 'Off'
+          },
+        }, [
+          el('span', null, '★'),
+          el('strong', null, 'Featured (launch special)'),
+          el('span', { 'data-state': '1', class: 'state' }, c.featured ? 'On' : 'Off'),
+        ])
+        return el('div', { style: 'margin-top:12px' }, [
+          pill,
+          hiddenCb,
+          el('p', { class: 'muted', style: 'margin:6px 0 0; font-size:12.5px; line-height:1.5' },
+            'When on: display on the buy page with a diagonal "LAUNCH SPECIAL" ribbon + the original price struck through. Auto-applies to buyers who don\'t type a code. Operator-typed codes still win when a buyer pastes one.'),
+        ])
+      })()
       const saveBtn = el('button', { class: 'btn primary', onclick: async function () {
         const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Saving…')
         editPanel.appendChild(status)
@@ -3898,8 +4053,15 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               body.amount = c.kind === 'percent' ? rawAmt * 100 : rawAmt
             }
           }
-          const muRaw = parseInt(editPanel.querySelector('[name=e_max_uses]').value, 10) || 0
-          body.max_uses = muRaw > 0 ? muRaw : null
+          // Max uses: only honor the number field if the "Limit total
+          // uses" checkbox is checked. Otherwise send null (unlimited).
+          const limitCb = editPanel.querySelector('[name=e_max_uses_enabled]')
+          if (limitCb && limitCb.checked) {
+            const muRaw = parseInt(editPanel.querySelector('[name=e_max_uses]').value, 10) || 0
+            body.max_uses = muRaw > 0 ? muRaw : null
+          } else {
+            body.max_uses = null
+          }
           // datetime-local → RFC3339 by appending ":00Z" for UTC.
           // Empty → null (clear the field).
           const expRaw = editPanel.querySelector('[name=e_expires_at]').value.trim()
