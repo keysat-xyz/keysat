@@ -205,10 +205,11 @@ body {{
    centered text within the full width; only the form below is
    constrained narrower for focused interaction. */
 .wrap {{ max-width:1040px; margin:48px auto; padding:0 24px; }}
-/* Form stays narrow so input fields aren't oddly stretched. */
-.wrap > form {{ max-width:560px; margin-left:auto; margin-right:auto; }}
-/* Headline elements + price card text-align center at the wider width
-   so the page visually stays centered as readers scan top-to-bottom. */
+/* Form + price card stay narrow so inputs aren't oddly stretched and
+   the price card doesn't visually swallow the tier picker above it.
+   Headline + description span the full container with centered text. */
+.wrap > form,
+.wrap > .cert {{ max-width:560px; margin-left:auto; margin-right:auto; }}
 .wrap > h1, .wrap > .product-slug, .wrap > .description {{ text-align:center; }}
 .cert {{ text-align:center; }}
 .eyebrow {{
@@ -334,6 +335,15 @@ h1 {{
   letter-spacing:0.16em; text-transform:uppercase;
   padding:4px 10px; border-radius:999px;
   white-space:nowrap;
+  z-index:3;
+}}
+/* When a tier carries BOTH the "most popular" pill and the launch
+   ribbon, the ribbon's `overflow:hidden` (which clips the ribbon's
+   off-card overhang) was also clipping the popular pill that sits 10px
+   above the card. Move the pill INSIDE the card top edge in that
+   specific combination so the pill stays visible. */
+.tier.has-launch .tier-popular {{
+  top:8px;
 }}
 .tier-name {{
   font-family:var(--font-display); font-weight:600; font-size:18px;
@@ -392,10 +402,13 @@ h1 {{
   content:'✓'; position:absolute; left:0; top:3px;
   color:var(--gold-700); font-weight:700;
 }}
-/* Marketing bullets and entitlements should read as one coherent
-   feature list regardless of which one renders first. */
-.tier-bullets + .tier-entitlements {{ margin-top:2px; }}
-.tier-entitlements + .tier-bullets {{ margin-top:2px; }}
+/* Marketing bullets and entitlements should read as ONE coherent
+   feature list regardless of which one renders first. Zero margin-top
+   here so the gap between the two lists matches the within-list gap
+   (each li already contributes 3px of top + bottom padding, so 6px
+   total between consecutive lines either way). */
+.tier-bullets + .tier-entitlements {{ margin-top:0; }}
+.tier-entitlements + .tier-bullets {{ margin-top:0; }}
 .tier-select-btn {{
   margin-top:auto;
   padding:8px 12px;

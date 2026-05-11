@@ -2358,7 +2358,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               ? desc + ' — Hidden from the buy page tier card (license still grants it).'
               : desc,
             style: 'padding:2px 0 2px 16px; position:relative' +
-              (isHidden ? '; opacity:0.55; text-decoration:line-through' : ''),
+              (isHidden ? '; opacity:0.5' : ''),
           }, [
             el('span', {
               style: 'position:absolute; left:0; top:2px; color:var(--gold-700); font-weight:700',
@@ -3831,15 +3831,15 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       }
       policyMultiHost._available.forEach((p) => {
         const on = policyMultiHost._selected.has(p.slug)
-        // Match the gold-filled pill convention used by
-        // entitlementBubblePicker so the admin UI looks consistent.
+        // Navy-filled when selected (matches the admin UI's
+        // "selected" / "on" convention). Cream-outlined otherwise.
         const pill = el('button', {
           type: 'button',
           'data-policy-slug': p.slug,
           style: 'font-size:13px; padding:6px 12px; border-radius:999px; cursor:pointer; ' +
             'font-family:var(--font-body); font-weight:500; transition:all 100ms; ' +
             (on
-              ? 'background:var(--gold-500); color:var(--navy-950); border:1px solid var(--gold-500);'
+              ? 'background:var(--navy-800); color:var(--cream-50); border:1px solid var(--navy-800);'
               : 'background:transparent; color:var(--ink-700); border:1px solid var(--border-2);'),
         }, p.name)
         pill.addEventListener('click', () => {
@@ -4222,15 +4222,15 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         }
         editPolicies.forEach((p) => {
           const on = editPolicyHost._selected.has(p.id)
-          // Match the gold-filled pill convention used by
-          // entitlementBubblePicker so the admin UI looks consistent.
+          // Navy-filled when selected (matches the admin UI's
+          // "selected" / "on" convention). Cream-outlined otherwise.
           const pill = el('button', {
             type: 'button',
             'data-policy-id': p.id,
             style: 'font-size:13px; padding:6px 12px; border-radius:999px; cursor:pointer; ' +
               'font-family:var(--font-body); font-weight:500; transition:all 100ms; ' +
               (on
-                ? 'background:var(--gold-500); color:var(--navy-950); border:1px solid var(--gold-500);'
+                ? 'background:var(--navy-800); color:var(--cream-50); border:1px solid var(--navy-800);'
                 : 'background:transparent; color:var(--ink-700); border:1px solid var(--border-2);'),
           }, p.name)
           pill.addEventListener('click', () => {
@@ -6005,10 +6005,22 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     function paint(pill, slug) {
       const isSel = selected.has(slug)
       const isHid = hidden.has(slug)
-      // Pill container styling tracks selection state.
-      pill.style.background = isSel ? 'var(--gold-500)' : 'transparent'
-      pill.style.color = isSel ? 'var(--navy-950)' : 'var(--ink-700)'
-      pill.style.borderColor = isSel ? 'var(--gold-500)' : 'var(--border-2)'
+      // Navy-filled pill when selected (matches "Selected" tier-select-
+      // btn + Featured-ON toggle conventions in the admin UI). Cream
+      // outline when not selected. Hidden state = reduced opacity on
+      // the whole pill — no strikethrough since the chip is still
+      // granted by the license.
+      if (isSel) {
+        pill.style.background = 'var(--navy-800)'
+        pill.style.color = 'var(--cream-50)'
+        pill.style.borderColor = 'var(--navy-800)'
+        pill.style.opacity = isHid ? '0.5' : '1'
+      } else {
+        pill.style.background = 'transparent'
+        pill.style.color = 'var(--ink-700)'
+        pill.style.borderColor = 'var(--border-2)'
+        pill.style.opacity = '1'
+      }
       // Eye toggle: only visible/clickable when entitlement is selected.
       const eye = pill.querySelector('[data-eye]')
       const nameEl = pill.querySelector('[data-name]')
@@ -6016,14 +6028,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         eye.style.display = isSel ? 'inline-flex' : 'none'
         // "Open eye" = visible on buy; "closed eye" = hidden on buy.
         eye.textContent = isHid ? '\u{1F441}\u{200D}\u{1F5E8}' : '\u{1F441}'
-        eye.style.opacity = isHid ? '0.5' : '1'
         eye.title = isHid
           ? 'Hidden from the buy page tier card. Click to show.'
           : 'Shown on the buy page tier card. Click to hide (license still grants it).'
       }
+      // No text strikethrough — opacity on the whole pill is enough to
+      // signal "muted / hidden on buy" without the misleading "deleted"
+      // affordance of a strike.
       if (nameEl) {
-        nameEl.style.textDecoration = isSel && isHid ? 'line-through' : 'none'
-        nameEl.style.opacity = isSel && isHid ? '0.6' : '1'
+        nameEl.style.textDecoration = 'none'
+        nameEl.style.opacity = '1'
       }
     }
     function renderPill(entry) {

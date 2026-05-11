@@ -58,6 +58,24 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:26 — **Buy-page + entitlement-picker polish.** Cluster of small visual fixes informed by side-by-side review of the public buy page and the admin entitlements UI.',
+  '',
+  '**Tier-card feature list reads as one column.** When marketing bullets and entitlements stacked (either above or below), there was ~8px between the two lists but only 6px between items within a list — the seam was visible. Zeroed the margin-top on the second list so the two render as one continuous feature ladder (the per-li padding now contributes the full inter-item gap on both sides of the boundary).',
+  '',
+  '**"MOST POPULAR" pill no longer clipped.** When a tier was both "most popular" and carried a launch-special ribbon, the ribbon\'s `overflow:hidden` (which clips the ribbon\'s off-card overhang) also chopped the popular pill that sits 10px above the card. Targeted rule moves the popular pill INSIDE the card top edge in that specific combination so it stays visible without changing the default highlighted-tier appearance.',
+  '',
+  '**Price card narrowed back to 560px.** The :23 release stretched the price card to the full 1040px container width along with the headline; that turned out to be visually overwhelming below the tier picker. Constrained the price card + form to 560px (centered); headline elements still span the full container with centered text.',
+  '',
+  '**Entitlement bubble picker: navy theme, no strikethrough on hidden chips.** The gold-filled "selected" pill state introduced earlier read as too marketing-y next to the rest of the admin actions, and the strikethrough on hidden chips looked like the entitlement had been deleted. New look: selected chips are navy-filled with cream text (matching "Selected" tier-select buttons + the Featured-ON toggle); hidden chips stay navy-filled but dim to 50% opacity (no strikethrough — the chip is still granted by the license).',
+  '',
+  '**Discount-code policy multi-pickers follow.** The Create + Edit forms\' "Restrict to policies" pickers re-aligned from gold to the same navy convention. The brief gold pass in :25 was the wrong call; navy reads consistently with the rest of the admin "selected/on" state.',
+  '',
+  '**Admin Policies grid: hidden entitlements also drop strikethrough.** Opacity-only treatment now, matching the bubble picker. The `(hidden on buy)` italic hint still appears so operators can spot the difference.',
+  '',
+  '**Test count: 87** (unchanged — pure CSS / inline style edits).',
+  '',
+  '**Upgrade path.** v0.2.0:25 → v0.2.0:26 is a drop-in. No data, schema, or API change.',
+  '',
   '0.2.0:25 — **Discount-code policy pills match the admin UI palette.** Cosmetic-only fix. The "Restrict to policies" multi-pickers on both the Create and Edit forms were rendering selected pills as dark navy with gold text, which clashed with the gold-filled / cream-outlined pill convention used everywhere else in the admin (entitlements bubble picker, marketing-bullets position, etc.). Aligned both pickers to that shared style. No data or behavior change — purely a CSS swap.',
   '',
   '0.2.0:24 — **Per-entitlement "hide on buy page" toggle.** Decouples "what the license grants" (functional) from "what the buyer sees on the tier card" (marketing). The entitlement is still issued — only its display is filtered.',
@@ -402,7 +420,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:25',
+  version: '0.2.0:26',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
