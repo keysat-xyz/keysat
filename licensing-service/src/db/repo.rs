@@ -2397,14 +2397,15 @@ pub async fn set_discount_code_active(
 }
 
 /// Patch mutable fields on a discount code. Mutable fields are the ones
-/// that don't change behavior in confusing ways for codes already in
-/// circulation: `amount`, `max_uses`, `expires_at`, `description`,
-/// `referrer_label`. The code string itself, kind, and product/policy
-/// scope are intentionally NOT editable — changing those would silently
-/// invalidate links that are already out in the wild. Operators should
-/// disable + create a new code instead. Each `Option<T>` parameter is
-/// `Some(value_or_clear)` to update, `None` to leave alone; for fields
-/// that can be NULL'd, callers pass `Some(None)` to clear.
+/// Most fields are editable. The code string and `kind` are intentionally
+/// NOT editable — those define the identity of the code (the string buyers
+/// type, and what arithmetic to apply). `applies_to_product_id` is also
+/// not editable because moving a code between products has weird semantics
+/// for historical redemptions. Everything else — amount, max_uses,
+/// expires_at, description, referrer_label, featured, **and policy scope**
+/// — can be updated in place. Each `Option<T>` parameter is `Some(...)` to
+/// update, `None` to leave alone; for fields that can be NULL'd, callers
+/// pass `Some(None)` to clear.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_discount_code(
     pool: &SqlitePool,
@@ -2415,8 +2416,13 @@ pub async fn update_discount_code(
     description: Option<&str>,
     referrer_label: Option<Option<&str>>,
     featured: Option<bool>,
-    // applies_to_policy_ids: None = no change, Some(vec) = overwrite
-    // (empty vec clears the column, falling back to singular column).
+    // Singular policy scope: None = no change, Some(None) = clear,
+    // Some(Some(id)) = set. Callers updating policy scope should also
+    // pass `applies_to_policy_ids` (or its inverse) so the two columns
+    // don't drift; the admin handler does this.
+    applies_to_policy_id: Option<Option<String>>,
+    // Multi-policy scope: None = no change, Some(vec) = overwrite (empty
+    // vec clears the column, so reads fall back to the singular column).
     applies_to_policy_ids: Option<Vec<String>>,
 ) -> AppResult<DiscountCode> {
     // Re-fetch to validate amount against the existing kind.
@@ -2481,6 +2487,9 @@ pub async fn update_discount_code(
     if featured.is_some() {
         sets.push("featured = ?");
     }
+    if applies_to_policy_id.is_some() {
+        sets.push("applies_to_policy_id = ?");
+    }
     if applies_to_policy_ids.is_some() {
         sets.push("applies_to_policy_ids_json = ?");
     }
@@ -2511,6 +2520,9 @@ pub async fn update_discount_code(
     }
     if let Some(f) = featured {
         q = q.bind(f as i64);
+    }
+    if let Some(opt_pid) = applies_to_policy_id {
+        q = q.bind(opt_pid);
     }
     if let Some(ids) = applies_to_policy_ids {
         // Empty list → store NULL (clear multi-scope). Non-empty → JSON.

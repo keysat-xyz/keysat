@@ -221,13 +221,13 @@ pub async fn get_one(
     })))
 }
 
-/// Patch fields on a discount code. Only mutable fields are accepted —
-/// `code`, `kind`, `applies_to_product`, `applies_to_policy` are
-/// intentionally not editable to avoid silently invalidating links that
-/// have already been distributed. To change those, disable the existing
-/// code and create a new one. All fields are optional; `null` clears
-/// the field where the column is nullable (max_uses, expires_at,
-/// referrer_label).
+/// Patch fields on a discount code. Most fields are editable. The
+/// `code` string and `kind` are not editable (identity fields), and
+/// `applies_to_product` is not editable (moving a code between products
+/// has weird semantics for historical redemptions). Policy scope IS
+/// editable (v0.2.0:22+) so operators can refine which tiers a code
+/// applies to without rotating the code string. All fields are optional;
+/// `null` clears the field where the column is nullable.
 #[derive(Debug, Deserialize)]
 pub struct UpdateDiscountCodeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,6 +245,13 @@ pub struct UpdateDiscountCodeReq {
     /// promote, `Some(false)` to demote, omit to leave alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub featured: Option<bool>,
+    /// Policy slugs (multi). Overwrites the policy scope. Resolved
+    /// against the code's existing `applies_to_product_id`. Send `[]`
+    /// to clear the scope so the code applies to any policy on the
+    /// existing product. Single-element arrays are also accepted and
+    /// stored on the singular legacy column for clarity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_slugs: Option<Vec<String>>,
 }
 
 /// Helper for `Option<Option<T>>` with serde — distinguishes "not present in
@@ -267,6 +274,45 @@ pub async fn update(
     let actor_hash = require_admin(&state, &headers)?;
     let (ip, ua) = request_context(&headers);
 
+    // Resolve policy_slugs → policy ids using the code's EXISTING product
+    // (product scope is not editable here; see UpdateDiscountCodeReq).
+    // Three pass-throughs to update_discount_code:
+    //   - applies_to_policy_id (singular column): set when count == 1,
+    //     cleared when count != 1.
+    //   - applies_to_policy_ids (JSON column): set when count >= 2,
+    //     cleared when count <= 1.
+    //   - both None when req.policy_slugs is absent (no change).
+    let (policy_id_update, policy_ids_update): (Option<Option<String>>, Option<Vec<String>>) =
+        match req.policy_slugs.as_ref() {
+            None => (None, None),
+            Some(slugs) => {
+                let existing = repo::get_discount_code_by_id(&state.db, &id)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound(format!("discount code {id}")))?;
+                let product_id = existing.applies_to_product_id.as_deref().ok_or_else(|| {
+                    AppError::BadRequest(
+                        "this code is not scoped to a product, so policy scope cannot be set".into(),
+                    )
+                })?;
+                let mut ids = Vec::with_capacity(slugs.len());
+                for slug in slugs {
+                    let policy = repo::get_policy_by_slug(&state.db, product_id, slug)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::NotFound(format!(
+                                "policy '{slug}' for product '{product_id}'"
+                            ))
+                        })?;
+                    ids.push(policy.id);
+                }
+                match ids.len() {
+                    0 => (Some(None), Some(Vec::new())),
+                    1 => (Some(Some(ids[0].clone())), Some(Vec::new())),
+                    _ => (Some(None), Some(ids)),
+                }
+            }
+        };
+
     let updated = repo::update_discount_code(
         &state.db,
         &id,
@@ -276,11 +322,8 @@ pub async fn update(
         req.description.as_deref(),
         req.referrer_label.as_ref().map(|opt| opt.as_deref()),
         req.featured,
-        // Scope (product/policy) is intentionally not editable — see
-        // doc-comment on UpdateDiscountCodeReq. Disable + recreate to
-        // re-scope a code rather than silently invalidating distributed
-        // links.
-        None,
+        policy_id_update,
+        policy_ids_update,
     )
     .await?;
 

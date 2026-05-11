@@ -4034,36 +4034,42 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       editPanel.innerHTML = ''
       editPanel.style.display = 'block'
 
-      // Resolve scope names (read-only display — scope can't be edited).
-      // Product name comes from the products list we already fetched.
-      // Policy names require fetching the product's policies. We honor
-      // multi-policy scope when present (0.2.0:20+); legacy single-
-      // policy codes display as before.
-      let scopeLabel = 'Applies to: all products on this instance'
+      // Product scope is read-only (changing product has weird semantics
+      // for historical redemptions; disable + recreate to re-product).
+      // Policy scope IS editable (0.2.0:22+) — load all policies on the
+      // existing product and present a pill multi-picker, pre-selected
+      // with the code's current allowed-policy set.
+      let productName = null
+      let productSlug = null
       if (c.applies_to_product_id) {
         const prod = productsForCreate.find((p) => p.id === c.applies_to_product_id)
-        const productName = prod ? prod.name : c.applies_to_product_id
-        // Multi-policy scope wins over the legacy singular when non-empty.
-        const multi = Array.isArray(c.applies_to_policy_ids) && c.applies_to_policy_ids.length > 0
-        const policyIds = multi
-          ? c.applies_to_policy_ids
-          : (c.applies_to_policy_id ? [c.applies_to_policy_id] : [])
-        if (policyIds.length > 0 && prod) {
-          let resolvedNames = policyIds.slice()
-          try {
-            const r = await api('/v1/admin/policies?product_slug=' + encodeURIComponent(prod.slug) +
-              '&include_inactive=true')
-            const pols = r.policies || []
-            resolvedNames = policyIds.map((pid) => {
-              const pol = pols.find((p) => p.id === pid)
-              return pol ? pol.name + ' (' + pol.slug + ')' : pid
-            })
-          } catch (_) {}
-          scopeLabel = 'Applies to: ' + productName + ' → ' + resolvedNames.join(', ')
-        } else {
-          scopeLabel = 'Applies to: ' + productName + ' (any policy)'
-        }
+        productName = prod ? prod.name : c.applies_to_product_id
+        productSlug = prod ? prod.slug : null
       }
+      const productLabel = productName
+        ? 'Product: ' + productName + (productSlug ? ' (' + productSlug + ')' : '')
+        : 'Product: any (global code)'
+
+      // Pre-load policies for the product so the picker can render
+      // immediately. Skip when global (no product → no policies to pick).
+      let editPolicies = []
+      if (productSlug) {
+        try {
+          const r = await api('/v1/admin/policies?product_slug=' +
+            encodeURIComponent(productSlug) + '&include_inactive=true')
+          editPolicies = (r.policies || []).map((p) => ({
+            id: p.id, slug: p.slug, name: p.name,
+          }))
+        } catch (_) {}
+      }
+      // Multi-policy scope wins over the legacy singular when non-empty.
+      const editInitialIds = (() => {
+        if (Array.isArray(c.applies_to_policy_ids) && c.applies_to_policy_ids.length > 0) {
+          return new Set(c.applies_to_policy_ids)
+        }
+        if (c.applies_to_policy_id) return new Set([c.applies_to_policy_id])
+        return new Set()
+      })()
 
       const amtField = formInput('e_amount', 'Amount', {
         type: 'number',
@@ -4158,6 +4164,50 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             'When on: display on the buy page with a diagonal "LAUNCH SPECIAL" ribbon + the original price struck through. Auto-applies to buyers who don\'t type a code. Operator-typed codes still win when a buyer pastes one.'),
         ])
       })()
+      // Policy scope multi-pill picker. Hidden when the code is global
+      // (no product) since there are no policies to choose from.
+      const editPolicyHost = el('div', {
+        'data-edit-policy-pills': '1',
+        style: 'display:flex; flex-wrap:wrap; gap:6px; min-height:32px; ' +
+          'padding:6px 8px; border:1px solid var(--border-1); border-radius:8px; ' +
+          'background:var(--cream-50);',
+      })
+      editPolicyHost._selected = new Set(editInitialIds)
+      function renderEditPolicyPills() {
+        editPolicyHost.innerHTML = ''
+        if (!editPolicies.length) {
+          editPolicyHost.appendChild(el('span', {
+            class: 'muted', style: 'font-size:12px; align-self:center',
+          }, productSlug ? 'No policies on this product yet.' : 'Global code — no policies to pick.'))
+          return
+        }
+        editPolicies.forEach((p) => {
+          const on = editPolicyHost._selected.has(p.id)
+          const pill = el('button', {
+            type: 'button',
+            'data-policy-id': p.id,
+            style: 'font-size:12px; padding:4px 12px; border-radius:999px; cursor:pointer; ' +
+              'border:1.5px solid ' + (on ? 'var(--gold-700)' : 'var(--border-1)') + '; ' +
+              'background:' + (on ? 'var(--navy-950)' : 'var(--cream-100)') + '; ' +
+              'color:' + (on ? 'var(--gold-500)' : 'var(--ink-700)') + '; ' +
+              'font-weight:' + (on ? '600' : '500') + ';',
+          }, p.name)
+          pill.addEventListener('click', () => {
+            if (editPolicyHost._selected.has(p.id)) editPolicyHost._selected.delete(p.id)
+            else editPolicyHost._selected.add(p.id)
+            renderEditPolicyPills()
+          })
+          editPolicyHost.appendChild(pill)
+        })
+      }
+      renderEditPolicyPills()
+      const policyScopeFieldEdit = productSlug ? el('div', { class: 'field' }, [
+        el('label', { class: 'lbl' }, 'Restrict to policies (optional)'),
+        editPolicyHost,
+        el('p', { class: 'muted', style: 'margin:4px 0 0; font-size:11.5px; line-height:1.4' },
+          'Click a tier to toggle. Pick 0 for "any policy on this product"; 2+ to scope to a subset.'),
+      ]) : null
+
       const saveBtn = el('button', { class: 'btn primary', onclick: async function () {
         const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Saving…')
         editPanel.appendChild(status)
@@ -4187,6 +4237,18 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           body.referrer_label = refRaw === '' ? null : refRaw
           body.description = editPanel.querySelector('[name=e_description]').value || ''
           body.featured = editPanel.querySelector('[name=e_featured]').checked
+          // Policy scope (editable since v0.2.0:22). Only sent when the
+          // code is scoped to a product — global codes have no policy
+          // picker. Send the selected ids' slugs as an array (server
+          // accepts 0/1/N and normalizes both singular + multi columns).
+          if (productSlug) {
+            const pickedIds = Array.from(editPolicyHost._selected)
+            const pickedSlugs = pickedIds.map((pid) => {
+              const found = editPolicies.find((p) => p.id === pid)
+              return found ? found.slug : null
+            }).filter(Boolean)
+            body.policy_slugs = pickedSlugs
+          }
           await api('/v1/admin/discount-codes/' + c.id, { method: 'PATCH', body })
           status.replaceWith(ok('Saved. Reloading…'))
           setTimeout(routes.codes, 600)
@@ -4205,20 +4267,21 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           el('strong', null, 'Editing code '),
           el('code', { style: 'font-size:14px' }, c.code),
         ]),
-        // Read-only scope display — the data the operator most often
-        // needs to see when reviewing a code. Distinct from the
-        // editable fields below.
+        // Product scope is read-only (changing product has weird semantics
+        // for historical redemptions). Policy scope is editable via the
+        // pill picker below.
         el('div', {
           style:
             'padding:8px 12px; margin-bottom:12px; ' +
             'background:var(--cream-100); border-radius:6px; ' +
             'font-size:12.5px; color:var(--ink-700);',
-        }, scopeLabel),
+        }, productLabel),
         el('p', { class: 'muted', style: 'margin:0 0 16px; font-size:13px' },
-          'Editable: amount, max uses, expiry, referrer label, description, featured flag. The code string, kind, and product/policy scope cannot be changed — disable + create a new code instead.'),
+          'The code string, kind, and product cannot be changed — disable + create a new code instead. Everything else (amount, max uses, expiry, label, description, featured flag, and which policies the code applies to) is editable.'),
         el('div', { class: 'row-2' }, [amtField, muField]),
         el('div', { class: 'row-2' }, [expField, refField]),
         descField,
+        policyScopeFieldEdit,
         featuredField,
         el('div', { style: 'margin-top:8px' }, [saveBtn, cancelBtn]),
       ]))

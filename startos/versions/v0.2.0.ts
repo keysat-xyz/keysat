@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:22 — **Policy scope is now editable on existing discount codes.** Previously, the Edit form showed scope as a read-only "Applies to:" label and forced operators to disable + recreate any code whose tier scope needed adjusting. That rule existed to "avoid silently invalidating distributed links" — but the same argument applies to `amount`, `max_uses`, and `expires_at`, all of which are already editable. Inconsistent. So: policy scope joins them.',
+  '',
+  '**Edit form: pill multi-picker for policy scope.** The Edit modal now renders the same gold-on-navy pill picker as Create, pre-selected with the code\'s current allowed-policy set. Toggle pills to refine: 0 picked → "any policy on this product"; 1 picked → singular scope (writes the legacy column); 2+ picked → multi-policy scope (writes the JSON column).',
+  '',
+  '**Product scope: still read-only.** Moving a discount code from one product to another has weirder semantics for historical redemptions (a redeemed code now points at a product it never originally applied to), so the product field stays locked. To re-product a code: disable + recreate.',
+  '',
+  '**API.** `PATCH /v1/admin/discount-codes/<id>` now accepts an optional `policy_slugs: string[]` field. Server resolves slugs against the code\'s existing product, then normalizes: empty → both scope columns NULL, single → singular column populated + JSON column cleared, multi → JSON column populated + singular column cleared. Sending no `policy_slugs` field at all leaves scope alone (back-compat).',
+  '',
+  '**Test count: 87** (unchanged — same data model as v0.2.0:20, just exposed on the update path).',
+  '',
+  '**Upgrade path.** v0.2.0:21 → v0.2.0:22 is a drop-in. No schema, no SDK breaking change.',
+  '',
   '0.2.0:21 — **Wider buy page so 3-tier grids breathe.** The public /buy/<slug> page was capped at 560px, which packed three tier cards into a too-narrow column on desktop browsers. Bumped the outer container to 1040px so the tier picker matches the admin Policies page layout. The form, price card, and intro text below the tier picker remain centered at the 560px reading-width so the buy form doesn\'t look stretched. Mobile (≤480px) breakpoint unchanged. Topbar inner widened to match. UI-only; no API or schema change.',
   '',
   '0.2.0:20 — **Discount codes can apply to multiple policies, not just one.** Operator picks a subset (e.g. "Patron AND Pro but not Creator") on a single code instead of cloning the code under different names.',
@@ -364,7 +376,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:21',
+  version: '0.2.0:22',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
