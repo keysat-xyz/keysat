@@ -1156,15 +1156,31 @@ fn render_tier_picker(
                 .unwrap_or_default();
             // raw slug if the catalog is empty or the slug isn't in
             // it (legacy slugs that predate the catalog land here).
-            let entitlements_html = if p.entitlements.is_empty() {
+            // Operator-controlled hide list: entitlements the license
+            // grants but the operator doesn't want rendered on the buy
+            // page (e.g. when a higher tier card uses "Everything in
+            // Creator, plus:" marketing copy and doesn't need to repeat
+            // already-implied entitlements). The entitlements still
+            // appear on the issued license — this only filters display.
+            let hidden_on_buy: std::collections::HashSet<&str> = p
+                .metadata
+                .get("hidden_entitlements")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let visible_entitlements: Vec<&String> = p
+                .entitlements
+                .iter()
+                .filter(|s| !hidden_on_buy.contains(s.as_str()))
+                .collect();
+            let entitlements_html = if visible_entitlements.is_empty() {
                 String::new()
             } else {
                 let catalog = product.entitlements_catalog.as_deref().unwrap_or(&[]);
-                let lis: Vec<String> = p
-                    .entitlements
+                let lis: Vec<String> = visible_entitlements
                     .iter()
                     .map(|slug| {
-                        let entry = catalog.iter().find(|e| &e.slug == slug);
+                        let entry = catalog.iter().find(|e| &e.slug == *slug);
                         let display = entry
                             .map(|e| if e.name.trim().is_empty() { e.slug.as_str() } else { e.name.as_str() })
                             .unwrap_or(slug.as_str());

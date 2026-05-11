@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:24 — **Per-entitlement "hide on buy page" toggle.** Decouples "what the license grants" (functional) from "what the buyer sees on the tier card" (marketing). The entitlement is still issued — only its display is filtered.',
+  '',
+  '**Why.** A common pattern: Pro inherits everything from Creator. On the buy page, instead of duplicating "Self-host on Start9 ✓" on every tier, the operator wants to write "Everything in Creator, plus:" as a marketing bullet and hide the duplicate entitlement from Pro\'s card. Before :24, the only way was to either drop the entitlement from the policy (breaks the license) or accept the duplication.',
+  '',
+  '**How.** The entitlements bubble picker on the policy create + edit forms now has a small eye toggle per granted chip. Click the chip name to grant/revoke as before. Click the eye to hide that entitlement from the buy page tier card only — the issued license still carries it. New per-policy metadata field `hidden_entitlements: string[]` stores the slugs. De-selecting a chip clears its hidden state automatically so stale slugs don\'t accumulate.',
+  '',
+  '**Where it shows up.** Buy page tier cards filter out hidden entitlements before rendering. Public `GET /v1/products/<slug>/policies` exposes the `hidden_entitlements` array so SDKs / dynamic pricing pages can do the same filtering. Admin Policies grid shows ALL entitlements with strikethrough + a "(hidden on buy)" italic hint on hidden ones — so operators reviewing what a policy actually grants still see the full picture.',
+  '',
+  '**Test count: 87** (unchanged — metadata pass-through; no new branches to test).',
+  '',
+  '**Upgrade path.** v0.2.0:23 → v0.2.0:24 is a drop-in. No schema, no SDK breaking change. Existing policies have no `hidden_entitlements` → buy page renders all entitlements as before.',
+  '',
   '0.2.0:23 — **Three buy-page fixes: layout proportions, featured discount on default tier, marketing-bullet gap.** Surfaced by feedback after the wider buy page rolled out in :21.',
   '',
   '**Headline + price card no longer look pinched.** The :21 release widened the outer container to 1040px to give the 3-tier picker room, but kept the headline ("Keysat", description) and the bottom price card constrained at 560px — which made them look dwarfed against the wider tier picker. Now: headline elements + the price card span the full container width with center-aligned text. The Email / Discount code / Pay-with-Bitcoin form stays narrower (560px) since input fields look stretched at 1040px. Net effect: the page reads as one cohesive width top to bottom.',
@@ -388,7 +400,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:23',
+  version: '0.2.0:24',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

@@ -1977,12 +1977,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     // textarea. The picker pre-selects the policy's current
     // entitlements; the textarea pre-fills with one slug per line.
     const editCatalog_pol = (prod && prod.entitlements_catalog) || []
+    const initialHidden_pol = Array.isArray(meta.hidden_entitlements)
+      ? meta.hidden_entitlements
+      : []
     const entField = (() => {
       const host = el('div', { 'data-ent-host': '1' })
       if (editCatalog_pol.length > 0) {
-        const picker = entitlementBubblePicker(editCatalog_pol, pol.entitlements || [])
+        const picker = entitlementBubblePicker(editCatalog_pol, pol.entitlements || [], initialHidden_pol)
         host.appendChild(picker.element)
         host._read = picker.read
+        host._readHidden = picker.readHidden
         host._mode = 'bubbles'
       } else {
         const fallback = formInput('e_pol_entitlements', 'Entitlements (one per line, or comma-separated)', {
@@ -2151,6 +2155,15 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             } else {
               delete newMetadata.marketing_bullets_position
             }
+            // Per-chip "hide on buy page" toggles from the bubble picker.
+            // Only persisted when non-empty; the buy page + admin grid
+            // treat an absent field as "show everything".
+            const entHostNode = card.querySelector('[data-ent-host]')
+            const hiddenList = (entHostNode && entHostNode._readHidden)
+              ? entHostNode._readHidden().filter((s) => ents.includes(s))
+              : []
+            if (hiddenList.length > 0) newMetadata.hidden_entitlements = hiddenList
+            else delete newMetadata.hidden_entitlements
             const priceRaw = card.querySelector('[name=e_pol_price]').value.trim()
             const price_sats_override = priceRaw === '' ? null : Math.max(0, parseInt(priceRaw, 10) || 0)
             // Recurring subscription — send the fields whenever the operator
@@ -2324,6 +2337,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     // Top-margin: tighten when this list follows another (marketing
     // list rendered ABOVE), normal when it leads the section.
     const entLeadsSection = !marketingList || bulletsBelow
+    // Per-chip "hide on buy page" list. The license still grants these,
+    // but the buy-page tier card renders them filtered out. Surface that
+    // here as muted strikethrough + a small "(hidden on buy)" hint so
+    // the operator can spot which chips don't appear to buyers.
+    const hiddenEnts = Array.isArray((pol.metadata || {}).hidden_entitlements)
+      ? new Set(pol.metadata.hidden_entitlements)
+      : new Set()
     const entChips = (pol.entitlements || []).length === 0
       ? null
       : el('ul', {
@@ -2332,14 +2352,22 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           const entry = cat.find((c) => c.slug === slug)
           const display = entry && entry.name ? entry.name : slug
           const desc = entry && entry.description ? entry.description : slug
+          const isHidden = hiddenEnts.has(slug)
           return el('li', {
-            title: desc,
-            style: 'padding:2px 0 2px 16px; position:relative',
+            title: isHidden
+              ? desc + ' — Hidden from the buy page tier card (license still grants it).'
+              : desc,
+            style: 'padding:2px 0 2px 16px; position:relative' +
+              (isHidden ? '; opacity:0.55; text-decoration:line-through' : ''),
           }, [
             el('span', {
               style: 'position:absolute; left:0; top:2px; color:var(--gold-700); font-weight:700',
             }, '✓'),
             display,
+            isHidden ? el('span', {
+              style: 'margin-left:6px; font-size:10.5px; color:var(--ink-500); ' +
+                'text-decoration:none; font-style:italic',
+            }, '(hidden on buy)') : null,
           ])
         }))
 
@@ -2636,10 +2664,12 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const cat = product.entitlements_catalog || []
     const entHost = el('div')
     let entRead = () => []
+    let entReadHidden = () => []
     if (cat.length > 0) {
-      const picker = entitlementBubblePicker(cat, [])
+      const picker = entitlementBubblePicker(cat, [], [])
       entHost.appendChild(picker.element)
       entRead = picker.read
+      entReadHidden = picker.readHidden
     } else {
       const textarea = el('textarea', {
         class: 'input', rows: '2',
@@ -2787,6 +2817,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
                   metadata.marketing_bullets_position = 'below'
                 }
               }
+              // Hide-on-buy-page entitlement slugs from the bubble picker.
+              // Filter against the granted-set so we never persist stale
+              // hidden entries (de-selecting a chip clears its hidden
+              // state too, but defensive).
+              const grantedEnts = entRead()
+              const hiddenEnts = entReadHidden().filter((s) => grantedEnts.includes(s))
+              if (hiddenEnts.length > 0) metadata.hidden_entitlements = hiddenEnts
               const body = {
                 product_slug: product.slug,
                 slug: slugInput.value.trim(),
@@ -5950,39 +5987,89 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
    *   container.appendChild(picker.element)
    *   const slugs = picker.read()  // -> ['core', 'pro']
    */
-  function entitlementBubblePicker(catalog, initialSelection) {
+  function entitlementBubblePicker(catalog, initialSelection, initialHidden) {
     const selected = new Set(Array.isArray(initialSelection) ? initialSelection : [])
+    // Per-chip "hidden on buy page" set. An entitlement can be granted
+    // by the license (in `selected`) without being displayed on the
+    // public buy-page tier card — useful for "Everything in Creator,
+    // plus:" marketing where the operator doesn't want to duplicate
+    // already-implied entitlements visually.
+    const hidden = new Set(Array.isArray(initialHidden) ? initialHidden : [])
     const host = el('div', {
       style: 'display:flex; flex-wrap:wrap; gap:6px; margin-top:4px',
     })
-    const pills = []
+    function paint(pill, slug) {
+      const isSel = selected.has(slug)
+      const isHid = hidden.has(slug)
+      // Pill container styling tracks selection state.
+      pill.style.background = isSel ? 'var(--gold-500)' : 'transparent'
+      pill.style.color = isSel ? 'var(--navy-950)' : 'var(--ink-700)'
+      pill.style.borderColor = isSel ? 'var(--gold-500)' : 'var(--border-2)'
+      // Eye toggle: only visible/clickable when entitlement is selected.
+      const eye = pill.querySelector('[data-eye]')
+      const nameEl = pill.querySelector('[data-name]')
+      if (eye) {
+        eye.style.display = isSel ? 'inline-flex' : 'none'
+        // "Open eye" = visible on buy; "closed eye" = hidden on buy.
+        eye.textContent = isHid ? '\u{1F441}\u{200D}\u{1F5E8}' : '\u{1F441}'
+        eye.style.opacity = isHid ? '0.5' : '1'
+        eye.title = isHid
+          ? 'Hidden from the buy page tier card. Click to show.'
+          : 'Shown on the buy page tier card. Click to hide (license still grants it).'
+      }
+      if (nameEl) {
+        nameEl.style.textDecoration = isSel && isHid ? 'line-through' : 'none'
+        nameEl.style.opacity = isSel && isHid ? '0.6' : '1'
+      }
+    }
     function renderPill(entry) {
-      const isSel = selected.has(entry.slug)
-      const pill = el('button', {
-        type: 'button',
-        title: entry.description || entry.slug,
+      // Container is a flex `<span>` (not a `<button>`) so we can nest
+      // two clickable buttons inside — the selection button and the eye
+      // toggle button — without nested-interactive-element issues.
+      const pill = el('span', {
         'data-slug': entry.slug,
         style:
-          'padding:6px 12px; border-radius:999px; cursor:pointer; ' +
+          'display:inline-flex; align-items:center; gap:6px; ' +
+          'padding:5px 10px; border-radius:999px; ' +
           'font-family:var(--font-body); font-size:13px; font-weight:500; ' +
-          'transition:all 100ms; ' +
-          (isSel
-            ? 'background:var(--gold-500); color:var(--navy-950); border:1px solid var(--gold-500); '
-            : 'background:transparent; color:var(--ink-700); border:1px solid var(--border-2); '),
-      }, entry.name || entry.slug)
-      pill.addEventListener('click', () => {
+          'border:1px solid var(--border-2); background:transparent; ' +
+          'transition:background 100ms, color 100ms, border-color 100ms;',
+      }, [
+        el('button', {
+          type: 'button',
+          'data-name': '1',
+          title: entry.description || entry.slug,
+          style: 'background:none; border:none; padding:0; cursor:pointer; ' +
+            'font:inherit; color:inherit; text-align:left;',
+        }, entry.name || entry.slug),
+        el('button', {
+          type: 'button',
+          'data-eye': '1',
+          style: 'background:none; border:none; padding:0 0 0 2px; cursor:pointer; ' +
+            'font-size:13px; line-height:1; display:none;',
+        }, ''),
+      ])
+      const nameBtn = pill.querySelector('[data-name]')
+      const eyeBtn = pill.querySelector('[data-eye]')
+      nameBtn.addEventListener('click', () => {
         if (selected.has(entry.slug)) {
           selected.delete(entry.slug)
+          // De-selecting also clears any "hidden" state so stale entries
+          // don't accumulate in metadata.
+          hidden.delete(entry.slug)
         } else {
           selected.add(entry.slug)
         }
-        // Re-style only this pill rather than re-rendering the host.
-        const nowSel = selected.has(entry.slug)
-        pill.style.background = nowSel ? 'var(--gold-500)' : 'transparent'
-        pill.style.color = nowSel ? 'var(--navy-950)' : 'var(--ink-700)'
-        pill.style.borderColor = nowSel ? 'var(--gold-500)' : 'var(--border-2)'
+        paint(pill, entry.slug)
       })
-      pills.push(pill)
+      eyeBtn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        if (!selected.has(entry.slug)) return
+        if (hidden.has(entry.slug)) hidden.delete(entry.slug)
+        else hidden.add(entry.slug)
+        paint(pill, entry.slug)
+      })
+      paint(pill, entry.slug)
       host.appendChild(pill)
     }
     ;(catalog || []).forEach(renderPill)
@@ -5990,12 +6077,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const wrap = el('div', { class: 'field' }, [
       el('label', { class: 'lbl' }, 'Entitlements'),
       el('div', { class: 'muted', style: 'font-size:12px; margin-bottom:6px' },
-        'Click each entitlement this tier should grant. Defined on the parent product\'s catalog.'),
+        'Click an entitlement to grant it. The eye toggle on a granted entitlement controls visibility on the buy page tier card (the license still grants it either way).'),
       host,
     ])
     return {
       element: wrap,
       read: () => Array.from(selected),
+      // Returns slugs that are SELECTED *and* hidden — callers filter
+      // for that pair so we never persist stale slugs that aren't even
+      // granted by the policy.
+      readHidden: () => Array.from(hidden).filter((s) => selected.has(s)),
     }
   }
 

@@ -834,6 +834,15 @@ pub async fn list_public_policies(
                 Some("below") => "below",
                 _ => "above",
             };
+            // Entitlement slugs the operator chose to hide from the
+            // buy-page tier-card display. The license still grants
+            // these — this only filters what buyers see. SDKs that
+            // render dynamic pricing pages should also filter on this.
+            let hidden_entitlements = p
+                .metadata
+                .get("hidden_entitlements")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             let price_sats = p.price_sats_override.unwrap_or(product.price_sats);
             // Featured discount (if any) — compute the post-discount
             // price the buyer would actually pay if they bought right
@@ -871,6 +880,7 @@ pub async fn list_public_policies(
                 "entitlements": p.entitlements,
                 "marketing_bullets": marketing_bullets,
                 "marketing_bullets_position": marketing_bullets_position,
+                "hidden_entitlements": hidden_entitlements,
                 "highlighted": highlighted,
                 // Recurring-subscription cadence — buy page renders
                 // "Renews every N days" / "$X/month" when is_recurring=true.
