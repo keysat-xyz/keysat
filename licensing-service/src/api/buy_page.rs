@@ -281,9 +281,29 @@ h1 {{
 }}
 .field .hint {{ font-size:12px; color:var(--ink-500); margin-top:5px; }}
 
-/* Tier picker — shown when product has 2+ public policies. */
+/* Tier picker — shown when product has 2+ public policies.
+   Each tier card is a CSS subgrid that shares row tracks with the
+   parent .tiers grid. Effect: launch-meta, name, original-price,
+   price, meta-block, description, features, and button each occupy
+   the same vertical band across all visible cards, so visually
+   equivalent sections line up horizontally. Empty sections (e.g.
+   Creator has no struck-through original price) leave whitespace
+   in their row — the explicit tradeoff for clean cross-card
+   alignment. */
 .tiers {{
   display:grid; gap:14px; margin:0 0 28px;
+  /* 8-row template, one per logical section. The features row is
+     `1fr` so it absorbs extra vertical space (pushing the Select
+     button to the bottom). */
+  grid-template-rows:
+    auto  /* row 1: launch-meta */
+    auto  /* row 2: name */
+    auto  /* row 3: original-price (struck) */
+    auto  /* row 4: price */
+    auto  /* row 5: meta-block (duration + recurring + trial) */
+    auto  /* row 6: description */
+    1fr   /* row 7: features (fills) */
+    auto; /* row 8: button */
 }}
 .tiers-2 {{ grid-template-columns:repeat(2, 1fr); }}
 .tiers-3 {{ grid-template-columns:repeat(3, 1fr); }}
@@ -313,9 +333,27 @@ h1 {{
   position:relative;
   background:var(--cream-50); border:1px solid var(--border-1);
   border-radius:12px; padding:22px 20px 20px;
-  display:flex; flex-direction:column; gap:10px;
+  /* Subgrid: each section (launch-meta, name, original-price, price,
+     meta-block, description, features, button) occupies the same row
+     in the parent .tiers grid as its counterpart in sibling cards.
+     This is how horizontal alignment across cards is achieved.
+     `row-gap:10px` keeps the visual rhythm between sections.  */
+  display:grid; grid-template-rows:subgrid; grid-row:1 / -1;
+  row-gap:10px;
   cursor:pointer; transition:all 150ms ease;
 }}
+/* Explicit grid-row per section class — required because the picker
+   omits sections it has no content for (e.g. Creator has no
+   launch-meta or original-price line). Auto-flow would place the
+   first present child in row 1, breaking cross-card alignment. */
+.tier-launch-meta   {{ grid-row:1; }}
+.tier-name          {{ grid-row:2; }}
+.tier-price-original {{ grid-row:3; }}
+.tier-price         {{ grid-row:4; }}
+.tier-meta-block    {{ grid-row:5; display:flex; flex-direction:column; gap:4px; }}
+.tier-description   {{ grid-row:6; }}
+.tier-features      {{ grid-row:7; }}
+.tier-select-btn    {{ grid-row:8; }}
 .tier:hover {{
   border-color:var(--gold-500);
   box-shadow:0 4px 12px rgba(14,31,51,0.08);
@@ -337,22 +375,11 @@ h1 {{
   white-space:nowrap;
   z-index:3;
 }}
-/* When a tier carries BOTH the "most popular" pill and the launch
-   ribbon, the ribbon's `overflow:hidden` (which clips the ribbon's
-   off-card overhang) was also clipping the popular pill that sits 10px
-   above the card. Move the pill INSIDE the card top edge in that
-   specific combination so the pill stays visible — and push the
-   card's content padding down to leave room so it doesn't sit on top
-   of the "Limited: ..." meta line. */
-.tier.has-launch.highlighted {{
-  padding-top:36px;
-}}
-.tier.has-launch.highlighted.selected {{
-  padding-top:35px; /* compensate for thicker selected-border */
-}}
-.tier.has-launch .tier-popular {{
-  top:8px;
-}}
+/* Popular pill stays at top:-10px above the card universally. The
+   launch ribbon's right-side overhang is clipped via `clip-path`
+   below, which (unlike `overflow:hidden`) doesn't clip above the
+   card — so the popular pill remains visible even when the tier
+   has both the highlight and the launch ribbon. */
 .tier-name {{
   font-family:var(--font-display); font-weight:600; font-size:18px;
   color:var(--navy-950); letter-spacing:-0.01em;
@@ -377,7 +404,14 @@ h1 {{
    corner of any tier with an active featured discount. Plus the
    strike-through original-price line that renders ABOVE the
    discounted price. */
-.tier.has-launch {{ overflow:hidden; }}
+/* Clip ONLY the right + bottom + left side of the card (so the
+   diagonal ribbon's overhang is hidden), while leaving 20px of
+   space ABOVE the card visible (so the "Most popular" pill at
+   top:-10px isn't clipped). `overflow:hidden` would clip in all
+   four directions and chop the popular pill. */
+.tier.has-launch {{
+  clip-path: polygon(0 -20px, 100% -20px, 100% 100%, 0 100%);
+}}
 .tier-launch-ribbon {{
   position:absolute; top:14px; right:-44px;
   background:var(--gold-500); color:var(--navy-950);
@@ -1082,7 +1116,15 @@ fn render_tier_picker(
             };
             // Ribbon + slashed-original-price markup. Only emitted when
             // a featured discount actually applies.
-            let (featured_ribbon, original_price_html) = if let Some(code) = featured {
+            // Split the featured-discount artifact into three discrete
+            // pieces so each can land in its own grid row independently
+            // (vs. before, where the launch-ribbon string ALSO contained
+            // the launch-meta div as an in-flow element — that coupling
+            // made cross-card row alignment impossible).
+            //   - featured_ribbon: absolutely-positioned diagonal banner
+            //   - launch_meta_html: in-flow "Limited: X of Y remaining"
+            //   - original_price_html: in-flow struck-through original
+            let (featured_ribbon, launch_meta_html, original_price_html) = if let Some(code) = featured {
                 let tagline = if code.kind == "percent" {
                     format!("{}% OFF", code.amount / 100)
                 } else if code.kind == "free_license" {
@@ -1093,7 +1135,7 @@ fn render_tier_picker(
                     "LAUNCH SPECIAL".to_string()
                 };
                 let remaining = code.max_uses.map(|m| (m - code.used_count).max(0)).unwrap_or(-1);
-                let remaining_html = if remaining > 0 {
+                let launch_meta = if remaining > 0 {
                     format!(
                         "<div class=\"tier-launch-meta\">Limited: {} of {} remaining</div>",
                         remaining,
@@ -1104,10 +1146,10 @@ fn render_tier_picker(
                 };
                 (
                     format!(
-                        "<div class=\"tier-launch-ribbon\">{}</div>{}",
+                        "<div class=\"tier-launch-ribbon\">{}</div>",
                         html_escape(&tagline),
-                        remaining_html,
                     ),
+                    launch_meta,
                     format!(
                         "<div class=\"tier-price-original\">{}<span class=\"tier-price-original-unit\">{}</span></div>",
                         original_fmt,
@@ -1115,7 +1157,7 @@ fn render_tier_picker(
                     ),
                 )
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), String::new())
             };
             let description = p
                 .metadata
@@ -1307,21 +1349,29 @@ fn render_tier_picker(
             } else {
                 classes.clone()
             };
+            // Wrap the meta lines (duration + recurring cadence + trial
+            // banner + trial flag) into ONE block so the grid layout can
+            // place them as a single row. Subgrid sizes that row to the
+            // tallest meta block across all tiers — cards with fewer
+            // lines get whitespace below their meta, which is the
+            // explicit tradeoff for horizontal alignment.
+            let meta_block_html = format!(
+                "<div class=\"tier-meta-block\">{}{}{}{}</div>",
+                dur_html, recurring_meta, trial_banner, trial_meta
+            );
             format!(
-                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{features_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}{launch_meta_html}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{meta_block_html}{description_html}{features_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,
                 slug = slug_attr,
                 popular_pill = popular_pill,
                 featured_ribbon = featured_ribbon,
+                launch_meta_html = launch_meta_html,
                 name = name,
                 original_price_html = original_price_html,
                 price_fmt = price_fmt,
                 price_unit = price_unit,
                 cadence_suffix = cadence_suffix,
-                dur_html = dur_html,
-                recurring_meta = recurring_meta,
-                trial_banner = trial_banner,
-                trial_meta = trial_meta,
+                meta_block_html = meta_block_html,
                 description_html = description_html,
                 features_html = features_html,
             )

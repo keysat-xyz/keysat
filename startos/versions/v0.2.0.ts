@@ -58,6 +58,20 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:29 — **Tier-card cross-card horizontal alignment via CSS subgrid.** Visually equivalent sections (names, prices, first feature bullet, Select button) now line up horizontally across all visible tier cards. Cards with fewer / shorter sections get extra whitespace in the rows they don\'t fill — the explicit tradeoff the operator asked for, in service of a cleaner grid.',
+  '',
+  '**How.** Each `.tier` card is now a CSS subgrid that shares row tracks with the parent `.tiers` grid. Eight named rows: launch-meta → name → original-price → price → meta-block → description → features (1fr) → button. Each section in the card emits with an explicit `grid-row`, so omitted sections (e.g. Creator has no struck-through original-price line) just leave the row empty while still preserving the alignment across siblings. The features row is `1fr` so it absorbs vertical slack, pinning the Select button to the bottom of every card.',
+  '',
+  '**Side fix: popular pill no longer clipped without the in-card hack.** Replaced `overflow:hidden` on `.tier.has-launch` (which was chopping the "MOST POPULAR" pill at top:-10px) with a `clip-path: polygon(0 -20px, 100% -20px, 100% 100%, 0 100%)`. Same effect for the launch ribbon overhang on the right, but leaves the 20px above the card visible so the popular pill survives. Removed the v0.2.0:26-27 `padding-top:36px` workaround that pushed pill inside the card; with subgrid alignment it\'s no longer needed.',
+  '',
+  '**Meta lines now wrapped in a single `.tier-meta-block`** (duration + recurring cadence + trial banner + trial flag). Previously each was its own `<div class="tier-meta">` which made them impossible to place as one grid row. Now they\'re a flex-column wrapper that lands in row 5, with tier-cards that have fewer meta lines getting whitespace below their content.',
+  '',
+  '**Browser requirement.** CSS subgrid lands in Chrome 117+ (Aug 2023), Firefox 71+ (2019), Safari 16+ (Sept 2022). Should cover essentially every browser an operator points at by 2026; if a very old browser falls through, the cards still render — just with the old non-aligned look (subgrid degrades to its parent grid track config, which is benign).',
+  '',
+  '**Test count: 87** (unchanged — pure render-layer + CSS).',
+  '',
+  '**Upgrade path.** v0.2.0:28 → v0.2.0:29 is a drop-in. No schema, no SDK breaking change. Public `/v1/products/<slug>/policies` JSON unchanged.',
+  '',
   '0.2.0:28 — **Settings cleanup, operator-name save fix, Licenses "Hide revoked" toggle.** Three small admin-UI changes.',
   '',
   '**Settings page intro card removed.** The "Operator-facing configuration. Display name, payment provider connections, …" preamble at the top of the Settings page was redundant with the page title + the section headers below; dropping it tightens the layout and gets the operator straight to the controls.',
@@ -442,7 +456,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:28',
+  version: '0.2.0:29',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
