@@ -186,7 +186,7 @@ body {{
   padding:14px 24px;
 }}
 .topbar .inner {{
-  max-width:680px; margin:0 auto;
+  max-width:1040px; margin:0 auto;
   display:flex; align-items:center; gap:12px;
   font-family:var(--font-display); font-weight:500; font-size:14px;
   letter-spacing:0.28em; text-transform:uppercase; color:var(--navy-900);
@@ -197,11 +197,21 @@ body {{
   color:var(--ink-500);
   margin-left:auto;
 }}
-.wrap {{ max-width:560px; margin:48px auto; padding:0 24px; }}
+/* Outer container width — was 560px (single-column friendly), now
+   wider so the 3-tier grid below has room to breathe and matches the
+   admin Policies page layout. Inner text + form blocks are constrained
+   back to ~560px reading width by the `.wrap > :not(.tiers)` rule
+   below so only the tier grid breaks out. */
+.wrap {{ max-width:1040px; margin:48px auto; padding:0 24px; }}
+.wrap > :not(.tiers) {{ max-width:560px; margin-left:auto; margin-right:auto; }}
 .eyebrow {{
   font-size:11.5px; font-weight:700; letter-spacing:0.18em;
   text-transform:uppercase; color:var(--gold-700); margin-bottom:14px;
-  display:inline-flex; align-items:center; gap:10px;
+  /* `flex; width:fit-content` instead of `inline-flex` so the
+     wrap-children margin:auto centering rule applies — otherwise
+     this inline element would sit flush left of the wider 1040px
+     container while its centered block-level siblings sit middle. */
+  display:flex; width:fit-content; align-items:center; gap:10px;
 }}
 .eyebrow::before {{ content:''; display:inline-block; width:28px; height:1px; background:var(--gold-500); }}
 h1 {{

@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:21 — **Wider buy page so 3-tier grids breathe.** The public /buy/<slug> page was capped at 560px, which packed three tier cards into a too-narrow column on desktop browsers. Bumped the outer container to 1040px so the tier picker matches the admin Policies page layout. The form, price card, and intro text below the tier picker remain centered at the 560px reading-width so the buy form doesn\'t look stretched. Mobile (≤480px) breakpoint unchanged. Topbar inner widened to match. UI-only; no API or schema change.',
+  '',
   '0.2.0:20 — **Discount codes can apply to multiple policies, not just one.** Operator picks a subset (e.g. "Patron AND Pro but not Creator") on a single code instead of cloning the code under different names.',
   '',
   '**What changed.** Previously, a discount code\'s tier scope was a single policy (`applies_to_policy_id`) or "any policy on this product" / global. To offer the same discount across two of three tiers required creating two codes with distinct strings — operationally messy and harder for buyers. The form now has a tier multi-select pill picker: click tiers to toggle inclusion. 0 picked = "any policy on this product" (unchanged). 1 picked = single-policy scope (writes to the legacy column for clarity). 2+ picked = the code applies if and only if the chosen tier is in the picked set.',
@@ -362,7 +364,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:20',
+  version: '0.2.0:21',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
