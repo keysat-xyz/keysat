@@ -1133,7 +1133,15 @@ fn render_tier_picker(
                 .map(|c| crate::api::purchase::compute_discount(&c.kind, c.amount, base_price_units))
                 .unwrap_or(0);
             let post_discount_units = (base_price_units - discount_units).max(0);
-            let (price_fmt, price_unit) = if product.price_currency == "SAT" {
+            // Render free tiers as "Free" rather than "0 sats" / "0.00
+            // USD". Matches the price card below the tier picker, which
+            // already swaps the price + unit to "FREE" via the JS path.
+            // Cadence suffix is suppressed below as well, since a
+            // "Free / yr" suffix would be incoherent.
+            let is_free = post_discount_units == 0;
+            let (price_fmt, price_unit) = if is_free {
+                ("Free".to_string(), String::new())
+            } else if product.price_currency == "SAT" {
                 (format_thousands(post_discount_units), "sats".to_string())
             } else {
                 let cents = post_discount_units;
@@ -1395,6 +1403,12 @@ fn render_tier_picker(
                 "<div class=\"tier-meta-block\">{}{}{}{}</div>",
                 dur_html, recurring_meta, trial_banner, trial_meta
             );
+            // Suppress the cadence suffix on free tiers so the price
+            // doesn't render as "Free /yr" or similar. The "Free"
+            // string alone is enough; the recurring_meta line below
+            // (e.g. "Renews annually") still surfaces the cadence for
+            // recurring tiers that aren't free.
+            let cadence_suffix = if is_free { "" } else { cadence_suffix };
             format!(
                 r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}{launch_meta_html}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{meta_block_html}{description_html}{features_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,

@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:35 — **Free tiers render as "Free" on the buy page tier card.** Previously the server rendered a 0-priced tier as `0 sats` (or `0.00 USD`) in the tier-card price headline, even though the price card BELOW the picker already swapped to `FREE` via the JS path. Inconsistency fixed at the server-render layer: when post-discount price is 0, the tier card renders the headline as `Free` with no unit suffix and no cadence (`Free /yr` would be incoherent). Recurring-meta line ("Renews annually") still surfaces beneath for recurring tiers that happen to be free, so the cadence is still visible — just not stuffed into the headline. Cosmetic; no API or schema change.',
+  '',
   '0.2.0:34 — **Buy page: featured discount pre-populates the code field and shows "Launch special applied" on load.** Previously the launch-special discount auto-applied silently at payment time but the discount-code input was empty, leaving buyers unsure whether they needed to type anything. Now: when a tier has an active featured code, the input renders pre-filled with the code (e.g. `LAUNCH`) and the green "Launch special applied" status badge shows on load. The price card has always rendered the slashed-original + discounted-current price; this change just makes the form match. Tier switches clear an auto-populated code so a code that doesn\'t apply to the new tier doesn\'t linger; buyer-typed codes are untouched. UI / JS only; no API or schema change.',
   '',
   '0.2.0:33 — **Drop a long-standing unused-variable warning.** Removed `let invoice_id_safe = html_escape(&invoice_id);` in `src/api/mod.rs` — the value was computed but never referenced anywhere in the thank-you-page template (the HTML uses `invoice_id_json` for the inline JS, and the on-screen invoice id renders from JS via that JSON variable). One-line cleanup; `cargo check` is now warning-free. No behavior change.',
@@ -493,7 +495,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:34',
+  version: '0.2.0:35',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
