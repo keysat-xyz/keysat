@@ -1451,7 +1451,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const status = el('div', { class: 'muted', style: 'margin-top:6px; font-size:12.5px;' }, '')
     const card = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
-        'border-radius:12px; max-width:480px; width:100%; padding:24px; ' +
+        'border-radius:12px; max-width:640px; width:100%; padding:24px; ' +
         'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
     }, [
       el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Edit product'),
@@ -1912,6 +1912,9 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const meta = pol.metadata || {}
     const description = (typeof meta.description === 'string') ? meta.description : ''
     const highlight = !!meta.highlight
+    const marketingBulletsInit = Array.isArray(meta.marketing_bullets)
+      ? meta.marketing_bullets.join('\n')
+      : ''
 
     const nameField = formInput('e_pol_name', 'Display name', { value: pol.name || '', required: true })
     const descField = formInput('e_pol_description', 'Tier description (optional)', {
@@ -1956,6 +1959,11 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       return host
     })()
     const highlightField = formCheckbox('e_pol_highlight', 'Mark as "Most popular" on the tier picker')
+    const bulletsField = formInput('e_pol_bullets', 'Marketing bullets (optional)', {
+      textarea: true,
+      value: marketingBulletsInit,
+      hint: 'One per line. Renders as ✓ checkmarks above the entitlements on the buy page. Use for things like "Up to 5 products" or "BTCPay integration" that aren\'t real entitlements.',
+    })
     if (highlight) setTimeout(() => {
       const cb = card.querySelector('[name=e_pol_highlight]')
       if (cb) cb.checked = true
@@ -2039,6 +2047,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       el('div', { class: 'row-2' }, [presetSel, customDur]),
       el('div', { class: 'row-2' }, [graceField, machinesField]),
       entField,
+      bulletsField,
       el('div', { class: 'row-2' }, [highlightField, trialField]),
       // Tier ladder rank — sits in its own row above the recurring section.
       tierRankField,
@@ -2083,6 +2092,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             else delete newMetadata.description
             if (newHighlight) newMetadata.highlight = true
             else delete newMetadata.highlight
+            const newBullets = (card.querySelector('[name=e_pol_bullets]').value || '')
+              .split('\n').map((s) => s.trim()).filter(Boolean)
+            if (newBullets.length > 0) newMetadata.marketing_bullets = newBullets
+            else delete newMetadata.marketing_bullets
             const priceRaw = card.querySelector('[name=e_pol_price]').value.trim()
             const price_sats_override = priceRaw === '' ? null : Math.max(0, parseInt(priceRaw, 10) || 0)
             // Recurring subscription — send the fields whenever the operator
@@ -2227,12 +2240,32 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           pol.trial_days + ' day free trial')
       : null
 
+    // Marketing bullets — operator-controlled copy that renders as
+    // ✓ checkmarks ABOVE the entitlement bullets. Things like
+    // "Up to 5 products" or "BTCPay integration" that aren't real
+    // entitlement gates but are buyer-relevant.
+    const marketingBullets = Array.isArray((pol.metadata || {}).marketing_bullets)
+      ? pol.metadata.marketing_bullets
+      : []
+    const marketingList = marketingBullets.length === 0
+      ? null
+      : el('ul', {
+          style: 'list-style:none; padding:0; margin:8px 0 0; font-size:12.5px; color:var(--ink-700)',
+        }, marketingBullets.map((b) => el('li', {
+          style: 'padding:2px 0 2px 16px; position:relative',
+        }, [
+          el('span', {
+            style: 'position:absolute; left:0; top:2px; color:var(--gold-700); font-weight:700',
+          }, '✓'),
+          b,
+        ])))
+
     // Entitlements as small chips with display name + tooltip.
     const cat = product.entitlements_catalog || []
     const entChips = (pol.entitlements || []).length === 0
       ? null
       : el('ul', {
-          style: 'list-style:none; padding:0; margin:8px 0 0; font-size:12.5px; color:var(--ink-700)',
+          style: 'list-style:none; padding:0; margin:' + (marketingList ? '2px' : '8px') + ' 0 0; font-size:12.5px; color:var(--ink-700)',
         }, (pol.entitlements || []).map((slug) => {
           const entry = cat.find((c) => c.slug === slug)
           const display = entry && entry.name ? entry.name : slug
@@ -2379,6 +2412,21 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         (isArchived ? ' opacity:0.55; background:repeating-linear-gradient(135deg, var(--cream-50) 0 10px, rgba(14,31,51,0.025) 10px 20px);' : ''),
     }, [
       popularPill,
+      // Drag-handle affordance — shown only on non-archived (draggable)
+      // tiers. Subtle muted icon top-right; the cursor still flips to
+      // grab on hover anywhere on the card, this just makes the
+      // affordance discoverable without reading any intro text.
+      !isArchived
+        ? el('div', {
+            style:
+              'position:absolute; top:8px; right:8px; ' +
+              'color:var(--ink-500); opacity:0.5; ' +
+              'display:flex; align-items:center; pointer-events:none;',
+            title: 'Drag to reorder tier ladder',
+          }, [
+            el('i', { 'data-lucide': 'grip-vertical', style: 'width:16px;height:16px' }),
+          ])
+        : null,
       el('div', {
         style: 'font-family:var(--font-display); font-weight:600; font-size:18px; color:var(--navy-950); letter-spacing:-0.01em',
       }, pol.name),
@@ -2401,6 +2449,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       description ? el('p', {
         style: 'font-size:13px; line-height:1.45; color:var(--ink-700); margin:6px 0 0',
       }, description) : null,
+      marketingList,
       entChips,
       el('div', { class: 'muted', style: 'font-size:11px; margin-top:4px' },
         (pol._license_count || 0) + ' license' + ((pol._license_count || 0) === 1 ? '' : 's')),
@@ -2547,6 +2596,21 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       class: 'input', type: 'number', min: '1', value: '30', style: 'width:60px',
     })
 
+    // "Most popular" highlight + free-form marketing bullets. Both
+    // write into metadata: metadata.highlight (boolean — drives the
+    // "Most popular" pill on the buy page tier card) and
+    // metadata.marketing_bullets (array of strings — extra ✓ bullets
+    // rendered above the entitlement bullets on the buy page card).
+    // Marketing bullets aren't enforced anywhere; they're operator-
+    // controlled copy for things like "5 active products" or "BTCPay
+    // integration" that don't map to a real entitlement gate.
+    const highlightCb = el('input', { type: 'checkbox' })
+    const bulletsTextarea = el('textarea', {
+      class: 'input', rows: '3',
+      placeholder: 'One bullet per line — e.g.\nUp to 5 products\nBTCPay integration\nWebhooks + audit log',
+      style: 'font-family:var(--font-body); font-size:12px; line-height:1.45;',
+    })
+
     // Tip recipient (advanced — collapsed by default to keep the
     // card narrow).
     const status = el('div', { style: 'font-size:12px; min-height:16px' }, '')
@@ -2574,6 +2638,21 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         ? 'Click to toggle. Defined on the product\'s catalog.'
         : 'Comma-separated slugs. Define a product catalog for click-to-pick.',
         entHost),
+      // "Most popular" toggle — drives the gold-pill anchored above
+      // the tier card on the buy page.
+      el('div', { style: 'display:flex; align-items:center; gap:6px; margin-top:8px' }, [
+        highlightCb,
+        el('label', { class: 'lbl', style: 'margin:0; font-size:11.5px; display:flex; align-items:center' }, [
+          'Mark as "Most popular"',
+          helpIcon('Renders a "Most popular" pill above this tier card on the buy page. Pick one tier per product.'),
+        ]),
+      ]),
+      // Free-form marketing bullets — operator-controlled copy that
+      // renders as additional ✓ checkmarks above the entitlement
+      // bullets. Not enforced anywhere; pure marketing surface.
+      fieldRow('Marketing bullets',
+        'One per line. Buyer sees these as ✓ checkmarks above the entitlement bullets on the buy page. Use for things like "Up to 5 products" or "BTCPay integration" that aren\'t real entitlements.',
+        bulletsTextarea),
       // Recurring section — minimal, expanded inline (no nested
       // disclosure; cards already imply compactness).
       el('div', { style: 'display:flex; align-items:center; gap:6px; margin-top:8px' }, [
@@ -2611,6 +2690,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               const durationSeconds = durationSel.value === 'custom'
                 ? Math.max(1, parseInt(customDaysInput.value, 10) || 0) * 86400
                 : parseInt(durationSel.value, 10) || 0
+              const marketingBullets = bulletsTextarea.value
+                .split('\n')
+                .map((s) => s.trim())
+                .filter(Boolean)
+              const metadata = {}
+              if (highlightCb.checked) metadata.highlight = true
+              if (marketingBullets.length > 0) metadata.marketing_bullets = marketingBullets
               const body = {
                 product_slug: product.slug,
                 slug: slugInput.value.trim(),
@@ -2620,7 +2706,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
                 max_machines: parseInt(maxMachinesInput.value, 10),
                 is_trial: false,
                 entitlements: Array.isArray(entRead()) ? entRead() : entRead(),
-                metadata: {},
+                metadata: metadata,
                 price_sats_override: isSat
                   ? Math.max(0, parseInt(priceInput.value, 10) || 0)
                   : Math.max(0, Math.round(parseFloat(priceInput.value) * 100) || 0),
@@ -3201,15 +3287,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       localStorage.setItem('ks_show_archived_policies', archivedToggle.checked ? '1' : '0')
       routes.policies()
     })
-    target.appendChild(plainCard([
-      el('div', { style: 'display:flex; align-items:center; gap:14px; flex-wrap:wrap' }, [
-        el('p', { class: 'muted', style: 'margin:0; flex:1; min-width:280px' },
-          'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance. Click the dashed "+ Add tier" card to author a new policy. Drag tier cards left/right to reorder — the ladder rank used by tier-upgrade flow follows the visual order.'),
-        el('label', {
-          for: 'showArchivedPolicies',
-          style: 'font-size:12.5px; color:var(--ink-700); white-space:nowrap; cursor:pointer',
-        }, [archivedToggle, 'Show archived']),
-      ]),
+    target.appendChild(el('div', {
+      style: 'display:flex; justify-content:flex-end; margin-bottom:14px',
+    }, [
+      el('label', {
+        for: 'showArchivedPolicies',
+        style: 'font-size:12.5px; color:var(--ink-700); white-space:nowrap; cursor:pointer',
+      }, [archivedToggle, 'Show archived']),
     ]))
     // Intentionally not used: `create` (legacy disclosure-form
     // create-policy flow). Kept around as dead code for one release
@@ -3602,6 +3686,14 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         ]),
         formInput('referrer_label', 'Referrer / campaign label (optional)'),
         formInput('description', 'Description (internal note)', { textarea: true }),
+        el('div', { style: 'display:flex; align-items:flex-start; gap:8px; margin-top:8px' }, [
+          el('input', { type: 'checkbox', name: 'featured', id: 'create_featured_cb', style: 'margin-top:3px' }),
+          el('label', { for: 'create_featured_cb', style: 'font-size:12.5px; line-height:1.45; cursor:pointer' }, [
+            el('strong', null, 'Featured (launch special) '),
+            el('span', { class: 'muted' },
+              '— display on the buy page with a diagonal "LAUNCH SPECIAL" ribbon + the original price struck through. Auto-applies to buyers who don\'t type a code. Operator-typed codes still win when a buyer pastes one.'),
+          ]),
+        ]),
         el('button', { class: 'btn primary', onclick: async function () {
           const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
           create.querySelector('.body').appendChild(status)
@@ -3632,6 +3724,8 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             if (ps) body.product_slug = ps
             const rl = create.querySelector('[name=referrer_label]').value.trim()
             if (rl) body.referrer_label = rl
+            const featured = create.querySelector('[name=featured]').checked
+            if (featured) body.featured = true
             await api('/v1/admin/discount-codes', { method: 'POST', body })
             status.replaceWith(ok('Created. Reloading…'))
             setTimeout(routes.codes, 600)
@@ -3696,6 +3790,23 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         textarea: true,
         value: c.description || '',
       })
+      // Featured toggle — same shape as in Create. Pre-populated with
+      // the existing value.
+      const featuredCb = el('input', {
+        type: 'checkbox', name: 'e_featured', id: 'e_featured_cb',
+        style: 'margin-top:3px',
+      })
+      if (c.featured) featuredCb.checked = true
+      const featuredField = el('div', {
+        style: 'display:flex; align-items:flex-start; gap:8px; margin-top:8px',
+      }, [
+        featuredCb,
+        el('label', { for: 'e_featured_cb', style: 'font-size:12.5px; line-height:1.45; cursor:pointer' }, [
+          el('strong', null, 'Featured (launch special) '),
+          el('span', { class: 'muted' },
+            '— display on the buy page with a diagonal ribbon + slashed price. Auto-applies for buyers who don\'t type a code.'),
+        ]),
+      ])
       const saveBtn = el('button', { class: 'btn primary', onclick: async function () {
         const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Saving…')
         editPanel.appendChild(status)
@@ -3714,6 +3825,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           const refRaw = editPanel.querySelector('[name=e_referrer_label]').value.trim()
           body.referrer_label = refRaw === '' ? null : refRaw
           body.description = editPanel.querySelector('[name=e_description]').value || ''
+          body.featured = editPanel.querySelector('[name=e_featured]').checked
           await api('/v1/admin/discount-codes/' + c.id, { method: 'PATCH', body })
           status.replaceWith(ok('Saved. Reloading…'))
           setTimeout(routes.codes, 600)
@@ -3737,19 +3849,27 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         el('div', { class: 'row-2' }, [amtField, muField]),
         el('div', { class: 'row-2' }, [expField, refField]),
         descField,
+        featuredField,
         el('div', { style: 'margin-top:8px' }, [saveBtn, cancelBtn]),
       ]))
       editPanel.scrollIntoView({ behavior: 'smooth', block: 'start' })
     }
 
     try {
-      const j = await api('/v1/admin/discount-codes?include_inactive=true')
-      const codes = j.codes || []
-      const rows = codes.map((c) => {
-        // Currency-aware rendering. SAT-currency codes show "5,000
-        // sats off"; fiat codes show "$10.00 off" with cents-to-
-        // dollars conversion. Backwards-compat for older rows that
-        // don't carry discount_currency: treat as SAT.
+      // Fetch products + codes in parallel so we can group codes by product.
+      const [productsResp, codesResp] = await Promise.all([
+        api('/v1/products').catch(() => ({ products: [] })),
+        api('/v1/admin/discount-codes?include_inactive=true'),
+      ])
+      const products = productsResp.products || []
+      const codes = codesResp.codes || []
+      const productById = {}
+      products.forEach((p) => { productById[p.id] = p })
+
+      // Build a row for one code. Same render whether the code is in
+      // a per-product section or the "Global" section.
+      function codeRow(c) {
+        // Currency-aware amount rendering (unchanged).
         const cur = (c.discount_currency || 'SAT').toUpperCase()
         const fmtFiat = (cents, sym) => sym + (cents / 100).toFixed(2)
         let amountStr = ''
@@ -3769,7 +3889,14 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         else amountStr = el('span', { class: 'badge b-gold' }, 'free')
         const usage = c.used_count + ' / ' + (c.max_uses == null ? '∞' : c.max_uses)
         return el('tr', null, [
-          el('td', null, el('code', null, c.code)),
+          el('td', null, [
+            el('code', null, c.code),
+            c.featured ? el('span', {
+              class: 'badge b-gold',
+              style: 'margin-left:8px; font-size:10px; padding:2px 6px; letter-spacing:0.05em',
+              title: 'Public launch-special — auto-applies on the buy page',
+            }, 'featured') : null,
+          ]),
           el('td', null, c.kind),
           el('td', null, amountStr),
           el('td', null, usage),
@@ -3811,14 +3938,84 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             }, 'Delete'),
           ])),
         ])
+      }
+
+      // Group codes by product. Codes without a product (applies_to_
+      // product_id null) land in the "Global" bucket — they apply to
+      // every product on this instance.
+      const grouped = new Map()  // product_id -> codes[]
+      const globalCodes = []
+      codes.forEach((c) => {
+        if (c.applies_to_product_id && productById[c.applies_to_product_id]) {
+          if (!grouped.has(c.applies_to_product_id)) {
+            grouped.set(c.applies_to_product_id, [])
+          }
+          grouped.get(c.applies_to_product_id).push(c)
+        } else {
+          globalCodes.push(c)
+        }
       })
-      target.appendChild(tableCard(
-        'All codes',
-        codes.length + ' total',
-        ['Code', 'Kind', 'Amount', 'Used', 'Expires', 'Status', ''],
-        rows,
-        'No codes yet.'
-      ))
+
+      // Single-product instances: flat table with no grouping noise.
+      // Multi-product instances OR any global codes: render one card
+      // per group, matching the Licenses + Subscriptions tab pattern.
+      const useGrouping = products.length > 1 || globalCodes.length > 0
+      if (!useGrouping) {
+        target.appendChild(tableCard(
+          'All codes',
+          codes.length + ' total',
+          ['Code', 'Kind', 'Amount', 'Used', 'Expires', 'Status', ''],
+          codes.map(codeRow),
+          'No codes yet.'
+        ))
+      } else {
+        // Per-product sections, sorted: products with codes first
+        // (preserving the product list order), Global section last.
+        products.forEach((p) => {
+          const list = grouped.get(p.id)
+          if (!list || list.length === 0) return
+          const featuredCount = list.filter((c) => c.featured).length
+          const activeCount = list.filter((c) => c.active).length
+          const breakdown =
+            list.length + ' code' + (list.length === 1 ? '' : 's') +
+            ' · ' + activeCount + ' active' +
+            (featuredCount > 0 ? ' · ' + featuredCount + ' featured' : '')
+          const card = el('div', { class: 'card', style: 'margin-bottom:14px' }, [
+            el('div', { class: 'card-head' }, [
+              el('h3', null, p.name),
+              el('span', { class: 'sub' }, breakdown),
+            ]),
+            tableCard('', null,
+              ['Code', 'Kind', 'Amount', 'Used', 'Expires', 'Status', ''],
+              list.map(codeRow), '(none)'),
+          ])
+          target.appendChild(card)
+        })
+        if (globalCodes.length > 0) {
+          const featuredCount = globalCodes.filter((c) => c.featured).length
+          const activeCount = globalCodes.filter((c) => c.active).length
+          const breakdown =
+            globalCodes.length + ' code' + (globalCodes.length === 1 ? '' : 's') +
+            ' · ' + activeCount + ' active' +
+            (featuredCount > 0 ? ' · ' + featuredCount + ' featured' : '')
+          const card = el('div', { class: 'card', style: 'margin-bottom:14px' }, [
+            el('div', { class: 'card-head' }, [
+              el('h3', null, 'All products (global)'),
+              el('span', { class: 'sub' }, breakdown),
+            ]),
+            tableCard('', null,
+              ['Code', 'Kind', 'Amount', 'Used', 'Expires', 'Status', ''],
+              globalCodes.map(codeRow), '(none)'),
+          ])
+          target.appendChild(card)
+        }
+        if (codes.length === 0) {
+          target.appendChild(plainCard([
+            el('p', { class: 'muted', style: 'margin:0' },
+              'No codes yet — use the "Create a new code" form above.'),
+          ]))
+        }
+      }
     } catch (e) {
       target.appendChild(plainCard([err(e.message)]))
     }
@@ -5233,37 +5430,45 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   function catalogEditor(initial) {
     const rowsHost = el('div', { style: 'display:flex; flex-direction:column; gap:8px' })
     const addRow = (slug, name, description) => {
+      // Each entitlement is a 2-line block instead of 4 cramped
+      // columns: slug + display name share the top line (so they fit
+      // side-by-side at typical lengths), description gets its own
+      // full-width line below so longer copy reads without truncation.
+      // The remove button anchors to the top-right of the block.
+      const slugInput = el('input', {
+        class: 'input mono', placeholder: 'slug (e.g. unlimited_products)',
+        value: slug || '',
+        'data-field': 'slug',
+      })
+      const nameInput = el('input', {
+        class: 'input', placeholder: 'Display name (e.g. Unlimited products)',
+        value: name || '',
+        'data-field': 'name',
+      })
+      const descInput = el('input', {
+        class: 'input', placeholder: 'Description — shown as a hover tooltip on the buy page',
+        value: description || '',
+        'data-field': 'description',
+      })
+      const removeBtn = el('button', {
+        type: 'button',
+        class: 'btn sm danger',
+        title: 'Remove this entitlement',
+        style: 'padding:6px 10px; flex-shrink:0',
+      }, '×')
       const row = el('div', {
         class: 'catalog-row',
-        style: 'display:grid; grid-template-columns: 1fr 1fr 1.6fr auto; gap:6px; align-items:flex-start',
+        style:
+          'display:flex; flex-direction:column; gap:6px; ' +
+          'padding:10px; border:1px solid var(--border-1); ' +
+          'border-radius:8px; background:var(--cream-50);',
       }, [
-        el('input', {
-          class: 'input', placeholder: 'slug',
-          value: slug || '',
-          'data-field': 'slug',
-        }),
-        el('input', {
-          class: 'input', placeholder: 'Display name',
-          value: name || '',
-          'data-field': 'name',
-        }),
-        el('input', {
-          class: 'input', placeholder: 'Description (buyer tooltip)',
-          value: description || '',
-          'data-field': 'description',
-          title: 'Description shown as a hover tooltip on the buy page',
-        }),
-        (() => {
-          const btn = el('button', {
-            type: 'button',
-            class: 'btn sm danger',
-            title: 'Remove this entitlement',
-            style: 'padding:6px 10px',
-          }, '×')
-          btn.addEventListener('click', () => row.remove())
-          return btn
-        })(),
+        el('div', {
+          style: 'display:grid; grid-template-columns: 1fr 1.4fr auto; gap:6px; align-items:center',
+        }, [slugInput, nameInput, removeBtn]),
+        descInput,
       ])
+      removeBtn.addEventListener('click', () => row.remove())
       rowsHost.appendChild(row)
     }
     if (Array.isArray(initial) && initial.length > 0) {

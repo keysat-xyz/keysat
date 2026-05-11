@@ -2064,6 +2064,13 @@ pub async fn list_audit(
 // ---------- Discount codes ----------
 
 fn row_to_discount_code(row: sqlx::sqlite::SqliteRow) -> DiscountCode {
+    // `featured` lands in migration 0017. Same fallback pattern as
+    // tier_rank / archived_at — try_get + ok().flatten() so pre-0017
+    // databases (theoretical) don't crash here.
+    let featured: bool = row
+        .try_get::<i64, _>("featured")
+        .map(|v| v != 0)
+        .unwrap_or(false);
     DiscountCode {
         id: row.get("id"),
         code: row.get("code"),
@@ -2077,6 +2084,7 @@ fn row_to_discount_code(row: sqlx::sqlite::SqliteRow) -> DiscountCode {
         referrer_label: row.get("referrer_label"),
         description: row.get("description"),
         active: row.get::<i64, _>("active") != 0,
+        featured,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -2122,6 +2130,7 @@ pub async fn create_discount_code(
         applies_to_policy_id,
         referrer_label,
         description,
+        false, // not featured by default — backwards-compat for callers
     )
     .await
 }
@@ -2148,6 +2157,7 @@ pub async fn create_discount_code_with_currency(
     applies_to_policy_id: Option<&str>,
     referrer_label: Option<&str>,
     description: &str,
+    featured: bool,
 ) -> AppResult<DiscountCode> {
     if !matches!(
         kind,
@@ -2203,8 +2213,8 @@ pub async fn create_discount_code_with_currency(
         "INSERT INTO discount_codes
          (id, code, kind, amount, discount_currency, max_uses, used_count, expires_at,
           applies_to_product_id, applies_to_policy_id, referrer_label,
-          description, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?)",
+          description, active, featured, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&normalized)
@@ -2217,6 +2227,7 @@ pub async fn create_discount_code_with_currency(
     .bind(applies_to_policy_id)
     .bind(referrer_label)
     .bind(description)
+    .bind(featured as i64)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -2239,7 +2250,7 @@ pub async fn get_discount_code_by_id(
     let row = sqlx::query(
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
                 applies_to_product_id, applies_to_policy_id, referrer_label,
-                description, active, created_at, updated_at
+                description, active, featured, created_at, updated_at
          FROM discount_codes WHERE id = ?",
     )
     .bind(id)
@@ -2256,7 +2267,7 @@ pub async fn get_discount_code_by_code(
     let row = sqlx::query(
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
                 applies_to_product_id, applies_to_policy_id, referrer_label,
-                description, active, created_at, updated_at
+                description, active, featured, created_at, updated_at
          FROM discount_codes WHERE code = ?",
     )
     .bind(&normalized)
@@ -2272,16 +2283,70 @@ pub async fn list_discount_codes(
     let q = if only_active {
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
                 applies_to_product_id, applies_to_policy_id, referrer_label,
-                description, active, created_at, updated_at
+                description, active, featured, created_at, updated_at
          FROM discount_codes WHERE active = 1 ORDER BY created_at DESC"
     } else {
         "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
                 applies_to_product_id, applies_to_policy_id, referrer_label,
-                description, active, created_at, updated_at
+                description, active, featured, created_at, updated_at
          FROM discount_codes ORDER BY created_at DESC"
     };
     let rows = sqlx::query(q).fetch_all(pool).await?;
     Ok(rows.into_iter().map(row_to_discount_code).collect())
+}
+
+/// Find the most-applicable active featured discount for a given
+/// (product_id, policy_id) pair, if any. Returns `None` if no featured
+/// code applies, or if all matching codes are expired / exhausted /
+/// inactive. Precedence: policy-specific > product-specific > global,
+/// then by created_at ascending (operator-set priority).
+///
+/// Used by:
+///   - `GET /v1/products/<slug>/policies` to surface launch-special
+///     prices on the public buy page + dynamic pricing page.
+///   - `POST /v1/purchase` to auto-apply the featured code when the
+///     buyer doesn't type one.
+pub async fn find_applicable_featured_discount(
+    pool: &SqlitePool,
+    product_id: &str,
+    policy_id: &str,
+) -> AppResult<Option<DiscountCode>> {
+    let now = Utc::now().to_rfc3339();
+    // The SQL filters by featured + active + not-expired +
+    // remaining-uses, scopes to either the policy, the product, or
+    // global, and orders by specificity (policy match first) then
+    // created_at ascending. LIMIT 1 — we only need the winner.
+    let row = sqlx::query(
+        "SELECT id, code, kind, amount, max_uses, used_count, expires_at,
+                applies_to_product_id, applies_to_policy_id, referrer_label,
+                description, active, featured, created_at, updated_at
+         FROM discount_codes
+         WHERE featured = 1
+           AND active = 1
+           AND (expires_at IS NULL OR expires_at > ?)
+           AND (max_uses IS NULL OR used_count < max_uses)
+           AND (
+                applies_to_policy_id = ?
+             OR (applies_to_policy_id IS NULL AND applies_to_product_id = ?)
+             OR (applies_to_policy_id IS NULL AND applies_to_product_id IS NULL)
+           )
+         ORDER BY
+           CASE
+             WHEN applies_to_policy_id = ? THEN 0
+             WHEN applies_to_product_id = ? THEN 1
+             ELSE 2
+           END,
+           created_at ASC
+         LIMIT 1",
+    )
+    .bind(&now)
+    .bind(policy_id)
+    .bind(product_id)
+    .bind(policy_id)
+    .bind(product_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_discount_code))
 }
 
 pub async fn set_discount_code_active(
@@ -2317,6 +2382,7 @@ pub async fn update_discount_code(
     expires_at: Option<Option<&str>>,
     description: Option<&str>,
     referrer_label: Option<Option<&str>>,
+    featured: Option<bool>,
 ) -> AppResult<DiscountCode> {
     // Re-fetch to validate amount against the existing kind.
     let existing = get_discount_code_by_id(pool, id)
@@ -2377,6 +2443,9 @@ pub async fn update_discount_code(
     if referrer_label.is_some() {
         sets.push("referrer_label = ?");
     }
+    if featured.is_some() {
+        sets.push("featured = ?");
+    }
     if sets.is_empty() {
         return Ok(existing);
     }
@@ -2401,6 +2470,9 @@ pub async fn update_discount_code(
     }
     if let Some(opt_r) = referrer_label {
         q = q.bind(opt_r);
+    }
+    if let Some(f) = featured {
+        q = q.bind(f as i64);
     }
     q = q.bind(&now).bind(id);
     q.execute(pool).await?;

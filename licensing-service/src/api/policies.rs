@@ -778,6 +778,22 @@ pub async fn list_public_policies(
     }
     let policies = repo::list_public_policies_by_product(&state.db, &product.id).await?;
 
+    // For each policy, look up an applicable active featured discount
+    // (if any). The buy page + dynamic pricing page render the ribbon +
+    // slashed price using this. Done as a sequential loop because the
+    // policy count per product is small (≤ tier-cap = 5 on Creator,
+    // unlimited on Pro but realistically <20). Switch to a single
+    // batched SQL if profiling ever flags this.
+    let mut featured_by_policy: std::collections::HashMap<String, crate::models::DiscountCode> =
+        std::collections::HashMap::new();
+    for p in &policies {
+        if let Some(code) =
+            repo::find_applicable_featured_discount(&state.db, &product.id, &p.id).await?
+        {
+            featured_by_policy.insert(p.id.clone(), code);
+        }
+    }
+
     let policies_json: Vec<Value> = policies
         .into_iter()
         .map(|p| {
@@ -797,7 +813,41 @@ pub async fn list_public_policies(
                 .get("highlight")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Marketing bullets: operator-controlled copy that renders
+            // as ✓ checkmarks ABOVE the entitlement bullets on the buy
+            // page. Stored as an array of strings in metadata; passes
+            // through to JSON unchanged.
+            let marketing_bullets = p
+                .metadata
+                .get("marketing_bullets")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             let price_sats = p.price_sats_override.unwrap_or(product.price_sats);
+            // Featured discount (if any) — compute the post-discount
+            // price the buyer would actually pay if they bought right
+            // now without typing any code. We mirror the same math
+            // the purchase endpoint applies (compute_discount), and
+            // floor the result at 0 so a 100%-off code doesn't go
+            // negative.
+            let featured = featured_by_policy.get(&p.id).map(|code| {
+                let discount = crate::api::purchase::compute_discount(
+                    &code.kind, code.amount, price_sats,
+                );
+                let final_price = (price_sats - discount).max(0);
+                let remaining = code.max_uses.map(|m| (m - code.used_count).max(0));
+                json!({
+                    "code": code.code,
+                    "kind": code.kind,
+                    "amount": code.amount,
+                    "description": code.description,
+                    "expires_at": code.expires_at,
+                    "max_uses": code.max_uses,
+                    "used_count": code.used_count,
+                    "remaining_uses": remaining,
+                    "discount_applied_sats": discount,
+                    "discounted_price_sats": final_price,
+                })
+            });
             json!({
                 "slug": p.slug,
                 "name": p.name,
@@ -807,12 +857,16 @@ pub async fn list_public_policies(
                 "max_machines": p.max_machines,
                 "is_trial": p.is_trial,
                 "entitlements": p.entitlements,
+                "marketing_bullets": marketing_bullets,
                 "highlighted": highlighted,
                 // Recurring-subscription cadence — buy page renders
                 // "Renews every N days" / "$X/month" when is_recurring=true.
                 "is_recurring": p.is_recurring,
                 "renewal_period_days": p.renewal_period_days,
                 "trial_days": p.trial_days,
+                // Featured (launch-special) discount metadata —
+                // null when no applicable featured code exists.
+                "featured_discount": featured,
             })
         })
         .collect();

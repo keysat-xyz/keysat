@@ -120,10 +120,29 @@ pub async fn render(
         .map(|p| p.slug.clone())
         .unwrap_or_default();
 
+    // Look up applicable featured (launch-special) discounts per
+    // policy. The tier picker renders the ribbon + slashed price for
+    // any policy with a match. Sequential because policy count is
+    // small per product.
+    let mut featured_by_policy: std::collections::HashMap<String, crate::models::DiscountCode> =
+        std::collections::HashMap::new();
+    for p in &public_policies {
+        if let Ok(Some(code)) =
+            repo::find_applicable_featured_discount(&state.db, &product.id, &p.id).await
+        {
+            featured_by_policy.insert(p.id.clone(), code);
+        }
+    }
+
     // Server-render the tier picker HTML so the page is functional even
     // before JS runs. The picker only appears when the product has 2+
     // public policies; otherwise the existing single-price view is used.
-    let tiers_html = render_tier_picker(&public_policies, &initial_policy, &product);
+    let tiers_html = render_tier_picker(
+        &public_policies,
+        &initial_policy,
+        &product,
+        &featured_by_policy,
+    );
     // Compact JSON map of {policy_slug: {price, name}} so the JS can update
     // the price card when the buyer clicks a different tier.
     let tiers_json = build_tiers_json(&public_policies, &product);
@@ -319,17 +338,46 @@ h1 {{
 .tier-description {{
   font-size:13.5px; line-height:1.45; color:var(--ink-700); margin:0;
 }}
-.tier-entitlements {{
+/* Launch-special ribbon — diagonal banner anchored to the top-right
+   corner of any tier with an active featured discount. Plus the
+   strike-through original-price line that renders ABOVE the
+   discounted price. */
+.tier.has-launch {{ overflow:hidden; }}
+.tier-launch-ribbon {{
+  position:absolute; top:14px; right:-44px;
+  background:var(--gold-500); color:var(--navy-950);
+  font-family:var(--font-display); font-weight:700; font-size:10.5px;
+  letter-spacing:0.14em; text-transform:uppercase;
+  padding:4px 50px; transform:rotate(35deg);
+  box-shadow:0 2px 6px rgba(14,31,51,0.15);
+  z-index:2;
+}}
+.tier-launch-meta {{
+  font-size:11.5px; color:var(--gold-700); font-weight:600;
+  margin-top:4px;
+}}
+.tier-price-original {{
+  font-family:var(--font-display); font-weight:500; font-size:14px;
+  color:var(--ink-500); margin-top:4px;
+  text-decoration:line-through; text-decoration-color:rgba(14,31,51,0.4);
+}}
+.tier-price-original-unit {{
+  font-size:11.5px; margin-left:4px; color:var(--ink-500);
+}}
+.tier-entitlements, .tier-bullets {{
   list-style:none; padding:0; margin:6px 0 0;
   font-size:13px; color:var(--ink-700);
 }}
-.tier-entitlements li {{
+.tier-entitlements li, .tier-bullets li {{
   padding:3px 0 3px 18px; position:relative;
 }}
-.tier-entitlements li::before {{
+.tier-entitlements li::before, .tier-bullets li::before {{
   content:'✓'; position:absolute; left:0; top:3px;
   color:var(--gold-700); font-weight:700;
 }}
+/* Marketing bullets render above entitlements with a slightly tighter
+   top margin so they read as one coherent feature list. */
+.tier-bullets + .tier-entitlements {{ margin-top:2px; }}
 .tier-select-btn {{
   margin-top:auto;
   padding:8px 12px;
@@ -931,6 +979,7 @@ fn render_tier_picker(
     policies: &[crate::models::Policy],
     initial: &Option<crate::models::Policy>,
     product: &crate::models::Product,
+    featured_by_policy: &std::collections::HashMap<String, crate::models::DiscountCode>,
 ) -> String {
     if policies.len() < 2 {
         return String::new();
@@ -949,13 +998,74 @@ fn render_tier_picker(
             // For SAT-currency products, the override is in sats; for
             // fiat-priced products it's in cents (USD/EUR). The price
             // unit cell renders in the right denomination either way.
-            let (price_fmt, price_unit) = if product.price_currency == "SAT" {
-                let price = p.price_sats_override.unwrap_or(product.price_sats);
-                (format_thousands(price), "sats".to_string())
+            let base_price_units: i64 = if product.price_currency == "SAT" {
+                p.price_sats_override.unwrap_or(product.price_sats)
             } else {
-                let cents = p.price_sats_override.unwrap_or(product.price_value);
+                p.price_sats_override.unwrap_or(product.price_value)
+            };
+            // Featured discount (if any) — apply the same math the
+            // purchase endpoint uses so the buyer sees the same number
+            // here as at checkout. Note: for fiat products the units
+            // are cents, but compute_discount is currency-agnostic
+            // (works on any positive integer).
+            let featured = featured_by_policy.get(&p.id);
+            let discount_units = featured
+                .map(|c| crate::api::purchase::compute_discount(&c.kind, c.amount, base_price_units))
+                .unwrap_or(0);
+            let post_discount_units = (base_price_units - discount_units).max(0);
+            let (price_fmt, price_unit) = if product.price_currency == "SAT" {
+                (format_thousands(post_discount_units), "sats".to_string())
+            } else {
+                let cents = post_discount_units;
                 let main = format!("{}.{:02}", cents / 100, (cents.abs() % 100));
                 (main, product.price_currency.clone())
+            };
+            // Original (pre-discount) price for the strikethrough.
+            let original_fmt = if featured.is_some() {
+                if product.price_currency == "SAT" {
+                    format_thousands(base_price_units)
+                } else {
+                    format!("{}.{:02}", base_price_units / 100, (base_price_units.abs() % 100))
+                }
+            } else {
+                String::new()
+            };
+            // Ribbon + slashed-original-price markup. Only emitted when
+            // a featured discount actually applies.
+            let (featured_ribbon, original_price_html) = if let Some(code) = featured {
+                let tagline = if code.kind == "percent" {
+                    format!("{}% OFF", code.amount / 100)
+                } else if code.kind == "free_license" {
+                    "FREE".to_string()
+                } else if code.kind == "set_price" {
+                    "LIMITED PRICE".to_string()
+                } else {
+                    "LAUNCH SPECIAL".to_string()
+                };
+                let remaining = code.max_uses.map(|m| (m - code.used_count).max(0)).unwrap_or(-1);
+                let remaining_html = if remaining > 0 {
+                    format!(
+                        "<div class=\"tier-launch-meta\">Limited: {} of {} remaining</div>",
+                        remaining,
+                        code.max_uses.unwrap_or(0)
+                    )
+                } else {
+                    String::new()
+                };
+                (
+                    format!(
+                        "<div class=\"tier-launch-ribbon\">{}</div>{}",
+                        html_escape(&tagline),
+                        remaining_html,
+                    ),
+                    format!(
+                        "<div class=\"tier-price-original\">{}<span class=\"tier-price-original-unit\">{}</span></div>",
+                        original_fmt,
+                        if product.price_currency == "SAT" { "sats" } else { product.price_currency.as_str() },
+                    ),
+                )
+            } else {
+                (String::new(), String::new())
             };
             let description = p
                 .metadata
@@ -982,6 +1092,29 @@ fn render_tier_picker(
             // If the product has an entitlements catalog, render
             // each policy entitlement using the catalog's display
             // name + description (as a tooltip). Falls back to the
+            // Marketing bullets — operator-controlled copy from
+            // metadata.marketing_bullets. Rendered as ✓ checkmarks
+            // above the entitlement bullets. Skipped silently if
+            // absent / wrong shape.
+            let marketing_html = p
+                .metadata
+                .get("marketing_bullets")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let lis: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("<li>{}</li>", html_escape(s)))
+                        .collect();
+                    if lis.is_empty() {
+                        String::new()
+                    } else {
+                        format!("<ul class=\"tier-bullets\">{}</ul>", lis.join(""))
+                    }
+                })
+                .unwrap_or_default();
             // raw slug if the catalog is empty or the slug isn't in
             // it (legacy slugs that predate the catalog land here).
             let entitlements_html = if p.entitlements.is_empty() {
@@ -1075,12 +1208,22 @@ fn render_tier_picker(
             } else {
                 ("", String::new(), String::new())
             };
+            // Add `has-launch` to the card class when a featured
+            // discount applies so the CSS can lift the price + draw
+            // the diagonal ribbon.
+            let classes = if featured.is_some() {
+                format!("{} has-launch", classes)
+            } else {
+                classes.clone()
+            };
             format!(
-                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}<div class="tier-name">{name}</div><div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{marketing_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,
                 slug = slug_attr,
                 popular_pill = popular_pill,
+                featured_ribbon = featured_ribbon,
                 name = name,
+                original_price_html = original_price_html,
                 price_fmt = price_fmt,
                 price_unit = price_unit,
                 cadence_suffix = cadence_suffix,
@@ -1089,6 +1232,7 @@ fn render_tier_picker(
                 trial_banner = trial_banner,
                 trial_meta = trial_meta,
                 description_html = description_html,
+                marketing_html = marketing_html,
                 entitlements_html = entitlements_html,
             )
         })

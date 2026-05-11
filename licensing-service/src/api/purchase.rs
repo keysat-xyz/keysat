@@ -249,8 +249,28 @@ pub async fn start(
     //
     // If C, D, or E fail after B succeeded, we call release_code_slot to
     // give the slot back.
+    // Determine the effective discount code. If the buyer typed one,
+    // honor it (operator-typed beats auto-applied). Otherwise, look up
+    // the most applicable active featured discount for the chosen
+    // policy and use it. This is the "launch special" auto-apply
+    // path — operators can run a public promo without making buyers
+    // type the code.
+    let explicit_code: Option<String> = req
+        .code
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    let effective_code: Option<String> = if explicit_code.is_some() {
+        explicit_code
+    } else if let Some(pol) = chosen_policy.as_ref() {
+        repo::find_applicable_featured_discount(&state.db, &product.id, &pol.id)
+            .await?
+            .map(|c| c.code)
+    } else {
+        None
+    };
     let (final_price, reservation, discount_applied) = if let Some(raw_code) =
-        req.code.as_deref().filter(|s| !s.trim().is_empty())
+        effective_code.as_deref().filter(|s| !s.trim().is_empty())
     {
         let code = repo::get_discount_code_by_code(&state.db, raw_code)
             .await?
@@ -528,7 +548,9 @@ pub async fn start(
 
 /// Apply the discount math. Returns the sats to subtract from `base`.
 /// Caller is responsible for clamping the result (and for floor enforcement).
-fn compute_discount(kind: &str, amount: i64, base_price_sats: i64) -> i64 {
+/// `pub(crate)` so the public policies endpoint can preview the post-
+/// discount price on tier cards for featured (auto-applied) codes.
+pub(crate) fn compute_discount(kind: &str, amount: i64, base_price_sats: i64) -> i64 {
     match kind {
         "percent" => {
             // amount is basis points (0..=10000). 5000 == 50%.

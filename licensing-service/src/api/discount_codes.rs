@@ -47,6 +47,12 @@ pub struct CreateDiscountCodeReq {
     pub referrer_label: Option<String>,
     #[serde(default)]
     pub description: String,
+    /// Mark this as a "launch special" — publicly displayed on the buy
+    /// page with a diagonal LAUNCH SPECIAL ribbon + original price
+    /// struck through. Auto-applies for buyers who don't type any
+    /// code. Operator-typed codes still win when the buyer pastes one.
+    #[serde(default)]
+    pub featured: bool,
 }
 
 pub async fn create(
@@ -117,6 +123,7 @@ pub async fn create(
         policy_id.as_deref(),
         req.referrer_label.as_deref(),
         &req.description,
+        req.featured,
     )
     .await?;
 
@@ -197,6 +204,10 @@ pub struct UpdateDiscountCodeReq {
     pub description: Option<String>,
     #[serde(default, deserialize_with = "deser_double_option", skip_serializing_if = "Option::is_none")]
     pub referrer_label: Option<Option<String>>,
+    /// Toggle the launch-special public-display flag. `Some(true)` to
+    /// promote, `Some(false)` to demote, omit to leave alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub featured: Option<bool>,
 }
 
 /// Helper for `Option<Option<T>>` with serde — distinguishes "not present in
@@ -227,6 +238,7 @@ pub async fn update(
         req.expires_at.as_ref().map(|opt| opt.as_deref()),
         req.description.as_deref(),
         req.referrer_label.as_ref().map(|opt| opt.as_deref()),
+        req.featured,
     )
     .await?;
 

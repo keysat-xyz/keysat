@@ -58,6 +58,20 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:16 — **Launch-special discount codes + marketing bullets + discount codes per-product UI.** Operators can now run public promotional discounts that auto-apply on the buy page, plus author marketing-copy bullets on tiers that don\'t map to real entitlements.',
+  '',
+  '**Launch-special (featured) discount codes (migration 0017).** Flag a discount code as `featured` and three things happen automatically: (1) the buy page renders a diagonal "LAUNCH SPECIAL" gold ribbon on every tier the code applies to; (2) the original price is struck through and replaced with the discounted price; (3) the purchase endpoint auto-applies the discount for buyers who don\'t type any code. Operator-typed codes still win — a buyer who pastes a different code in the form gets that code instead. When a featured code exhausts its `max_uses` cap (e.g. "first 100 buyers"), the ribbon disappears automatically and pricing reverts to standard. Expiry dates work the same way. New repo helper `find_applicable_featured_discount` picks the most specific match (policy > product > global) with operator priority by created_at.',
+  '',
+  '**Marketing bullets on policies.** Tier cards can now carry operator-controlled marketing copy in addition to the technical entitlements. Authored via a textarea on the policy create + edit forms (one bullet per line), stored as `metadata.marketing_bullets` on the policy, and rendered as ✓ checkmarks ABOVE the entitlement bullets on both the admin grid and the buy page. Use for things like "Up to 5 products" or "BTCPay integration" — features that are real but don\'t gate on a daemon-level entitlement. SDK consumers also receive these via `GET /v1/products/<slug>/policies` so dynamic pricing pages can render them too.',
+  '',
+  '**"Most popular" checkbox on draft tier cards.** Previously only the Edit modal had this toggle, which meant authoring a new tier required commit-then-edit to get the gold "Most Popular" pill. Now exposed on the draft create card too, alongside the new marketing-bullets textarea. Writes `metadata.highlight = true`.',
+  '',
+  '**Discount codes admin tab — per-product organization.** Replaces the flat-table view with per-product sections matching the Licenses + Subscriptions tab pattern. Each card shows a breakdown ("3 codes · 2 active · 1 featured"). Global codes (those without `applies_to_product_id`) get their own "All products (global)" section. Single-product instances continue to see a flat table. Each code row now carries a small gold "featured" badge when applicable.',
+  '',
+  '**Test count: 87** (unchanged — UI-heavy release; the existing CORS + entitlements-catalog regression tests cover the surface).',
+  '',
+  '**Upgrade path.** v0.2.0:15 → v0.2.0:16 is a drop-in. Migration 0017 is additive (one nullable column on `discount_codes` + a partial index). All new behavior is opt-in — `featured` defaults to false on existing codes, `marketing_bullets` defaults to absent. No SDK changes; the new fields appear in JSON responses but old SDKs ignore unknown fields. Operators who don\'t use launch specials see no behavior change at all.',
+  '',
   '0.2.0:15 — **Multi-draft tier authoring + custom durations on draft cards.** Small admin-UI release that fixes two papercuts from authoring fresh policies side-by-side.',
   '',
   '**Multi-draft survival.** Previously, committing one draft tier (clicking Create on a side-by-side draft card) reloaded the whole Policies tab — which wiped any other drafts the operator had open. Now the commit replaces ONLY that draft\'s grid slot with a finalized tier card; sibling drafts keep their in-progress input state untouched. Author Creator, Pro, Patron in parallel and click Create on each as it\'s ready, in any order.',
@@ -300,7 +314,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:15',
+  version: '0.2.0:16',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

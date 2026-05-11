@@ -324,6 +324,13 @@ pub struct DiscountCode {
     pub referrer_label: Option<String>,
     pub description: String,
     pub active: bool,
+    /// When `true`, the buy page renders this code as a public "launch
+    /// special" — striking the original price, showing the discounted
+    /// price, with a "LAUNCH SPECIAL" diagonal ribbon. The purchase
+    /// endpoint auto-applies it for buyers who don't type any code.
+    /// Operator-typed codes still win if the buyer manually enters one.
+    #[serde(default)]
+    pub featured: bool,
     pub created_at: String,
     pub updated_at: String,
 }
