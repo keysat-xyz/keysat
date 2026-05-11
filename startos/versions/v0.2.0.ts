@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:34 — **Buy page: featured discount pre-populates the code field and shows "Launch special applied" on load.** Previously the launch-special discount auto-applied silently at payment time but the discount-code input was empty, leaving buyers unsure whether they needed to type anything. Now: when a tier has an active featured code, the input renders pre-filled with the code (e.g. `LAUNCH`) and the green "Launch special applied" status badge shows on load. The price card has always rendered the slashed-original + discounted-current price; this change just makes the form match. Tier switches clear an auto-populated code so a code that doesn\'t apply to the new tier doesn\'t linger; buyer-typed codes are untouched. UI / JS only; no API or schema change.',
+  '',
   '0.2.0:33 — **Drop a long-standing unused-variable warning.** Removed `let invoice_id_safe = html_escape(&invoice_id);` in `src/api/mod.rs` — the value was computed but never referenced anywhere in the thank-you-page template (the HTML uses `invoice_id_json` for the inline JS, and the on-screen invoice id renders from JS via that JSON variable). One-line cleanup; `cargo check` is now warning-free. No behavior change.',
   '',
   '0.2.0:32 — **Per-product policy cap also pre-checked + grandfathered.** Extends the v0.2.0:31 cap-handling pattern to the third tier-enforced surface (Creator caps each product at 5 policies). Same shape, just scoped to a single product instead of the whole instance.',
@@ -491,7 +493,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:33',
+  version: '0.2.0:34',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

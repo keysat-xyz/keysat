@@ -685,6 +685,12 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   // declaration below the call hits the temporal-dead-zone error and kills
   // every event handler on the page (including the form submit).
   let appliedCode = null; // {{ code, kind, is_free, final_price_sats }}
+  // `true` when the currently-applied code was auto-populated from a
+  // tier's featured (launch-special) discount, vs. typed by the buyer
+  // and confirmed via the Apply button. Tracked separately so that
+  // tier switches can clear the auto-populated value from the input
+  // without wiping a code the buyer deliberately typed.
+  let autoAppliedFeatured = false;
 
   function fmtSats(n) {{ return Number(n).toLocaleString('en-US'); }}
 
@@ -734,10 +740,19 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     }});
     // Reset any active discount apply state — a different tier may not
     // honor the same code (server validates again on the next Apply).
+    // If the previously-applied code was auto-populated (a featured
+    // discount on the prior tier), also clear it from the input so we
+    // don't carry stale auto-text into a tier that doesn't honor it.
+    // Buyer-typed codes are NOT cleared from the input — they may be
+    // valid for the new tier and the buyer can hit Apply to check.
     if (appliedCode) {{
       appliedCode = null;
       setStatus(null);
       setPaidButton();
+      if (autoAppliedFeatured) {{
+        codeInput.value = '';
+        autoAppliedFeatured = false;
+      }}
     }}
     // Reflect new base price in the cert card. For fiat-priced
     // products the unit cell ("sats" → "USD" / "EUR") also swaps.
@@ -754,6 +769,20 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       priceStrike.style.display = 'block';
       priceTag.textContent = t.featured.label;
       priceTag.style.display = 'inline-block';
+      // Pre-populate the discount input + flip into the "applied"
+      // state so the buyer sees what's been applied without having
+      // to type it. Marked `autoAppliedFeatured = true` so the
+      // selectTier reset above will clear the input on tier switch
+      // (in case the new tier doesn't honor a featured code).
+      codeInput.value = t.featured.code;
+      appliedCode = {{
+        code: t.featured.code,
+        kind: t.featured.kind,
+        is_free: (t.featured.kind === 'free_license' || t.featured.discounted_price_sats === 0),
+        final_price_sats: t.featured.discounted_price_sats,
+      }};
+      autoAppliedFeatured = true;
+      setStatus('ok', 'Launch special applied.');
     }} else {{
       priceStrike.style.display = 'none';
       priceTag.style.display = 'none';
@@ -851,7 +880,11 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   }}
 
   // Reset apply state if the buyer edits the code after a successful Apply.
+  // Any keystroke also strips the "auto-populated" flag — once the buyer
+  // touches the input, the value is theirs (not ours to clear on a tier
+  // switch).
   codeInput.addEventListener('input', function() {{
+    autoAppliedFeatured = false;
     if (appliedCode && codeInput.value.trim().toUpperCase() !== appliedCode.code.toUpperCase()) {{
       appliedCode = null;
       resetPrice();
@@ -894,6 +927,9 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
         is_free: !!j.is_free,
         final_price_sats: j.final_price_sats,
       }};
+      // Buyer typed + clicked Apply — this code is theirs, not ours
+      // to clear on a tier switch.
+      autoAppliedFeatured = false;
       // Update price card
       if (j.kind === 'free_license' || j.final_price_sats === 0) {{
         priceStrike.textContent = fmtNum(j.base_price_sats) + ' sats';
