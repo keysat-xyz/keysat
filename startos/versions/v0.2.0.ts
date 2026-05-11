@@ -58,6 +58,25 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:31 — **Four-item punchlist landed: cap-hit pre-check, grandfather banner, webhooks empty state, help-icon overhaul.** Clears the remaining outstanding admin-UI items.',
+  '',
+  '**Cap-hit pre-check (item #7).** Operators no longer have to submit-and-bounce off a 402 to learn they\'re about to hit a tier cap. The Products page and the Discount Codes page each call `/v1/admin/tier` on render and surface a gold-bordered "Approaching cap" warning inline above the create-form submit button whenever usage is at cap-1 (e.g. 4/5 products on Creator). The warning includes a direct upgrade link. The existing 402 → upgrade modal still fires if the operator goes ahead and submits.',
+  '',
+  '**Grandfather banner (item #6).** When the operator downgrades a tier and ends up with more existing rows than the new tier\'s cap allows (e.g. 8 products under Creator\'s 5-product cap), the relevant page now renders a persistent grandfather banner at the top: "Grandfathered: 8 products active vs Creator tier cap of 5. Existing products keep working. Creating new ones is blocked until you upgrade to Pro." The daemon\'s enforcement was already correct — it only blocks NEW writes, never deletes existing — but the UI was silent about it, leaving operators confused about why creates failed. Banner appears on Products + Discount Codes pages (the two surfaces with global tier caps). Per-product policy caps not yet pre-checked; that\'s a follow-up polish.',
+  '',
+  '**Webhooks empty state (item #10/15).** Previously the Webhooks tab rendered a bare "No webhooks registered." empty table on a fresh instance — no CTA, no context. Now there\'s a centered card with eyebrow + headline ("Get notified when something happens"), a 2-sentence "what\'s a webhook for?" explainer covering common use cases (license issued, code redeemed, invoice settled, fulfillment automation), and a primary "Add your first webhook" button that opens the create disclosure and focuses the URL input. Mirrors the Machines tab\'s empty state for visual consistency.',
+  '',
+  '**Help-icon click-to-toggle (item #13).** The "?" tooltips peppered through the admin UI previously used the browser\'s native `title=` attribute — hover-only, browser-styled, no keyboard access, accidentally triggered on grazes. Refactored to a small outlined `<button>` that opens a navy-styled popover anchored next to itself on click. Click outside / press Esc / click the icon again closes it. Focus + Enter / Space opens. Visually less prominent (smaller, outlined cream vs the previous filled grey). One JS function (`helpIcon`) — used everywhere — so the change ripples across every help affordance.',
+  '',
+  '**New helpers.** Three new JS helpers used by the changes above (and available for future surfaces):',
+  '- `loadTierStatus({ forceRefresh })` — fetches `/v1/admin/tier`, returns a cached promise within a single route render.',
+  '- `capPreCheckCard(tierStatus, key, label)` — inline warning when usage is at cap-1 or over.',
+  '- `grandfatherBanner(tierStatus, key, label)` — persistent banner when usage strictly exceeds cap.',
+  '',
+  '**Test count: 87** (unchanged — pure UI / CSS).',
+  '',
+  '**Upgrade path.** v0.2.0:30 → v0.2.0:31 is a drop-in. No schema, no SDK breaking change. The `/v1/admin/tier` endpoint already existed; this release just consumes it on more surfaces.',
+  '',
   '0.2.0:30 — **Two small copy fixes.** "Embed your public key" tip now says "your product\'s source code" (not "your app\'s source") — clearer for operators distributing libraries, services, or anything that isn\'t literally an app. And the Licenses search row drops the Nostr npub mention from the placeholder, the description, and the search-field dropdown, since the purchase flow doesn\'t capture buyer npubs yet so the option has nothing to find. The npub search code-path on the backend stays — we\'ll bring the UI option back when buyer npub capture lands in the purchase flow.',
   '',
   '0.2.0:29 — **Tier-card cross-card horizontal alignment via CSS subgrid.** Visually equivalent sections (names, prices, first feature bullet, Select button) now line up horizontally across all visible tier cards. Cards with fewer / shorter sections get extra whitespace in the rows they don\'t fill — the explicit tradeoff the operator asked for, in service of a cleaner grid.',
@@ -458,7 +477,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:30',
+  version: '0.2.0:31',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
