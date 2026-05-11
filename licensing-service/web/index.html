@@ -4513,12 +4513,40 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     let products = []                  // for product-name lookup + grouping
     let allLicenses = []               // last fetched set
     let currentProductFilter = ''      // empty = all products
+    let hideRevoked = false            // toggle: hide revoked rows from table (stats unaffected)
     let lastQuery = ''
     let lastQueryField = 'email'
 
     const productPillRow = el('div', {
-      style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0',
+      style: 'display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 4px',
     })
+    // Status-filter row: a single "Hide revoked" toggle for now. Stats
+    // cards below still show the revoked count so operators don't lose
+    // visibility — this only filters which rows render in the table.
+    const statusFilterRow = el('div', {
+      style: 'display:flex; gap:8px; flex-wrap:wrap; margin:0 0 14px; ' +
+        'font-size:12px; color:var(--ink-500);',
+    })
+    const hideRevokedBtn = el('button', {
+      type: 'button',
+      style: 'font-size:12px; padding:4px 12px; border-radius:999px; cursor:pointer; ' +
+        'font-family:var(--font-body); font-weight:500; transition:all 100ms; ' +
+        'background:transparent; color:var(--ink-700); border:1px solid var(--border-2);',
+    }, 'Hide revoked')
+    hideRevokedBtn.addEventListener('click', () => {
+      hideRevoked = !hideRevoked
+      if (hideRevoked) {
+        hideRevokedBtn.style.background = 'var(--navy-800)'
+        hideRevokedBtn.style.color = 'var(--cream-50)'
+        hideRevokedBtn.style.borderColor = 'var(--navy-800)'
+      } else {
+        hideRevokedBtn.style.background = 'transparent'
+        hideRevokedBtn.style.color = 'var(--ink-700)'
+        hideRevokedBtn.style.borderColor = 'var(--border-2)'
+      }
+      render()
+    })
+    statusFilterRow.appendChild(hideRevokedBtn)
     const statsRow = el('div', { class: 'stats', style: 'margin:0 0 14px' })
     const tableHolder = el('div')
 
@@ -4717,6 +4745,11 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       tableHolder.innerHTML = ''
       let scoped = allLicenses
       if (currentProductFilter) scoped = scoped.filter((l) => l.product_id === currentProductFilter)
+      // Hide-revoked toggle: applied to TABLE rows only. Stats below
+      // still show the full revoked count from `scoped` (renderStats
+      // ignores hideRevoked deliberately so the operator never loses
+      // visibility into how many revoked licenses exist).
+      if (hideRevoked) scoped = scoped.filter((l) => l.status !== 'revoked')
 
       // Single-product or product-filtered: flat table.
       const inSearchMode = lastQuery.length > 0
@@ -4964,6 +4997,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       issueDisclosure,
     ]))
     target.appendChild(productPillRow)
+    target.appendChild(statusFilterRow)
     target.appendChild(statsRow)
     target.appendChild(tableHolder)
     buildIssueForm()
@@ -5442,12 +5476,8 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   routes.settings = async function () {
     const target = document.getElementById('route-target')
     target.innerHTML = ''
-    target.appendChild(plainCard([
-      el('p', { class: 'muted', style: 'margin:0' },
-        'Operator-facing configuration. Display name, payment provider connections, and scoped API keys for agent / automation access.'),
-    ]))
 
-    const opNameHost = el('div', { style: 'margin-top:18px' })
+    const opNameHost = el('div')
     target.appendChild(opNameHost)
     renderOperatorNameCard(opNameHost)
 
@@ -5464,7 +5494,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     host.innerHTML = ''
     let stored = '', effective = '', fallbackEnv = ''
     try {
-      const r = await api('/v1/admin/operator-name').catch(() => null)
+      const r = await api('/v1/admin/settings/operator-name').catch(() => null)
       if (r) {
         stored = r.stored || ''
         effective = r.effective || ''
@@ -5483,7 +5513,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       saveBtn.disabled = true
       status.textContent = 'Saving…'
       try {
-        await api('/v1/admin/operator-name', {
+        await api('/v1/admin/settings/operator-name', {
           method: 'POST',
           body: { name: input.value.trim() },
         })

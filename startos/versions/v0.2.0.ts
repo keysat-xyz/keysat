@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:28 — **Settings cleanup, operator-name save fix, Licenses "Hide revoked" toggle.** Three small admin-UI changes.',
+  '',
+  '**Settings page intro card removed.** The "Operator-facing configuration. Display name, payment provider connections, …" preamble at the top of the Settings page was redundant with the page title + the section headers below; dropping it tightens the layout and gets the operator straight to the controls.',
+  '',
+  '**Operator name save no longer 404s.** The admin UI was POSTing to `/v1/admin/operator-name`, but the daemon mounts the endpoint at `/v1/admin/settings/operator-name`. Mismatch fixed in the JS — both GET (page load) and POST (save) now hit the correct path. The route on the daemon side was already correct; this was a UI typo from the original wiring.',
+  '',
+  '**Licenses page: "Hide revoked" toggle.** A pill toggle sits between the product filter row and the stat cards. Off (default) = table shows every license. On = table filters out `status = "revoked"` rows so operators reviewing active state aren\'t scrolling past revoked entries. The Revoked stat card stays accurate either way — the toggle only affects rendered rows, never the stat counts. Per-product grouping, search, and product-filter pills all still work alongside it.',
+  '',
+  '**Test count: 87** (unchanged — UI-only release).',
+  '',
+  '**Upgrade path.** v0.2.0:27 → v0.2.0:28 is a drop-in. No data, schema, or API change. Existing operator-name settings in the DB are untouched.',
+  '',
   '0.2.0:27 — **Tier-card feature list merged into a single ul; "MOST POPULAR" + "Limited: …" no longer collide.** Two remaining buy-page nits from :26.',
   '',
   '**Single feature list.** The :26 attempt at zeroing the gap between adjacent `<ul.tier-bullets>` and `<ul.tier-entitlements>` worked on paper but the boundary was still visible to the eye — probably from list-item bottom-padding accumulating around the ul switch. Solved structurally: the daemon now builds ONE `<ul class="tier-features">` server-side, concatenating marketing bullets and entitlements in the operator-controlled order. No list boundary = no gap to fight with CSS. Both groups render with the same ✓ checkmark, indistinguishable to the buyer.',
@@ -430,7 +442,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:27',
+  version: '0.2.0:28',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
