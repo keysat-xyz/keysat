@@ -323,6 +323,17 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   .content { padding:20px; }
   .topbar { padding:14px 20px; }
 }
+
+/* Tier-card drag affordance — cursor signals draggability on hover,
+   the dragging card visibly lifts, and the drop-target receives a
+   subtle outline so the operator sees where the card will land. */
+.tier-card[draggable="true"]:hover { cursor: grab; }
+.tier-card[draggable="true"]:active { cursor: grabbing; }
+.tier-card.dragging {
+  opacity: 0.45;
+  transform: scale(0.98);
+  transition: transform 100ms;
+}
 </style>
 </head>
 <body>
@@ -1986,7 +1997,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const tierRankField = formInput('e_pol_tier_rank', 'Tier ladder rank (optional)', {
       type: 'number',
       value: pol.tier_rank == null ? '' : String(pol.tier_rank),
-      hint: 'Higher = better tier. Leave blank to keep this policy out of the buyer-facing upgrade ladder.',
+      hint: 'Set by dragging tier cards in the grid. Override here only if you want a specific rank, or blank to remove this policy from the buyer-facing upgrade ladder entirely.',
     })
     if (isRecurringInit) setTimeout(() => {
       const cb = card.querySelector('[name=e_pol_is_recurring]')
@@ -2652,10 +2663,31 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         'gap:14px; margin-top:12px;',
     })
 
-    policies.forEach((pol) => {
+    // Sort by tier_rank ascending so the visual order matches the
+    // ladder. NULL/missing rank floats to the end — operator can drag
+    // it into place later, at which point the drop handler assigns
+    // ranks based on position.
+    const sorted = [...policies].sort((a, b) => {
+      const ar = a.tier_rank == null ? Infinity : a.tier_rank
+      const br = b.tier_rank == null ? Infinity : b.tier_rank
+      if (ar !== br) return ar - br
+      // Stable tiebreak: by created_at so the order doesn't jitter
+      // between renders when multiple tiers share a rank.
+      return (a.created_at || '').localeCompare(b.created_at || '')
+    })
+
+    sorted.forEach((pol) => {
       // Annotate with license count for the card footer.
       pol._license_count = byPolicyCounts[pol.id] || 0
-      grid.appendChild(renderTierCard(pol, product, onMutate))
+      const card = renderTierCard(pol, product, onMutate)
+      // Wire drag-and-drop reordering. Archived tiers are excluded
+      // — their position in the ladder is moot and dragging them
+      // would just create noise.
+      if (!pol.archived_at) {
+        card.draggable = true
+        card.dataset.policyId = pol.id
+      }
+      grid.appendChild(card)
     })
 
     // Add-tier card. On click, the placeholder transforms into a
@@ -2676,7 +2708,78 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       return placeholder
     }
     grid.appendChild(makePlaceholder())
+
+    wireTierGridDragAndDrop(grid, onMutate)
     return grid
+  }
+
+  /**
+   * Drag-and-drop reordering for the tier-card grid. Operator drags
+   * any tier card to a new position; on drop we recompute tier_rank
+   * based on each card's new index and PATCH the affected policies
+   * in parallel. Archived tiers aren't draggable (no `draggable`
+   * attribute) and the "+ Add tier" placeholder is naturally skipped
+   * by the `.tier-card[data-policy-id]` selector.
+   */
+  function wireTierGridDragAndDrop(grid, onMutate) {
+    grid.addEventListener('dragstart', (e) => {
+      const card = e.target.closest('.tier-card[data-policy-id]')
+      if (!card) return
+      card.classList.add('dragging')
+      card.style.opacity = '0.45'
+      e.dataTransfer.effectAllowed = 'move'
+      // Some browsers require setData to enable drag.
+      try { e.dataTransfer.setData('text/plain', card.dataset.policyId) } catch (_) {}
+    })
+
+    grid.addEventListener('dragend', (e) => {
+      const card = e.target.closest('.tier-card[data-policy-id]')
+      if (card) {
+        card.classList.remove('dragging')
+        card.style.opacity = ''
+      }
+    })
+
+    grid.addEventListener('dragover', (e) => {
+      const dragging = grid.querySelector('.tier-card.dragging')
+      if (!dragging) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'move'
+      // Insertion target: nearest tier card under the cursor.
+      const target = e.target.closest('.tier-card[data-policy-id]')
+      if (!target || target === dragging) return
+      const rect = target.getBoundingClientRect()
+      // Within a row of cards, compare X to the target's horizontal
+      // midpoint to decide "before" or "after". For multi-row grids
+      // this still feels natural because dragging across rows moves
+      // through cards one-by-one.
+      const after = e.clientX > rect.left + rect.width / 2
+      grid.insertBefore(dragging, after ? target.nextSibling : target)
+    })
+
+    grid.addEventListener('drop', async (e) => {
+      e.preventDefault()
+      const cards = Array.from(grid.querySelectorAll('.tier-card[data-policy-id]'))
+      // Reassign ranks 1..N based on new DOM order.
+      const updates = cards.map((c, i) => ({
+        id: c.dataset.policyId,
+        tier_rank: i + 1,
+      }))
+      try {
+        await Promise.all(updates.map((u) =>
+          api('/v1/admin/policies/' + u.id, {
+            method: 'PATCH',
+            body: { tier_rank: u.tier_rank },
+          })
+        ))
+        // Reload from server so what's displayed matches what's
+        // persisted (also resolves any race with concurrent edits).
+        onMutate && onMutate()
+      } catch (err) {
+        alert('Failed to save new tier order: ' + (err.message || err))
+        onMutate && onMutate()
+      }
+    })
   }
 
   // -------- Policies --------
@@ -3067,7 +3170,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     target.appendChild(plainCard([
       el('div', { style: 'display:flex; align-items:center; gap:14px; flex-wrap:wrap' }, [
         el('p', { class: 'muted', style: 'margin:0; flex:1; min-width:280px' },
-          'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance. Click the dashed "+ Add tier" card under any product to author a new policy in place.'),
+          'Reusable license templates per product. The policy slugged "default" is consumed by the public purchase flow; other slugs are used by manual license issuance. Click the dashed "+ Add tier" card to author a new policy. Drag tier cards left/right to reorder — the ladder rank used by tier-upgrade flow follows the visual order.'),
         el('label', {
           for: 'showArchivedPolicies',
           style: 'font-size:12.5px; color:var(--ink-700); white-space:nowrap; cursor:pointer',
@@ -3136,7 +3239,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         // multi-tier authoring.
         const productCard = el('div', { class: 'card' }, [
           el('div', { class: 'card-head' }, [
-            el('h3', null, p.name + ' — ' + p.slug),
+            el('h3', null, p.name),
             el('span', { class: 'sub' },
               policies.length + ' polic' + (policies.length === 1 ? 'y' : 'ies')),
             previewBtn ? el('span', { style: 'margin-left:auto' }, previewBtn) : null,
@@ -5111,9 +5214,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
           'data-field': 'name',
         }),
         el('input', {
-          class: 'input', placeholder: 'Description (shown on buy page tooltip)',
+          class: 'input', placeholder: 'Description (buyer tooltip)',
           value: description || '',
           'data-field': 'description',
+          title: 'Description shown as a hover tooltip on the buy page',
         }),
         (() => {
           const btn = el('button', {
@@ -5241,6 +5345,30 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       if (window.lucide) lucide.createIcons()
     })
     history.replaceState(null, '', '#' + name)
+    // Auto-refresh self-tier from the DB on every route change so the
+    // sidebar banner reflects admin changes (revoke / tier change /
+    // unsuspend) without waiting for the hourly background sweep or
+    // a daemon restart. Fire-and-forget — the route already rendered
+    // with the previously-known tier; this re-renders the banner once
+    // the refresh comes back. Errors swallowed; if the refresh fails
+    // the banner just keeps its existing state until next nav.
+    selfTierRefreshDebounced()
+  }
+
+  // Per-nav self-tier refresh, lightly debounced (max one in-flight
+  // request at a time) so a fast-clicking operator doesn't hammer
+  // /v1/admin/self-license/refresh.
+  let _selfTierRefreshInflight = false
+  async function selfTierRefreshDebounced() {
+    if (_selfTierRefreshInflight) return
+    _selfTierRefreshInflight = true
+    try {
+      await api('/v1/admin/self-license/refresh', { method: 'POST' })
+    } catch (_) { /* network / endpoint hiccup — banner keeps prior state */ }
+    finally {
+      _selfTierRefreshInflight = false
+      refreshTierBanner()
+    }
   }
   document.querySelectorAll('.sidebar a.nav').forEach((a) => {
     a.addEventListener('click', (e) => { e.preventDefault(); setRoute(a.getAttribute('data-route')) })

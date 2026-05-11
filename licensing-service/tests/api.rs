@@ -3104,3 +3104,64 @@ async fn cors_preflight_returns_2xx_without_auth() {
     assert_eq!(acao, "*");
 }
 
+/// Regression: `entitlements_catalog_json` was missing from every
+/// product SELECT for ~a release, so admin UI edits appeared to drop
+/// on the floor — the column was being written correctly but never
+/// read back. This test creates a product, sets a catalog, reads it
+/// back through the same code path the admin UI hits.
+#[tokio::test]
+async fn product_entitlements_catalog_round_trips_through_list_endpoint() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Create a product
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({
+            "slug": "catalog-rt",
+            "name": "Catalog round-trip",
+            "description": "",
+            "price_currency": "SAT",
+            "price_value": 1000,
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "product create");
+    let created = body_json(resp).await;
+    let product_id = created["id"].as_str().expect("id").to_string();
+
+    // PATCH the catalog
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/products/{}", product_id),
+        &[("authorization", &auth)],
+        Some(json!({
+            "entitlements_catalog": [
+                {"slug": "self_host", "name": "Self-host on Start9", "description": "Run on your own hardware."},
+                {"slug": "unlimited_products", "name": "Unlimited products", "description": "No 5-product cap."}
+            ]
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "product patch with catalog");
+
+    // Now read it back via /v1/products (same endpoint the admin UI uses)
+    let req = build_request("GET", "/v1/products", &[], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let products = body["products"].as_array().expect("products array");
+    let found = products
+        .iter()
+        .find(|p| p["id"] == product_id)
+        .expect("product visible in list");
+    let catalog = found["entitlements_catalog"]
+        .as_array()
+        .expect("entitlements_catalog should be an array, not null");
+    assert_eq!(catalog.len(), 2, "both catalog entries should round-trip");
+    assert_eq!(catalog[0]["slug"], "self_host");
+    assert_eq!(catalog[1]["slug"], "unlimited_products");
+}
+

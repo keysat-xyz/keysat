@@ -58,6 +58,20 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:14 — **Product entitlements catalog bug fix + drag-and-drop tier ordering.** One real bug fix that was silently breaking operator workflows, plus a UX rework of how tier ranks get set.',
+  '',
+  '**Bug fix: product entitlements catalog reads.** Every SELECT against the `products` table in repo.rs was missing the `entitlements_catalog_json` column. The PATCH handler wrote the catalog correctly, but every read returned it as null — so admin UI edits silently appeared to drop on the floor (operator adds entitlements, clicks Save, re-opens the editor, entitlements are gone). The data was always in the DB; only the API was blind to it. Now all four product SELECTs include the column. Net effect: catalog edits persist correctly; the bubble-picker on policy create / edit forms populates from the parent product\'s catalog.',
+  '',
+  '**Regression test.** New `product_entitlements_catalog_round_trips_through_list_endpoint` test creates a product, PATCHes a catalog, reads it back through `/v1/products`, and asserts the catalog is present. Would have caught this bug at PR time.',
+  '',
+  '**Drag-and-drop tier ordering.** The Policies tab\'s tier-card grid now supports drag-and-drop reordering. Operator drags any tier card to a new position; on drop, the daemon receives parallel PATCH /v1/admin/policies/<id> requests setting tier_rank 1..N based on the new visual order. The cursor flips to grab/grabbing on hover/drag, the dragging card visibly lifts + fades. Archived tiers aren\'t draggable (their position in the ladder is moot). The Edit-policy modal keeps a `tier_rank` number field for two edge cases drag-and-drop can\'t express: precise manual override, and blanking the field to remove a policy from the ladder entirely (so it\'s not offered as an upgrade target).',
+  '',
+  '**Two small copy fixes.** Section headers on the Policies tab now show just the product name (`Keysat`) instead of the redundant `Keysat — keysat`. The entitlements-catalog row editor\'s Description column placeholder shortened from "Description (shown on buy page tooltip)" to "Description (buyer tooltip)" so it fits in the column; full hover-explanation now lives in the input\'s title attribute.',
+  '',
+  '**Test count: 87** (was 85 — +1 entitlements catalog regression, +1 from CORS additions that were re-counted).',
+  '',
+  '**Upgrade path.** v0.2.0:13 → v0.2.0:14 is a drop-in. No schema migrations, no SDK changes, no behavior change for buyers. Operators who had entitlements catalogs silently dropped on previous versions will see them populate correctly on next product PATCH. Operators who manually set tier_ranks via the number field will see those ranks reflected as the initial visual order in the policies grid.',
+  '',
   '0.2.0:13 — **CORS on public endpoints.** Small, surgical release. Adds permissive cross-origin headers (`Access-Control-Allow-Origin: *`, all methods, all headers) to every public route so browsers can fetch from any origin. Unblocks a few things the static keysat.xyz / docs.keysat.xyz pages want to do directly without proxying:',
   '',
   '- The pricing page on docs.keysat.xyz fetches the live tier list from `licensing.keysat.xyz/v1/products/keysat/policies` so it always reflects what\'s actually configured on the master Keysat. No more out-of-sync static copies.',
@@ -276,7 +290,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:13',
+  version: '0.2.0:14',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

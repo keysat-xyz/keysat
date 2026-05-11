@@ -14,10 +14,10 @@ use uuid::Uuid;
 
 pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Vec<Product>> {
     let q = if only_active {
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
          FROM products WHERE active = 1 ORDER BY name"
     } else {
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
          FROM products ORDER BY name"
     };
     let rows = sqlx::query(q).fetch_all(pool).await?;
@@ -26,7 +26,7 @@ pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Ve
 
 pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Option<Product>> {
     let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
          FROM products WHERE slug = ?",
     )
     .bind(slug)
@@ -37,7 +37,7 @@ pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Opt
 
 pub async fn get_product_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Product>> {
     let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
          FROM products WHERE id = ?",
     )
     .bind(id)
