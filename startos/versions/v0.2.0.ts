@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:23 — **Three buy-page fixes: layout proportions, featured discount on default tier, marketing-bullet gap.** Surfaced by feedback after the wider buy page rolled out in :21.',
+  '',
+  '**Headline + price card no longer look pinched.** The :21 release widened the outer container to 1040px to give the 3-tier picker room, but kept the headline ("Keysat", description) and the bottom price card constrained at 560px — which made them look dwarfed against the wider tier picker. Now: headline elements + the price card span the full container width with center-aligned text. The Email / Discount code / Pay-with-Bitcoin form stays narrower (560px) since input fields look stretched at 1040px. Net effect: the page reads as one cohesive width top to bottom.',
+  '',
+  '**Featured discount auto-applies on the headline price.** Previously the tier card showed "100,000 sats slashed → 40,000 sats/yr" via a server-rendered ribbon, but the price card below ("PRICE · PRO") rendered the un-discounted 100,000 sats until the buyer typed the code in by hand — even though the discount is featured (auto-applies). Fixed: the tier JSON now carries each tier\'s featured-discount snapshot, and `selectTier()` renders the strike-through + discounted price headline whenever a tier has an active featured code. Tier switching also re-applies the featured code for the new tier instead of clearing the strike-through.',
+  '',
+  '**Marketing-bullets gap when positioned below.** When `metadata.marketing_bullets_position = "below"` (added in :19), the entitlements list and the marketing-bullets list rendered as two `<ul>`s with default spacing between them — visible as a ~10px gap on the tier card. Symmetrical CSS rule `.tier-entitlements + .tier-bullets { margin-top:2px }` fixes it; the two lists now read as one coherent feature ladder regardless of order.',
+  '',
+  '**Test count: 87** (unchanged).',
+  '',
+  '**Upgrade path.** v0.2.0:22 → v0.2.0:23 is a drop-in. No schema, no SDK change. Public buy-page CSS + JS only.',
+  '',
   '0.2.0:22 — **Policy scope is now editable on existing discount codes.** Previously, the Edit form showed scope as a read-only "Applies to:" label and forced operators to disable + recreate any code whose tier scope needed adjusting. That rule existed to "avoid silently invalidating distributed links" — but the same argument applies to `amount`, `max_uses`, and `expires_at`, all of which are already editable. Inconsistent. So: policy scope joins them.',
   '',
   '**Edit form: pill multi-picker for policy scope.** The Edit modal now renders the same gold-on-navy pill picker as Create, pre-selected with the code\'s current allowed-policy set. Toggle pills to refine: 0 picked → "any policy on this product"; 1 picked → singular scope (writes the legacy column); 2+ picked → multi-policy scope (writes the JSON column).',
@@ -376,7 +388,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:22',
+  version: '0.2.0:23',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

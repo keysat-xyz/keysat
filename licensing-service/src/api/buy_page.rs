@@ -143,9 +143,12 @@ pub async fn render(
         &product,
         &featured_by_policy,
     );
-    // Compact JSON map of {policy_slug: {price, name}} so the JS can update
-    // the price card when the buyer clicks a different tier.
-    let tiers_json = build_tiers_json(&public_policies, &product);
+    // Compact JSON map of {policy_slug: {price, name, featured?}} so the
+    // JS can update the price card when the buyer clicks a different tier.
+    // Featured info is keyed per-policy so each tier's headline price
+    // reflects an active launch-special discount automatically (matches
+    // the tier-card ribbon + slashed-price display).
+    let tiers_json = build_tiers_json(&public_policies, &product, &featured_by_policy);
 
     let body = format!(
         r#"<!doctype html>
@@ -197,21 +200,25 @@ body {{
   color:var(--ink-500);
   margin-left:auto;
 }}
-/* Outer container width — was 560px (single-column friendly), now
-   wider so the 3-tier grid below has room to breathe and matches the
-   admin Policies page layout. Inner text + form blocks are constrained
-   back to ~560px reading width by the `.wrap > :not(.tiers)` rule
-   below so only the tier grid breaks out. */
+/* Outer container width. The 3-tier picker breathes at this width and
+   matches the admin Policies page layout. Headline + price card are
+   centered text within the full width; only the form below is
+   constrained narrower for focused interaction. */
 .wrap {{ max-width:1040px; margin:48px auto; padding:0 24px; }}
-.wrap > :not(.tiers) {{ max-width:560px; margin-left:auto; margin-right:auto; }}
+/* Form stays narrow so input fields aren't oddly stretched. */
+.wrap > form {{ max-width:560px; margin-left:auto; margin-right:auto; }}
+/* Headline elements + price card text-align center at the wider width
+   so the page visually stays centered as readers scan top-to-bottom. */
+.wrap > h1, .wrap > .product-slug, .wrap > .description {{ text-align:center; }}
+.cert {{ text-align:center; }}
 .eyebrow {{
   font-size:11.5px; font-weight:700; letter-spacing:0.18em;
   text-transform:uppercase; color:var(--gold-700); margin-bottom:14px;
-  /* `flex; width:fit-content` instead of `inline-flex` so the
-     wrap-children margin:auto centering rule applies — otherwise
-     this inline element would sit flush left of the wider 1040px
-     container while its centered block-level siblings sit middle. */
+  /* `flex; width:fit-content` + explicit margin:auto so this small
+     pill sits centered like its block siblings below. (Was inline-flex,
+     which can't be centered via margin:auto.) */
   display:flex; width:fit-content; align-items:center; gap:10px;
+  margin-left:auto; margin-right:auto;
 }}
 .eyebrow::before {{ content:''; display:inline-block; width:28px; height:1px; background:var(--gold-500); }}
 h1 {{
@@ -385,9 +392,10 @@ h1 {{
   content:'✓'; position:absolute; left:0; top:3px;
   color:var(--gold-700); font-weight:700;
 }}
-/* Marketing bullets render above entitlements with a slightly tighter
-   top margin so they read as one coherent feature list. */
+/* Marketing bullets and entitlements should read as one coherent
+   feature list regardless of which one renders first. */
 .tier-bullets + .tier-entitlements {{ margin-top:2px; }}
+.tier-entitlements + .tier-bullets {{ margin-top:2px; }}
 .tier-select-btn {{
   margin-top:auto;
   padding:8px 12px;
@@ -686,8 +694,18 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
     const t = TIERS[slug];
     const fmt = formatTierPrice(t);
     currentBaseFmt = fmt.amount;
-    priceStrike.style.display = 'none';
-    priceTag.style.display = 'none';
+    // Featured discount auto-applies on the headline price (matches
+    // the tier card's ribbon + slashed-price display). The strike +
+    // tag stay hidden when there's no featured code for this tier.
+    if (t.featured) {{
+      priceStrike.textContent = fmt.amount + ' sats';
+      priceStrike.style.display = 'block';
+      priceTag.textContent = t.featured.label;
+      priceTag.style.display = 'inline-block';
+    }} else {{
+      priceStrike.style.display = 'none';
+      priceTag.style.display = 'none';
+    }}
     const unitEl = document.querySelector('.unit');
     let unitText = fmt.unit;
     if (t.is_recurring) {{
@@ -718,7 +736,11 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
       if (unitEl) unitEl.textContent = '';
       setRedeemButton();
     }} else {{
-      priceCurrent.textContent = currentBaseFmt;
+      // Paid tier. If a featured discount applies, show the discounted
+      // price as the headline (the original is struck-through above).
+      priceCurrent.textContent = t.featured
+        ? fmtSats(t.featured.discounted_price_sats)
+        : currentBaseFmt;
       setPaidButton();
     }}
   }}
@@ -1273,6 +1295,7 @@ fn render_tier_picker(
 fn build_tiers_json(
     policies: &[crate::models::Policy],
     product: &crate::models::Product,
+    featured_by_policy: &std::collections::HashMap<String, crate::models::DiscountCode>,
 ) -> String {
     // Each tier carries enough info for the JS to render its price
     // in the right unit. For SAT-currency products, `price_sats`
@@ -1292,6 +1315,30 @@ fn build_tiers_json(
         // (cents for USD/EUR). Most operators leave the override
         // unset; the inheritance path covers the common case.
         let price_value = p.price_sats_override.unwrap_or(product.price_value);
+        // Featured-discount snapshot per policy — mirrors the math in
+        // policies.rs's GET /v1/products/<slug>/policies so the JS-
+        // driven headline price below the tier picker matches what's
+        // rendered on the tier card. `label` is human-friendly ("60%
+        // off", "10,000 sats off", "FREE") so the JS doesn't need to
+        // know the kind enum.
+        let featured = featured_by_policy.get(&p.id).map(|code| {
+            let discount = crate::api::purchase::compute_discount(
+                &code.kind, code.amount, price_sats_value,
+            );
+            let final_price = (price_sats_value - discount).max(0);
+            let label = match code.kind.as_str() {
+                "percent" => format!("{}% off", (code.amount as f64 / 100.0) as i64),
+                "free_license" => "FREE".to_string(),
+                _ => format!("{} sats off", discount),
+            };
+            serde_json::json!({
+                "code": code.code,
+                "kind": code.kind,
+                "discount_applied_sats": discount,
+                "discounted_price_sats": final_price,
+                "label": label,
+            })
+        });
         map.insert(
             p.slug.clone(),
             serde_json::json!({
@@ -1302,6 +1349,7 @@ fn build_tiers_json(
                 "is_recurring": p.is_recurring,
                 "renewal_period_days": p.renewal_period_days,
                 "trial_days": p.trial_days,
+                "featured": featured,
             }),
         );
     }
