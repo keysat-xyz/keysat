@@ -2485,17 +2485,33 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       style: 'font-size:12px; align-self:center',
     }, isSat ? 'sats' : product.price_currency)
 
-    // Duration preset
+    // Duration preset + custom-days fallback for arbitrary durations.
+    // Selecting "Custom (days)" reveals a number input; on submit, the
+    // raw days value is multiplied to seconds before sending. Matches
+    // the Edit-policy modal which has the same pattern (but in raw
+    // seconds — days is friendlier for the draft create flow since
+    // common cadences are day-based).
     const DURATION_PRESETS = [
       { value: '0', label: 'Perpetual' },
       { value: '604800', label: '7 days' },
       { value: '2592000', label: '30 days' },
       { value: '7776000', label: '90 days' },
       { value: '31536000', label: '1 year' },
+      { value: 'custom', label: 'Custom (days)' },
     ]
     const durationSel = el('select', { class: 'select' })
     DURATION_PRESETS.forEach((p) => durationSel.appendChild(el('option', { value: p.value }, p.label)))
     durationSel.value = '0'
+    const customDaysInput = el('input', {
+      class: 'input', type: 'number', min: '1', value: '14',
+      placeholder: 'days',
+    })
+    const customDaysWrap = el('div', {
+      style: 'display:none; margin-top:6px',
+    }, [customDaysInput])
+    durationSel.addEventListener('change', () => {
+      customDaysWrap.style.display = durationSel.value === 'custom' ? 'block' : 'none'
+    })
 
     const maxMachinesInput = el('input', {
       class: 'input', type: 'number', min: '0', value: '1',
@@ -2552,7 +2568,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       fieldRow('Slug', 'Stable id used by SDK; auto-fills from name. Lowercase, digits, hyphens.', slugInput),
       fieldRow('Price', 'Override for this tier. Pre-filled with product base price.',
         el('div', { style: 'display:flex; gap:6px' }, [priceInput, priceUnit])),
-      fieldRow('Duration', 'How long the issued license is valid. Perpetual = no expiry.', durationSel),
+      fieldRow('Duration', 'How long the issued license is valid. Perpetual = no expiry. Pick "Custom (days)" to enter an arbitrary number.', el('div', null, [durationSel, customDaysWrap])),
       fieldRow('Max devices', '1 = single seat; 0 = unlimited; n = n-seat.', maxMachinesInput),
       fieldRow('Entitlements', cat.length > 0
         ? 'Click to toggle. Defined on the product\'s catalog.'
@@ -2592,11 +2608,14 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             btn.disabled = true
             try {
               const isRecurring = recurringCb.checked
+              const durationSeconds = durationSel.value === 'custom'
+                ? Math.max(1, parseInt(customDaysInput.value, 10) || 0) * 86400
+                : parseInt(durationSel.value, 10) || 0
               const body = {
                 product_slug: product.slug,
                 slug: slugInput.value.trim(),
                 name: nameInput.value.trim(),
-                duration_seconds: parseInt(durationSel.value, 10) || 0,
+                duration_seconds: durationSeconds,
                 grace_seconds: 0,
                 max_machines: parseInt(maxMachinesInput.value, 10),
                 is_trial: false,
@@ -2612,8 +2631,8 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
                 body.grace_period_days = 7
                 body.trial_days = parseInt(trialDaysInput.value, 10) || 0
               }
-              await api('/v1/admin/policies', { method: 'POST', body })
-              onCommit && onCommit()
+              const saved = await api('/v1/admin/policies', { method: 'POST', body })
+              onCommit && onCommit(saved)
             } catch (e) {
               if (handleTierCap(e)) {
                 status.textContent = ''
@@ -2695,11 +2714,26 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     // operator can keep clicking "+ Add tier" to author multiple
     // policies side-by-side. Named recursive function so each new
     // placeholder reuses the same handler.
+    //
+    // On commit of any draft, the saved policy is passed back and we
+    // replace ONLY that draft's slot with a finalized tier card —
+    // other drafts (if the operator is authoring multiple in
+    // parallel) keep their in-progress input state untouched. The
+    // grid does NOT reload via onMutate() on commit, because a full
+    // reload would wipe sibling drafts.
     function makePlaceholder() {
       const placeholder = renderAddTierCard(() => {
         const draft = renderDraftTierCard(
           product,
-          () => onMutate && onMutate(), // commit → reload (rebuilds grid)
+          (savedPolicy) => {
+            savedPolicy._license_count = 0
+            const newCard = renderTierCard(savedPolicy, product, onMutate)
+            if (!savedPolicy.archived_at) {
+              newCard.draggable = true
+              newCard.dataset.policyId = savedPolicy.id
+            }
+            grid.replaceChild(newCard, draft)
+          },
           () => grid.replaceChild(makePlaceholder(), draft), // cancel → swap back
         )
         grid.replaceChild(draft, placeholder)

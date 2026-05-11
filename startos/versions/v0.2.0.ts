@@ -58,6 +58,16 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:15 — **Multi-draft tier authoring + custom durations on draft cards.** Small admin-UI release that fixes two papercuts from authoring fresh policies side-by-side.',
+  '',
+  '**Multi-draft survival.** Previously, committing one draft tier (clicking Create on a side-by-side draft card) reloaded the whole Policies tab — which wiped any other drafts the operator had open. Now the commit replaces ONLY that draft\'s grid slot with a finalized tier card; sibling drafts keep their in-progress input state untouched. Author Creator, Pro, Patron in parallel and click Create on each as it\'s ready, in any order.',
+  '',
+  '**Custom duration on draft cards.** The Duration dropdown on the draft tier card now has a "Custom (days)" option at the bottom. Selecting it reveals a number input; on submit, days × 86400 seconds is what gets sent. Matches the same pattern the Edit-policy modal has had (in raw seconds) — bringing it to the create flow so operators don\'t have to "create then immediately edit" for non-standard durations.',
+  '',
+  '**Test count: 87** (UI-only release).',
+  '',
+  '**Upgrade path.** v0.2.0:14 → v0.2.0:15 is a drop-in. No schema, no SDK, no behavior change for buyers.',
+  '',
   '0.2.0:14 — **Product entitlements catalog bug fix + drag-and-drop tier ordering.** One real bug fix that was silently breaking operator workflows, plus a UX rework of how tier ranks get set.',
   '',
   '**Bug fix: product entitlements catalog reads.** Every SELECT against the `products` table in repo.rs was missing the `entitlements_catalog_json` column. The PATCH handler wrote the catalog correctly, but every read returned it as null — so admin UI edits silently appeared to drop on the floor (operator adds entitlements, clicks Save, re-opens the editor, entitlements are gone). The data was always in the DB; only the API was blind to it. Now all four product SELECTs include the column. Net effect: catalog edits persist correctly; the bubble-picker on policy create / edit forms populates from the parent product\'s catalog.',
@@ -290,7 +300,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:14',
+  version: '0.2.0:15',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
