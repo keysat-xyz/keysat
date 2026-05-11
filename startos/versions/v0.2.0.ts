@@ -58,6 +58,18 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:32 — **Per-product policy cap also pre-checked + grandfathered.** Extends the v0.2.0:31 cap-handling pattern to the third tier-enforced surface (Creator caps each product at 5 policies). Same shape, just scoped to a single product instead of the whole instance.',
+  '',
+  '**Pre-check.** When the operator clicks "+ Add tier" on a product that already has 4 of 5 policies, the draft tier card opens with a gold-bordered "Approaching cap" warning at the top: "You\'re at 4/5 policies on this product. Creating one more will hit your Creator tier cap." Includes a direct upgrade link. The existing 402 → upgrade modal still fires if the operator pushes through.',
+  '',
+  '**Grandfather.** When a single product carries more policies than the current tier\'s per-product cap (e.g. operator on Pro authored 7 policies, then downgraded to Creator), that product\'s card now renders a persistent grandfather banner above its tier grid: "Grandfathered: 7 policies on this product active vs Creator tier cap of 5. Existing policies keep working. Creating new ones is blocked until you upgrade to Pro." The banner appears per-product (not page-wide) since the cap is per-product. Other products on the same instance show their own state independently.',
+  '',
+  '**Implementation note.** Reuses the v0.2.0:31 helpers (`capPreCheckCard`, `grandfatherBanner`) by synthesizing a `tierStatus` shape with `caps.policies` mapped to the per-product cap — no new component code needed, just an extra parameter threaded through `renderPolicyCardGrid` → `renderDraftTierCard`.',
+  '',
+  '**Test count: 87** (unchanged — pure UI).',
+  '',
+  '**Upgrade path.** v0.2.0:31 → v0.2.0:32 is a drop-in. No schema, no SDK breaking change.',
+  '',
   '0.2.0:31 — **Four-item punchlist landed: cap-hit pre-check, grandfather banner, webhooks empty state, help-icon overhaul.** Clears the remaining outstanding admin-UI items.',
   '',
   '**Cap-hit pre-check (item #7).** Operators no longer have to submit-and-bounce off a 402 to learn they\'re about to hit a tier cap. The Products page and the Discount Codes page each call `/v1/admin/tier` on render and surface a gold-bordered "Approaching cap" warning inline above the create-form submit button whenever usage is at cap-1 (e.g. 4/5 products on Creator). The warning includes a direct upgrade link. The existing 402 → upgrade modal still fires if the operator goes ahead and submits.',
@@ -477,7 +489,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:31',
+  version: '0.2.0:32',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

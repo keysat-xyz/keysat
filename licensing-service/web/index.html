@@ -2667,7 +2667,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
    * bubble picker against the product's catalog (or fallback
    * textarea when no catalog).
    */
-  function renderDraftTierCard(product, onCommit, onCancel) {
+  function renderDraftTierCard(product, onCommit, onCancel, tierStatus, productPolicyCount) {
     // Compact inputs. Help icons replace per-field hint text to
     // keep the card narrow.
     const nameInput = el('input', {
@@ -2947,6 +2947,31 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       if (det) det.style.display = recurringCb.checked ? 'block' : 'none'
     })
 
+    // Per-product policy cap pre-check. tierStatus.caps.policies_per_product
+    // is the cap (or null = unlimited). If the operator has 4/5 policies
+    // and they just clicked "+ Add tier", show an inline warning at the
+    // top of the draft so they know what to expect. If already over,
+    // show the "cap reached" notice instead (operator can still try; the
+    // existing 402 modal catches the failed submit).
+    let policyCapNotice = null
+    if (tierStatus && tierStatus.caps && tierStatus.caps.policies_per_product != null) {
+      const cap = tierStatus.caps.policies_per_product
+      const used = productPolicyCount || 0
+      if (used >= cap || used === cap - 1) {
+        // Synthesize a per-product tierStatus shape so capPreCheckCard
+        // can do its thing without a special case. We map the
+        // policies-per-product cap onto a synthetic 'policies' key.
+        const synth = {
+          tier_name: tierStatus.tier_name,
+          next_tier: tierStatus.next_tier,
+          upgrade_url: tierStatus.upgrade_url,
+          caps: { policies: cap },
+          usage: { policies: used },
+        }
+        policyCapNotice = capPreCheckCard(synth, 'policies', 'policies on this product')
+      }
+    }
+
     return el('div', {
       class: 'tier-card draft',
       style:
@@ -2955,7 +2980,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         'padding:18px 16px; min-height:280px; ' +
         'box-shadow:0 0 0 1px rgba(191,160,104,0.06); ' +
         'display:flex; flex-direction:column;',
-    }, [body])
+    }, [policyCapNotice, body].filter(Boolean))
   }
 
   /**
@@ -2963,7 +2988,27 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
    * as a tier card + an "+ Add tier" card on the right. Click to
    * add → morphs into a draft card; multiple drafts can coexist.
    */
-  function renderPolicyCardGrid(product, policies, byPolicyCounts, onMutate) {
+  function renderPolicyCardGrid(product, policies, byPolicyCounts, onMutate, tierStatus) {
+    // Grandfather banner for this product, when its policy count
+    // strictly exceeds the per-product cap (e.g. operator downgraded
+    // from Pro to Creator with 6 policies on a product, Creator caps
+    // at 5). Renders ABOVE the grid so the operator sees the state
+    // before scrolling through cards.
+    let gfBanner = null
+    if (tierStatus && tierStatus.caps && tierStatus.caps.policies_per_product != null) {
+      const cap = tierStatus.caps.policies_per_product
+      const used = (policies || []).length
+      if (used > cap) {
+        const synth = {
+          tier_name: tierStatus.tier_name,
+          next_tier: tierStatus.next_tier,
+          upgrade_url: tierStatus.upgrade_url,
+          caps: { policies: cap },
+          usage: { policies: used },
+        }
+        gfBanner = grandfatherBanner(synth, 'policies', 'policies on this product')
+      }
+    }
     const grid = el('div', {
       style:
         'display:grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); ' +
@@ -3023,6 +3068,8 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             grid.replaceChild(newCard, draft)
           },
           () => grid.replaceChild(makePlaceholder(), draft), // cancel → swap back
+          tierStatus,
+          (policies || []).length,
         )
         grid.replaceChild(draft, placeholder)
         grid.appendChild(makePlaceholder())
@@ -3032,6 +3079,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     grid.appendChild(makePlaceholder())
 
     wireTierGridDragAndDrop(grid, onMutate)
+    // If a grandfather banner exists, wrap [banner, grid] in one
+    // container; otherwise return the grid as before. Wrapping is the
+    // simplest way to render the banner inside the same product card
+    // body without altering the caller (which appends a single child).
+    if (gfBanner) {
+      return el('div', null, [gfBanner, grid])
+    }
     return grid
   }
 
@@ -3109,6 +3163,12 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
+    // Per-product policy cap state. Used by renderPolicyCardGrid +
+    // renderDraftTierCard to surface a grandfather banner (when over)
+    // and a pre-check warning (when at cap-1 or over) on each product
+    // card. Force-refresh so the count reflects any creates/deletes
+    // from the prior route.
+    const policiesTierStatus = await loadTierStatus({ forceRefresh: true })
     const products = (await api('/v1/products').catch(() => ({ products: [] }))).products || []
     if (products.length === 0) {
       target.appendChild(plainCard([
@@ -3565,7 +3625,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             previewBtn ? el('span', { style: 'margin-left:auto' }, previewBtn) : null,
           ]),
           el('div', { class: 'card-body' }, [
-            renderPolicyCardGrid(p, policies, byPolicy, () => routes.policies()),
+            renderPolicyCardGrid(p, policies, byPolicy, () => routes.policies(), policiesTierStatus),
           ]),
         ])
         target.appendChild(productCard)
