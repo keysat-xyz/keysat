@@ -341,7 +341,15 @@ h1 {{
    ribbon, the ribbon's `overflow:hidden` (which clips the ribbon's
    off-card overhang) was also clipping the popular pill that sits 10px
    above the card. Move the pill INSIDE the card top edge in that
-   specific combination so the pill stays visible. */
+   specific combination so the pill stays visible — and push the
+   card's content padding down to leave room so it doesn't sit on top
+   of the "Limited: ..." meta line. */
+.tier.has-launch.highlighted {{
+  padding-top:36px;
+}}
+.tier.has-launch.highlighted.selected {{
+  padding-top:35px; /* compensate for thicker selected-border */
+}}
 .tier.has-launch .tier-popular {{
   top:8px;
 }}
@@ -391,24 +399,21 @@ h1 {{
 .tier-price-original-unit {{
   font-size:11.5px; margin-left:4px; color:var(--ink-500);
 }}
-.tier-entitlements, .tier-bullets {{
+/* Single merged feature list — entitlements and marketing bullets
+   render as one <ul> server-side so there's no list-boundary gap to
+   fight with CSS. Order is operator-controlled via
+   marketing_bullets_position. */
+.tier-features {{
   list-style:none; padding:0; margin:6px 0 0;
   font-size:13px; color:var(--ink-700);
 }}
-.tier-entitlements li, .tier-bullets li {{
+.tier-features li {{
   padding:3px 0 3px 18px; position:relative;
 }}
-.tier-entitlements li::before, .tier-bullets li::before {{
+.tier-features li::before {{
   content:'✓'; position:absolute; left:0; top:3px;
   color:var(--gold-700); font-weight:700;
 }}
-/* Marketing bullets and entitlements should read as ONE coherent
-   feature list regardless of which one renders first. Zero margin-top
-   here so the gap between the two lists matches the within-list gap
-   (each li already contributes 3px of top + bottom padding, so 6px
-   total between consecutive lines either way). */
-.tier-bullets + .tier-entitlements {{ margin-top:0; }}
-.tier-entitlements + .tier-bullets {{ margin-top:0; }}
 .tier-select-btn {{
   margin-top:auto;
   padding:8px 12px;
@@ -1148,23 +1153,21 @@ fn render_tier_picker(
                 .and_then(|v| v.as_str())
                 .map(|s| s == "below")
                 .unwrap_or(false);
-            let marketing_html = p
+            // Marketing-bullet items (just the <li>s — we'll merge them
+            // with entitlement items into a single <ul> below so the two
+            // groups read as ONE continuous feature ladder with zero
+            // boundary artifact between them).
+            let marketing_lis: Vec<String> = p
                 .metadata
                 .get("marketing_bullets")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
-                    let lis: Vec<String> = arr
-                        .iter()
+                    arr.iter()
                         .filter_map(|v| v.as_str())
                         .map(|s| s.trim())
                         .filter(|s| !s.is_empty())
                         .map(|s| format!("<li>{}</li>", html_escape(s)))
-                        .collect();
-                    if lis.is_empty() {
-                        String::new()
-                    } else {
-                        format!("<ul class=\"tier-bullets\">{}</ul>", lis.join(""))
-                    }
+                        .collect()
                 })
                 .unwrap_or_default();
             // raw slug if the catalog is empty or the slug isn't in
@@ -1186,11 +1189,13 @@ fn render_tier_picker(
                 .iter()
                 .filter(|s| !hidden_on_buy.contains(s.as_str()))
                 .collect();
-            let entitlements_html = if visible_entitlements.is_empty() {
-                String::new()
-            } else {
+            // Entitlement <li>s. Same format as marketing items so the
+            // merged feature list looks uniform — visual distinction
+            // between an "entitlement" and a "marketing bullet" is
+            // intentionally invisible to the buyer.
+            let entitlement_lis: Vec<String> = {
                 let catalog = product.entitlements_catalog.as_deref().unwrap_or(&[]);
-                let lis: Vec<String> = visible_entitlements
+                visible_entitlements
                     .iter()
                     .map(|slug| {
                         let entry = catalog.iter().find(|e| &e.slug == *slug);
@@ -1208,8 +1213,26 @@ fn render_tier_picker(
                             html_escape(display),
                         )
                     })
-                    .collect();
-                format!("<ul class=\"tier-entitlements\">{}</ul>", lis.join(""))
+                    .collect()
+            };
+            // Merge into a SINGLE <ul class="tier-features"> so there's
+            // no list-boundary gap to fight with CSS. Order respects the
+            // operator's marketing_bullets_position metadata.
+            let merged_lis: Vec<String> = if bullets_below {
+                entitlement_lis
+                    .into_iter()
+                    .chain(marketing_lis.into_iter())
+                    .collect()
+            } else {
+                marketing_lis
+                    .into_iter()
+                    .chain(entitlement_lis.into_iter())
+                    .collect()
+            };
+            let features_html = if merged_lis.is_empty() {
+                String::new()
+            } else {
+                format!("<ul class=\"tier-features\">{}</ul>", merged_lis.join(""))
             };
             let dur_html = if p.duration_seconds > 0 {
                 let days = p.duration_seconds / 86_400;
@@ -1284,14 +1307,8 @@ fn render_tier_picker(
             } else {
                 classes.clone()
             };
-            // Operator-controlled order: above (default) or below.
-            let (first_block, second_block) = if bullets_below {
-                (&entitlements_html, &marketing_html)
-            } else {
-                (&marketing_html, &entitlements_html)
-            };
             format!(
-                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{first_block}{second_block}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{features_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,
                 slug = slug_attr,
                 popular_pill = popular_pill,
@@ -1306,8 +1323,7 @@ fn render_tier_picker(
                 trial_banner = trial_banner,
                 trial_meta = trial_meta,
                 description_html = description_html,
-                first_block = first_block,
-                second_block = second_block,
+                features_html = features_html,
             )
         })
         .collect();

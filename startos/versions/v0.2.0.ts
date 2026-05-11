@@ -58,6 +58,16 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:27 — **Tier-card feature list merged into a single ul; "MOST POPULAR" + "Limited: …" no longer collide.** Two remaining buy-page nits from :26.',
+  '',
+  '**Single feature list.** The :26 attempt at zeroing the gap between adjacent `<ul.tier-bullets>` and `<ul.tier-entitlements>` worked on paper but the boundary was still visible to the eye — probably from list-item bottom-padding accumulating around the ul switch. Solved structurally: the daemon now builds ONE `<ul class="tier-features">` server-side, concatenating marketing bullets and entitlements in the operator-controlled order. No list boundary = no gap to fight with CSS. Both groups render with the same ✓ checkmark, indistinguishable to the buyer.',
+  '',
+  '**"MOST POPULAR" no longer collides with the launch-special meta line.** In :26 the popular pill was moved inside the card (top:8px) for tiers that also had a launch ribbon, so the ribbon\'s overflow-hidden wouldn\'t clip it. But that landed it on top of the "Limited: 100 of 100 remaining" line. Added `padding-top:36px` (35px when also `.selected`, to compensate for the thicker border) to the tier card when both classes are present, so the popular pill has its own gap above the meta line.',
+  '',
+  '**Test count: 87** (unchanged — CSS + HTML composition only).',
+  '',
+  '**Upgrade path.** v0.2.0:26 → v0.2.0:27 is a drop-in. No data, schema, or API change. SDK consumers that read `/v1/products/<slug>/policies` still get `entitlements` and `marketing_bullets` as separate arrays — the merging happens only at the buy-page render layer.',
+  '',
   '0.2.0:26 — **Buy-page + entitlement-picker polish.** Cluster of small visual fixes informed by side-by-side review of the public buy page and the admin entitlements UI.',
   '',
   '**Tier-card feature list reads as one column.** When marketing bullets and entitlements stacked (either above or below), there was ~8px between the two lists but only 6px between items within a list — the seam was visible. Zeroed the margin-top on the second list so the two render as one continuous feature ladder (the per-li padding now contributes the full inter-item gap on both sides of the boundary).',
@@ -420,7 +430,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:26',
+  version: '0.2.0:27',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
