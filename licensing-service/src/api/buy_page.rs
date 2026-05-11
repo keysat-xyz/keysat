@@ -1166,7 +1166,7 @@ fn render_tier_picker(
             // the launch-meta div as an in-flow element — that coupling
             // made cross-card row alignment impossible).
             //   - featured_ribbon: absolutely-positioned diagonal banner
-            //   - launch_meta_html: in-flow "Limited: N remaining"
+            //   - launch_meta_html: in-flow "Limited discount: N remaining"
             //   - original_price_html: in-flow struck-through original
             let (featured_ribbon, launch_meta_html, original_price_html) = if let Some(code) = featured {
                 let tagline = if code.kind == "percent" {
@@ -1179,12 +1179,14 @@ fn render_tier_picker(
                     "LAUNCH SPECIAL".to_string()
                 };
                 let remaining = code.max_uses.map(|m| (m - code.used_count).max(0)).unwrap_or(-1);
-                // Display: "Limited: N remaining" (not "N of M remaining").
-                // The total cap is operator-private — buyers don't need to
-                // infer launch volume from the M.
+                // Display: "Limited discount: N remaining". "discount"
+                // makes clear what's limited (otherwise buyers might read
+                // it as the number of LICENSES left, not the discount-code
+                // uses left). N alone — no "of M" — keeps initial launch
+                // volume operator-private.
                 let launch_meta = if remaining > 0 {
                     format!(
-                        "<div class=\"tier-launch-meta\">Limited: {} remaining</div>",
+                        "<div class=\"tier-launch-meta\">Limited discount: {} remaining</div>",
                         remaining,
                     )
                 } else {

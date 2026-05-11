@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:37 — **"Limited" → "Limited discount".** Adds the word "discount" to the launch-special remaining-count label so it\'s unambiguous what\'s limited. Without it, a buyer scanning a tier card with a launch ribbon might read "Limited: 10 remaining" as "only 10 licenses left at this tier" rather than "only 10 uses of the discount code left." Both surfaces (buy page tier card + landing-page dynamic card) now render "Limited discount: N remaining". Cosmetic.',
+  '',
   '0.2.0:36 — **Launch-special remaining count drops the total.** The buy-page tier card\'s "Limited: N of M remaining" line now reads just "Limited: N remaining". The total cap (M) is operator-private — there\'s no upside to exposing initial volume to buyers, and it can make a tier look smaller than the operator wants to signal. Symmetric change in the landing-page dynamic tier-card render. Cosmetic; no API or schema change.',
   '',
   '0.2.0:35 — **Free tiers render as "Free" on the buy page tier card.** Previously the server rendered a 0-priced tier as `0 sats` (or `0.00 USD`) in the tier-card price headline, even though the price card BELOW the picker already swapped to `FREE` via the JS path. Inconsistency fixed at the server-render layer: when post-discount price is 0, the tier card renders the headline as `Free` with no unit suffix and no cadence (`Free /yr` would be incoherent). Recurring-meta line ("Renews annually") still surfaces beneath for recurring tiers that happen to be free, so the cadence is still visible — just not stuffed into the headline. Cosmetic; no API or schema change.',
@@ -497,7 +499,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:36',
+  version: '0.2.0:37',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
