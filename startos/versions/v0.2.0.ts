@@ -58,6 +58,14 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:19 — **Marketing-bullets position: above or below the entitlements.** Tiny operator-control add: pick where the free-form ✓ checkmark copy renders on each tier card.',
+  '',
+  '**The change.** Marketing bullets (`metadata.marketing_bullets`) have always rendered ABOVE the entitlement chips. That\'s usually right for "lifestyle" bullets like "Up to 5 products" / "BTCPay integration" — they sell the tier. But for tiers where the entitlements ARE the headline and the marketing bullets are caveats or fine-print, operators want them BELOW. New `metadata.marketing_bullets_position` field (`"above"` default, `"below"` opt-in) controls this per-policy. UI: small dropdown next to the bullets textarea on both create and edit forms. Renders consistently across the admin grid, the buy page, and the public `/v1/products/<slug>/policies` JSON (so SDK consumers stay in sync).',
+  '',
+  '**Test count: 87** (unchanged — metadata pass-through; no new branches to test).',
+  '',
+  '**Upgrade path.** v0.2.0:18 → v0.2.0:19 is a drop-in. No schema, no SDK breaking change. Existing policies keep rendering bullets above (the default). The new JSON field appears in policies-list responses but is optional and back-compat: old SDKs ignore it.',
+  '',
   '0.2.0:18 — **Discount Codes form polish: less typing, clearer intent.** Three small admin-UI changes that make the create + edit forms less footgun-prone.',
   '',
   '**Max-uses: checkbox + dependent number, not "0 = unlimited".** Previously the form had a single number input with a hint that read `"0 = unlimited"`. That meant the default value was `0`, which displayed as "no cap" but read like "0 uses allowed." Now it\'s a "Limit total uses" checkbox + a number input that only appears when the checkbox is checked (default 100). Unchecked = no cap is sent. Edit form matches.',
@@ -338,7 +346,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:18',
+  version: '0.2.0:19',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

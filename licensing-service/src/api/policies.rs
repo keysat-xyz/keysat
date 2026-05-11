@@ -814,14 +814,26 @@ pub async fn list_public_policies(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             // Marketing bullets: operator-controlled copy that renders
-            // as ✓ checkmarks ABOVE the entitlement bullets on the buy
-            // page. Stored as an array of strings in metadata; passes
-            // through to JSON unchanged.
+            // as ✓ checkmarks above (default) or below the entitlement
+            // bullets on the buy page based on
+            // `marketing_bullets_position`. Stored as an array of
+            // strings in metadata; passes through to JSON unchanged.
             let marketing_bullets = p
                 .metadata
                 .get("marketing_bullets")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            // "above" (default — matches prior behavior) or "below".
+            // Normalize anything else to "above" so SDK consumers don't
+            // have to defensively coerce.
+            let marketing_bullets_position = match p
+                .metadata
+                .get("marketing_bullets_position")
+                .and_then(|v| v.as_str())
+            {
+                Some("below") => "below",
+                _ => "above",
+            };
             let price_sats = p.price_sats_override.unwrap_or(product.price_sats);
             // Featured discount (if any) — compute the post-discount
             // price the buyer would actually pay if they bought right
@@ -858,6 +870,7 @@ pub async fn list_public_policies(
                 "is_trial": p.is_trial,
                 "entitlements": p.entitlements,
                 "marketing_bullets": marketing_bullets,
+                "marketing_bullets_position": marketing_bullets_position,
                 "highlighted": highlighted,
                 // Recurring-subscription cadence — buy page renders
                 // "Renews every N days" / "$X/month" when is_recurring=true.

@@ -1094,8 +1094,15 @@ fn render_tier_picker(
             // name + description (as a tooltip). Falls back to the
             // Marketing bullets — operator-controlled copy from
             // metadata.marketing_bullets. Rendered as ✓ checkmarks
-            // above the entitlement bullets. Skipped silently if
-            // absent / wrong shape.
+            // above (default) or below the entitlement bullets based
+            // on metadata.marketing_bullets_position. Skipped silently
+            // if absent / wrong shape.
+            let bullets_below = p
+                .metadata
+                .get("marketing_bullets_position")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "below")
+                .unwrap_or(false);
             let marketing_html = p
                 .metadata
                 .get("marketing_bullets")
@@ -1216,8 +1223,14 @@ fn render_tier_picker(
             } else {
                 classes.clone()
             };
+            // Operator-controlled order: above (default) or below.
+            let (first_block, second_block) = if bullets_below {
+                (&entitlements_html, &marketing_html)
+            } else {
+                (&marketing_html, &entitlements_html)
+            };
             format!(
-                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{marketing_html}{entitlements_html}<button type="button" class="tier-select-btn">Select</button></div>"#,
+                r#"<div class="{classes}" data-policy-slug="{slug}">{popular_pill}{featured_ribbon}<div class="tier-name">{name}</div>{original_price_html}<div class="tier-price">{price_fmt}<span class="tier-price-unit">{price_unit}{cadence_suffix}</span></div>{dur_html}{recurring_meta}{trial_banner}{trial_meta}{description_html}{first_block}{second_block}<button type="button" class="tier-select-btn">Select</button></div>"#,
                 classes = classes,
                 slug = slug_attr,
                 popular_pill = popular_pill,
@@ -1232,8 +1245,8 @@ fn render_tier_picker(
                 trial_banner = trial_banner,
                 trial_meta = trial_meta,
                 description_html = description_html,
-                marketing_html = marketing_html,
-                entitlements_html = entitlements_html,
+                first_block = first_block,
+                second_block = second_block,
             )
         })
         .collect();

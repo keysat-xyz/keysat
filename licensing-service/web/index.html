@@ -1999,8 +1999,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const bulletsField = formInput('e_pol_bullets', 'Marketing bullets (optional)', {
       textarea: true,
       value: marketingBulletsInit,
-      hint: 'One per line. Renders as ✓ checkmarks above the entitlements on the buy page. Use for things like "Up to 5 products" or "BTCPay integration" that aren\'t real entitlements.',
+      hint: 'One per line. Renders as ✓ checkmarks on the tier card. Use for things like "Up to 5 products" or "BTCPay integration" that aren\'t real entitlements.',
     })
+    // Marketing bullets position — "above" (default, prior behavior) or
+    // "below" the entitlement chips on the tier card. Pre-populated
+    // from existing metadata.marketing_bullets_position.
+    const bulletsPositionInit = meta.marketing_bullets_position === 'below' ? 'below' : 'above'
+    const bulletsPositionField = formSelect('e_pol_bullets_position', 'Bullets position on tier card', [
+      { value: 'above', label: 'Above entitlements' },
+      { value: 'below', label: 'Below entitlements' },
+    ], { value: bulletsPositionInit })
     if (highlight) setTimeout(() => {
       const cb = card.querySelector('[name=e_pol_highlight]')
       if (cb) cb.checked = true
@@ -2085,6 +2093,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       el('div', { class: 'row-2' }, [graceField, machinesField]),
       entField,
       bulletsField,
+      bulletsPositionField,
       el('div', { class: 'row-2' }, [highlightField, trialField]),
       // Tier ladder rank — sits in its own row above the recurring section.
       tierRankField,
@@ -2133,6 +2142,15 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               .split('\n').map((s) => s.trim()).filter(Boolean)
             if (newBullets.length > 0) newMetadata.marketing_bullets = newBullets
             else delete newMetadata.marketing_bullets
+            // Position: only persist when bullets exist AND the operator
+            // picked something other than the default ("above"). Keeps
+            // metadata clean for tiers that use defaults or have no bullets.
+            const newBulletsPos = card.querySelector('[name=e_pol_bullets_position]').value
+            if (newBullets.length > 0 && newBulletsPos === 'below') {
+              newMetadata.marketing_bullets_position = 'below'
+            } else {
+              delete newMetadata.marketing_bullets_position
+            }
             const priceRaw = card.querySelector('[name=e_pol_price]').value.trim()
             const price_sats_override = priceRaw === '' ? null : Math.max(0, parseInt(priceRaw, 10) || 0)
             // Recurring subscription — send the fields whenever the operator
@@ -2278,16 +2296,20 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       : null
 
     // Marketing bullets — operator-controlled copy that renders as
-    // ✓ checkmarks ABOVE the entitlement bullets. Things like
-    // "Up to 5 products" or "BTCPay integration" that aren't real
-    // entitlement gates but are buyer-relevant.
+    // ✓ checkmarks above (default) or below the entitlement chips.
+    // Things like "Up to 5 products" or "BTCPay integration" that
+    // aren't real entitlement gates but are buyer-relevant.
     const marketingBullets = Array.isArray((pol.metadata || {}).marketing_bullets)
       ? pol.metadata.marketing_bullets
       : []
+    const bulletsBelow = (pol.metadata || {}).marketing_bullets_position === 'below'
+    // Tighten top-margin when marketing list follows entitlements
+    // (bulletsBelow=true) — entChips renders first with the normal
+    // 8px gap, marketingList trails directly under it.
     const marketingList = marketingBullets.length === 0
       ? null
       : el('ul', {
-          style: 'list-style:none; padding:0; margin:8px 0 0; font-size:12.5px; color:var(--ink-700)',
+          style: 'list-style:none; padding:0; margin:' + (bulletsBelow ? '2px' : '8px') + ' 0 0; font-size:12.5px; color:var(--ink-700)',
         }, marketingBullets.map((b) => el('li', {
           style: 'padding:2px 0 2px 16px; position:relative',
         }, [
@@ -2299,10 +2321,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 
     // Entitlements as small chips with display name + tooltip.
     const cat = product.entitlements_catalog || []
+    // Top-margin: tighten when this list follows another (marketing
+    // list rendered ABOVE), normal when it leads the section.
+    const entLeadsSection = !marketingList || bulletsBelow
     const entChips = (pol.entitlements || []).length === 0
       ? null
       : el('ul', {
-          style: 'list-style:none; padding:0; margin:' + (marketingList ? '2px' : '8px') + ' 0 0; font-size:12.5px; color:var(--ink-700)',
+          style: 'list-style:none; padding:0; margin:' + (entLeadsSection ? '8px' : '2px') + ' 0 0; font-size:12.5px; color:var(--ink-700)',
         }, (pol.entitlements || []).map((slug) => {
           const entry = cat.find((c) => c.slug === slug)
           const display = entry && entry.name ? entry.name : slug
@@ -2486,8 +2511,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       description ? el('p', {
         style: 'font-size:13px; line-height:1.45; color:var(--ink-700); margin:6px 0 0',
       }, description) : null,
-      marketingList,
-      entChips,
+      // Operator-controlled order: marketing bullets above (default)
+      // or below the entitlements (metadata.marketing_bullets_position).
+      bulletsBelow ? entChips : marketingList,
+      bulletsBelow ? marketingList : entChips,
       el('div', { class: 'muted', style: 'font-size:11px; margin-top:4px' },
         (pol._license_count || 0) + ' license' + ((pol._license_count || 0) === 1 ? '' : 's')),
       actions,
@@ -2647,6 +2674,19 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       placeholder: 'One bullet per line — e.g.\nUp to 5 products\nBTCPay integration\nWebhooks + audit log',
       style: 'font-family:var(--font-body); font-size:12px; line-height:1.45;',
     })
+    // Position: where the marketing bullets render relative to the
+    // entitlements list on the tier card. "above" matches the previous
+    // hardcoded behavior; "below" puts them after entitlements (useful
+    // when marketing bullets are general value-prop blurbs and the
+    // entitlements are the technical contract a buyer wants to see
+    // first).
+    const bulletsPositionSel = el('select', {
+      class: 'input',
+      style: 'font-size:12px; max-width:200px',
+    }, [
+      el('option', { value: 'above' }, 'Above entitlements'),
+      el('option', { value: 'below' }, 'Below entitlements'),
+    ])
 
     // Tip recipient (advanced — collapsed by default to keep the
     // card narrow).
@@ -2685,11 +2725,15 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         ]),
       ]),
       // Free-form marketing bullets — operator-controlled copy that
-      // renders as additional ✓ checkmarks above the entitlement
-      // bullets. Not enforced anywhere; pure marketing surface.
+      // renders as additional ✓ checkmarks alongside the entitlement
+      // bullets. Position (above vs below entitlements) is operator-
+      // controlled per tier. Not enforced anywhere; pure marketing.
       fieldRow('Marketing bullets',
-        'One per line. Buyer sees these as ✓ checkmarks above the entitlement bullets on the buy page. Use for things like "Up to 5 products" or "BTCPay integration" that aren\'t real entitlements.',
+        'One per line. Buyer sees these as ✓ checkmarks on the tier card. Use for things like "Up to 5 products" or "BTCPay integration" that aren\'t real entitlements.',
         bulletsTextarea),
+      fieldRow('Position on tier card',
+        'Where these bullets render relative to the entitlement chips.',
+        bulletsPositionSel),
       // Recurring section — minimal, expanded inline (no nested
       // disclosure; cards already imply compactness).
       el('div', { style: 'display:flex; align-items:center; gap:6px; margin-top:8px' }, [
@@ -2733,7 +2777,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
                 .filter(Boolean)
               const metadata = {}
               if (highlightCb.checked) metadata.highlight = true
-              if (marketingBullets.length > 0) metadata.marketing_bullets = marketingBullets
+              if (marketingBullets.length > 0) {
+                metadata.marketing_bullets = marketingBullets
+                // Only persist position when bullets exist — keeps
+                // metadata clean for tiers that don't use bullets.
+                // Default ("above") matches the previous hardcoded
+                // behavior, so we only write the field when it differs.
+                if (bulletsPositionSel.value === 'below') {
+                  metadata.marketing_bullets_position = 'below'
+                }
+              }
               const body = {
                 product_slug: product.slug,
                 slug: slugInput.value.trim(),
