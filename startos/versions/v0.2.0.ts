@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:33 — **Drop a long-standing unused-variable warning.** Removed `let invoice_id_safe = html_escape(&invoice_id);` in `src/api/mod.rs` — the value was computed but never referenced anywhere in the thank-you-page template (the HTML uses `invoice_id_json` for the inline JS, and the on-screen invoice id renders from JS via that JSON variable). One-line cleanup; `cargo check` is now warning-free. No behavior change.',
+  '',
   '0.2.0:32 — **Per-product policy cap also pre-checked + grandfathered.** Extends the v0.2.0:31 cap-handling pattern to the third tier-enforced surface (Creator caps each product at 5 policies). Same shape, just scoped to a single product instead of the whole instance.',
   '',
   '**Pre-check.** When the operator clicks "+ Add tier" on a product that already has 4 of 5 policies, the draft tier card opens with a gold-bordered "Approaching cap" warning at the top: "You\'re at 4/5 policies on this product. Creating one more will hit your Creator tier cap." Includes a direct upgrade link. The existing 402 → upgrade modal still fires if the operator pushes through.',
@@ -489,7 +491,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:32',
+  version: '0.2.0:33',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

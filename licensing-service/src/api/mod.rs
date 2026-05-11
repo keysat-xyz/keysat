@@ -558,7 +558,6 @@ async fn thank_you(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Html<String> {
     let invoice_id = params.get("invoice_id").cloned().unwrap_or_default();
-    let invoice_id_safe = html_escape(&invoice_id);
     let invoice_id_json = serde_json::to_string(&invoice_id).unwrap_or_else(|_| "\"\"".into());
     // Live-read operator_name from the settings table; fall back to the
     // env-var config; final fallback to a neutral brand name.
