@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:39 — **Buy page now renders a tier card for single-public-policy products.** Previously the tier picker only rendered when a product had two or more public policies; single-public-policy products fell back to a bare price card + form, swallowing all the operator-configured entitlements, marketing bullets, and tier descriptions. Fixed: render a single centered tier card (new `.tiers-1` grid class, ~480px max-width) whenever there\'s at least one public policy. Operators who keep most tiers private and only expose one (e.g. "Pro" public, "Core" and "Max" admin-only) now see the same rich tier-card render that multi-tier products get. The price card below still renders unchanged as the buy-confirmation summary.',
+  '',
   '0.2.0:38 — **Admin UI: Create-product Cancel button + modal-overflow fix across all dialogs.** Two operator-reported bugs.',
   '',
   '**Create product: Cancel button.** The "Create a new product" disclosure had a Create button but no way to back out without scrolling up to the chevron. Added a secondary Cancel button alongside Create — collapses the disclosure (returns to the products list) without clearing typed input, so re-expanding picks up where the operator left off.',
@@ -505,7 +507,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:38',
+  version: '0.2.0:39',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

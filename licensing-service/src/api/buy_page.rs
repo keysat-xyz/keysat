@@ -305,6 +305,10 @@ h1 {{
     1fr   /* row 7: features (fills) */
     auto; /* row 8: button */
 }}
+/* Single-policy products: one centered card at a comfortable width.
+   Wide enough to read entitlements + marketing bullets clearly without
+   stretching across the full container. */
+.tiers-1 {{ grid-template-columns:minmax(0, 480px); justify-content:center; }}
 .tiers-2 {{ grid-template-columns:repeat(2, 1fr); }}
 .tiers-3 {{ grid-template-columns:repeat(3, 1fr); }}
 .tiers-4 {{ grid-template-columns:repeat(2, 1fr); }}
@@ -1093,19 +1097,23 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 }
 
 /// Build the server-rendered tier-picker HTML. Returns an empty string
-/// when the product has fewer than 2 public policies (i.e., the existing
-/// single-price view is sufficient).
+/// only when the product has zero public policies (the bare price-card +
+/// form fallback covers that case). For one public policy, we still
+/// render a single tier card so the operator-configured entitlements
+/// and marketing bullets surface — without this, single-tier products
+/// showed only price + form, eating the operator's tier copy.
 fn render_tier_picker(
     policies: &[crate::models::Policy],
     initial: &Option<crate::models::Policy>,
     product: &crate::models::Product,
     featured_by_policy: &std::collections::HashMap<String, crate::models::DiscountCode>,
 ) -> String {
-    if policies.len() < 2 {
+    if policies.is_empty() {
         return String::new();
     }
     let n = policies.len().min(4);
     let class_n = match n {
+        1 => "tiers-1",
         2 => "tiers-2",
         3 => "tiers-3",
         _ => "tiers-4",
