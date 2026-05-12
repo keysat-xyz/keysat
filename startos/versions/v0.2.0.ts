@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:42 — **Revert the implicit Patron→Pro entitlement expansion shipped in :41.** Reasoning on revert: the only license affected by the missing-entitlement bug was the master operator\'s own pre-launch self-license, issued under an earlier entitlement scheme. The Patron policy on the master Keysat now lists the correct entitlements, so any fresh Patron license issued today carries them in the signed payload directly. Making `patron` a magic superset at the resolution layer was paying ongoing complexity tax (entitlement-renames have to update a hardcoded list; the gate behavior diverges from what the policy literally says) for a one-shot migration that won\'t recur. Operators with a stuck old-scheme Patron license should re-issue + run "Activate Keysat license" — the new license overwrites `/data/keysat-license.txt` and the daemon picks up the fresh entitlements without a restart. The :41 BTCPay one-click authorize-flow restoration in the admin UI is unchanged.',
+  '',
   '0.2.0:41 — **Two fixes: Patron tier now implies the full Pro feature surface, and BTCPay Connect is back to one-click authorize.** Both came from operator-side bugs that the admin-UI redesign exposed.',
   '',
   '**Patron implies Pro at the resolution layer.** Previously, every `tier.has(<pro-entitlement>)` check required the Patron POLICY on the master Keysat to redundantly list every Pro entitlement (`unlimited_products`, `unlimited_policies`, `unlimited_codes`, `recurring_billing`, `zaprite_payments`) — if the operator forgot even one slug on the Patron policy, every Patron customer was silently locked out of that feature. The Zaprite gate caught this in the wild: a Patron license without `zaprite_payments` got an "Upgrade to Pro" CTA on the payment-providers page. Fixed at the right layer: `tier::current()` now expands `patron` into the full Pro entitlement set on read, so a Patron policy can list just `patron` and have everything Pro grants flow through automatically. Existing Patron customers get the implied entitlements without re-issuing a license. Recommended cleanup: also list the entitlements explicitly on the Patron policy itself so the buy-page tier card stays informative — but the gate behavior no longer depends on it.',
@@ -517,7 +519,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:41',
+  version: '0.2.0:42',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

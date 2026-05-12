@@ -90,35 +90,11 @@ impl TierInfo {
 /// to be fixed.
 pub async fn current(state: &AppState) -> TierInfo {
     let tier = state.self_tier.read().await;
-    let mut entitlements = match &*tier {
+    let entitlements = match &*tier {
         Tier::Licensed { entitlements, .. } => entitlements.clone(),
         Tier::Unlicensed { .. } => Vec::new(),
     };
     drop(tier);
-
-    // Patron implies Pro by design (see module docstring: "Patron: same
-    // feature surface as Pro, plus a `patron` entitlement..."). Without
-    // this expansion, every downstream `tier.has(<pro-entitlement>)`
-    // check requires the Patron POLICY on the master Keysat to
-    // redundantly list every Pro entitlement. That's brittle: a single
-    // missing slug on the policy (e.g. operator forgets
-    // `zaprite_payments`) breaks Pro-equivalence for every Patron
-    // customer. Treating `patron` as a strict superset of Pro at the
-    // resolution layer means policy authors can list `patron` alone
-    // and have everything Pro grants flow through automatically.
-    if entitlements.iter().any(|e| e == "patron") {
-        for implied in [
-            "unlimited_products",
-            "unlimited_policies",
-            "unlimited_codes",
-            "recurring_billing",
-            "zaprite_payments",
-        ] {
-            if !entitlements.iter().any(|e| e == implied) {
-                entitlements.push(implied.to_string());
-            }
-        }
-    }
 
     let label: &'static str;
     let display_name: &'static str;
