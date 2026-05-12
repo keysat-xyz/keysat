@@ -43,23 +43,25 @@ hangs on these:
 4. **How should unlicensed users experience the app?** Three legitimate
    patterns; pick whichever fits the operator's business model. **None
    is "wrong."**
+   - **Soft gate** (safest default if the operator is unsure) — the
+     app runs and provides basic functionality unlicensed; specific
+     paid features return 402 with an "Upgrade to unlock" message.
+     Recommended for free → paid migrations and for freemium products.
    - **Hard gate** — the app downloads freely from the Start9 registry,
      but won't function without a paid license. The binary is essentially
      a locked installer until the buyer activates. Common for closed-source
      paid apps and for open-source apps that the operator chooses to
-     monetize through the registry distribution. See section 8 for the
+     monetize through the registry distribution. See section **7d** for the
      two flavors of hard gating (refuse-to-start vs. activate-screen-only).
-   - **Soft gate** — the app runs and provides basic functionality
-     unlicensed; specific paid features return 402 with an "Upgrade to
-     unlock" message. Recommended for free → paid migrations and for
-     freemium products.
    - **Nag mode** — no enforcement; just a "support development" banner
      when unlicensed. Pure honor system. Useful when the app is
      fundamentally free-to-use but the operator wants a tip-jar.
 
    Nudge the operator if their answer doesn't match their business
    reality. Closed-source-paid + nag-mode is incoherent; freemium +
-   hard-gate alienates the existing user base.
+   hard-gate alienates the existing user base. **When in doubt, propose
+   soft-gate** — it preserves the user's ability to evaluate the app
+   before paying and gives the operator the simplest implementation.
 5. **What are the entitlement strings, and what does each unlock?**
    The operator decides; ask them. Common patterns:
    - `["self_host"]` for a free tier — "you can run the app, no premium features"
@@ -88,7 +90,17 @@ hangs on these:
 If the creator doesn't know yet, propose sensible defaults from the
 ranges above and confirm before coding.
 
-8. **Compile a config card before writing code.** After answering 1–7,
+8. **Has the operator declared an entitlements catalog on the product
+   yet?** (Admin → Products → Edit → "Entitlements catalog".) If yes,
+   the operator already has a typed list of feature slugs + display
+   names + descriptions; ask them to paste it so your gating logic
+   uses the canonical slugs and avoids drift. If no, propose a catalog
+   in your config card (next step) so the operator can paste it into
+   admin in one step — this prevents the operator from inventing a
+   slightly different slug spelling later. See section 8 ("Picking
+   entitlement names") for the catalog mechanics.
+
+9. **Compile a config card before writing code.** After answering 1–8,
    produce a short summary the operator can paste into the Keysat admin
    without re-deriving anything. This is the single highest-leverage
    step for avoiding "wait, what entitlements did we agree on?" churn
@@ -355,15 +367,18 @@ the payload. The SDK parses and verifies in one call. You should never
 need to handle the encoding manually.
 
 The signed payload contains:
-- `product_id` (UUID) — for matching against your product slug
-- `license_id` (UUID) — useful for logging
+- `product_id` (UUID; **not a slug** — see §9a for cross-product checks)
+- `license_id` (UUID — useful for logging; never log the full key)
 - `issued_at` (Unix seconds)
 - `expires_at` (Unix seconds; 0 means perpetual)
-- `flags` (bitfield; `FLAG_TRIAL=1`)
+- `flags` (bitfield: bit 0 = `FLAG_FINGERPRINT_BOUND` (mask `0x01`); bit 1 = `FLAG_TRIAL` (mask `0x02`))
 - `entitlements: string[]` — **this is the array you gate features on**
 - `fingerprint_hash` (32 bytes; for online machine-binding)
 
-Your software reads `entitlements` and decides what to unlock.
+Your software reads `entitlements` and decides what to unlock. **Do not
+do flag bit arithmetic yourself** — every SDK pre-parses the flags into
+boolean fields on the payload (`isTrial` / `is_trial`, `isFingerprintBound`
+/ `is_fingerprint_bound`). Use those.
 
 ---
 
@@ -474,49 +489,20 @@ direct callers but the timer keeps humming along.
 npm install @keysat/licensing-client
 ```
 
-**GitHub fallback** (if the npm package isn't published yet). Several
-prerequisites must be met for this path to work end-to-end:
+**GitHub fallback** (the npm package is pending publication; the GitHub
+repo is public and installable directly):
 
-1. The `keysat-xyz/keysat-client-ts` repo must be **public** on GitHub.
-   Private repos require credentials, which fails inside hermetic build
-   environments (Docker, CI, fresh dev machines without an SSH key). If
-   the repo flips public temporarily for one build, every future build
-   re-hits this wall — prefer publishing to npm if at all possible.
-2. The repo must include a `prepare` script in `package.json` that
-   builds `dist/` on git-install. This is fixed as of this doc; if you
-   see `Cannot find module '...dist/index.cjs'` after install, the SDK
-   you're pulling pre-dates the fix and you need a newer commit.
-3. **Use the explicit `git+https://` URL form**, not the `github:`
-   shorthand:
-
-   ```jsonc
-   // package.json
-   "@keysat/licensing-client": "git+https://github.com/keysat-xyz/keysat-client-ts.git"
-   ```
-
-   The `github:user/repo` shorthand often resolves to `git+ssh://...`
-   on machines with an existing GitHub SSH key, which then breaks for
-   any subsequent integrator without a key (CI, Docker, a fresh laptop).
-
-4. **If you switched from `github:` to `git+https://`, also delete the
-   stale lock-file entry.** `npm install` will keep the previous
-   `resolved: "git+ssh://..."` line in `package-lock.json` even after
-   you change the spec in `package.json`. The fastest fix is:
-
-   ```bash
-   rm package-lock.json node_modules
-   npm cache clean --force
-   npm install
-   ```
-
-   Or hand-edit the `resolved:` field of the offending entry to swap
-   `git+ssh://` → `git+https://`, leaving the commit hash unchanged.
-
-When all four are satisfied:
-
-```bash
-npm install github:keysat-xyz/keysat-client-ts
+```jsonc
+// package.json
+"dependencies": {
+  "@keysat/licensing-client": "git+https://github.com/keysat-xyz/keysat-client-ts.git"
+}
 ```
+
+Use the explicit `git+https://` form (not the `github:user/repo` shorthand),
+which avoids the ssh-vs-https resolution drift that bites hermetic build
+environments. The SDK's `prepare` script builds `dist/` automatically on
+git install, so no extra steps are needed.
 
 **Embed the public key.** The simplest way is to commit the PEM file
 to your repo at `assets/issuer.pub` and import it as a raw string:
@@ -565,18 +551,20 @@ export function checkLicense(): LicenseState {
   if (!raw) return { state: 'unlicensed', entitlements: new Set() }
   try {
     const ok = verifier.verify(raw)
-    // (optional) reject keys for the wrong product slug
-    if (ok.payload.productSlug && ok.payload.productSlug !== PRODUCT_SLUG) {
-      return { state: 'invalid', reason: 'product_mismatch', entitlements: new Set() }
-    }
+    // For cross-product safety, you need to assert the payload's
+    // product matches what your app expects. The payload carries a
+    // PRODUCT UUID, not a slug — see §9a for the correct check
+    // (online via `client.validate(key, slug, fp)`, or offline by
+    // comparing `payload.productUuid` against the operator-provided
+    // product UUID constant).
     return {
       state: 'licensed',
-      licenseId: ok.payload.licenseId,
+      licenseId: ok.licenseId, // top-level shortcut on the VerifyOk result
       entitlements: new Set(ok.payload.entitlements || []),
       expiresAt: ok.payload.expiresAt
         ? new Date(ok.payload.expiresAt * 1000)
         : undefined,
-      isTrial: !!(ok.payload.flags & 1),
+      isTrial: ok.payload.isTrial, // pre-parsed by the SDK — don't bit-math
     }
   } catch (e: any) {
     return { state: 'invalid', reason: e.message, entitlements: new Set() }
@@ -675,11 +663,11 @@ def check_license() -> LicenseState:
         ok = _verifier.verify(raw)
         return LicenseState(
             state='licensed',
-            license_id=str(ok.payload.license_id),
-            entitlements=set(ok.payload.entitlements or []),
-            expires_at=datetime.fromtimestamp(ok.payload.expires_at)
-                if ok.payload.expires_at else None,
-            is_trial=bool(ok.payload.flags & 1),
+            license_id=str(ok.license_id),  # top-level shortcut on VerifyOk
+            entitlements=set(ok.entitlements or []),
+            expires_at=datetime.fromtimestamp(ok.expires_at)
+                if ok.expires_at else None,
+            is_trial=ok.is_trial,  # pre-parsed by the SDK; don't bit-math
         )
     except Exception as e:
         return LicenseState(state='invalid', reason=str(e))
@@ -733,7 +721,7 @@ const ISSUER_PEM: &str = include_str!("../assets/issuer.pub");
 
 ```rust
 // src/license.rs
-use keysat_licensing_client::{Verifier, PublicKeyPem};
+use keysat_licensing_client::{Verifier, PublicKeyPem, FLAG_TRIAL};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -792,14 +780,17 @@ pub fn check_license() -> LicenseState {
     match verifier.verify(&raw) {
         Ok(ok) => LicenseState {
             state: "licensed",
-            license_id: Some(ok.payload.license_id.to_string()),
+            // license_id is a [u8; 16] in the Rust SDK — render to hex.
+            license_id: Some(hex::encode(ok.payload.license_id)),
             entitlements: ok.payload.entitlements.into_iter().collect(),
             expires_at: if ok.payload.expires_at == 0 {
                 None
             } else {
                 chrono::DateTime::from_timestamp(ok.payload.expires_at, 0)
             },
-            is_trial: (ok.payload.flags & 1) != 0,
+            // Use the FLAG_TRIAL constant — it's bit 1 (mask 0x02), NOT 0x01.
+            // The Rust SDK leaves flag parsing to the caller.
+            is_trial: (ok.payload.flags & FLAG_TRIAL) != 0,
             ..Default::default()
         },
         Err(e) => LicenseState {
@@ -965,17 +956,16 @@ def activate():
 // ACTIVATION_PATHS or `state.license.read().await.state == "licensed"`.
 ```
 
-**How would Keysat itself do this?** Keysat already has the `Mode::Enforce`
-build-time flag in [`license_self.rs`](./licensing-service-startos/licensing-service/src/license_self.rs):
-when built with `KEYSAT_LICENSE_ENFORCE=1`, missing or invalid licenses
-cause the daemon to refuse to start (Flavor 1). Default Permissive
-builds run unlicensed at Creator-tier caps. To switch Keysat to Flavor 2
-("run but block until activated") would mean: keep the existing boot-time
-license check non-fatal, expose `/admin/login`-style activation endpoints
-under a hardcoded allowlist, and have an axum middleware return 402 on
-every other admin/business endpoint until `state.self_tier` flips from
-`Unlicensed` to `Licensed`. The pieces are all there — it's a few hundred
-lines of axum middleware + an SPA "Activate" splash screen.
+**How does Keysat itself handle this?** Keysat dogfoods the soft-gate
+pattern: missing or invalid licenses log a warning and the daemon
+starts in `Tier::Unlicensed` (the Creator-tier caps apply). The admin
+UI renders as Creator-tier with an upgrade CTA; product / policy / code
+creation endpoints return 402 once the tier caps are hit (see
+[`api/tier.rs`](./licensing-service-startos/licensing-service/src/api/tier.rs)).
+There's no `KEYSAT_LICENSE_ENFORCE` build flag — that was deprecated in
+favor of always-permissive boot + tier-cap enforcement at create-time.
+The pattern is a good reference for soft-gate or hard-gate-Flavor-2 in
+your own app: never block boot; gate work on entitlements.
 
 ### 7e. Packaging gotchas — Docker, s9pk, hermetic builds
 
@@ -1300,59 +1290,74 @@ in your app, a license issued for Recap would parse + signature-verify
 successfully inside Notewise — same public key, valid signature. That would
 be a real bug, not a theoretical one.
 
-**The protection exists, but it's your job to use it.** The LIC1 payload
-includes a signed `product_slug` field. Recap's licenses literally carry
-`"product_slug": "recap"` inside the signed bytes; Notewise's carry
-`"product_slug": "notewise"`. The signature covers those bytes, so the
-buyer can't tamper with them — but the SDK won't reject a wrong-product
-license unless you tell it which product you are.
+**Important: the signed payload carries a product UUID, not the product
+slug.** Every SDK exposes it as `productUuid` (TS), `product_id` (Python /
+Rust as a `uuid.UUID` / `[u8; 16]`), or `ProductID` (Go as `[16]byte`).
+There is no `product_slug` field on the payload. Treat the two paths
+differently:
 
-### Rule
+### Online path (preferred) — daemon resolves slug → UUID for you
 
-- **Online validation:** always pass `product_slug` to `client.validate(...)`.
-  The daemon enforces it and returns `reason: 'product_mismatch'` on mismatch.
-- **Offline verify:** always assert `payload.product_slug === MY_PRODUCT_SLUG`
-  after `parseAndVerify(...)`. The SDK does not do this for you.
-
-### Concrete pattern (TypeScript)
+Always pass the product slug to `client.validate(...)`. The daemon
+looks up the product by slug, fetches its UUID, and compares against
+the UUID baked into the license. If they don't match, you get
+`reason: 'product_mismatch'`. This is the simplest correct check.
 
 ```ts
 const MY_PRODUCT_SLUG = 'recap'  // hard-code; matches what the operator picked
-
-// Online — daemon enforces product_slug for you
 const r = await client.validate(licenseKey, MY_PRODUCT_SLUG, machineFingerprint)
 if (!r.ok) {
   // r.reason === 'product_mismatch' if a Notewise license was presented
   reject(r.reason)
   return
 }
+```
 
-// Offline — you must check yourself
-const payload = parseAndVerify(licenseKey, EMBEDDED_PUBKEY_PEM)
-if (payload.product_slug !== MY_PRODUCT_SLUG) {
+### Offline path — ask the operator for the product UUID and compare it
+
+Because the payload only has a UUID, you need the operator's product UUID
+(not just the slug) baked into your app to do an offline cross-product
+check. Get the UUID from the operator's admin UI (Products → Edit → the
+URL or the admin API: `GET /v1/admin/products` returns each product's `id`).
+Embed it as a constant alongside the slug.
+
+```ts
+const MY_PRODUCT_SLUG = 'recap'
+const MY_PRODUCT_UUID = '11111111-2222-3333-4444-555555555555' // ask the operator
+
+const ok = verifier.verify(licenseKey)
+if (ok.payload.productUuid !== MY_PRODUCT_UUID) {
   reject('product_mismatch')
   return
 }
 ```
 
-Same shape in Python / Rust / Go: pass `product_slug` to `validate`,
-check `payload.product_slug` after `parse_and_verify`. Every SDK exposes
-the field on the parsed payload object.
+For Python / Rust / Go, compare `payload.product_id` / `payload.ProductID`
+against the same UUID constant (parsed as `uuid.UUID` in Python, raw bytes
+in Rust / Go).
 
 ### Why the SDK doesn't auto-reject offline
 
-`ParseAndVerify` is intentionally low-level — it returns the verified
+`Verifier.verify` is intentionally low-level — it returns the verified
 payload and lets the caller decide what to enforce. A multi-product app
-(unusual but possible) might legitimately accept any product the operator
-signed for; a per-product app must reject mismatches. Making this opt-in
-keeps the SDK honest about what it's checking on your behalf.
+might legitimately accept any product the operator signed for; a
+per-product app must reject mismatches. Making this opt-in keeps the
+SDK honest about what it's checking on your behalf.
 
 ### Forgetting to check is a silent failure
 
-If you call `parseAndVerify` without asserting the product, a license
-from any of the operator's products will signature-verify and you'll
-treat it as valid. There is no warning. **Make the check a constant
-in your app and assert it on every code path that loads a license.**
+If you call `verifier.verify` without asserting the product UUID (or
+using the online `validate` path with the slug), a license from any
+of the operator's products will signature-verify and you'll treat it
+as valid. There is no warning. **Make the check a constant in your app
+and assert it on every code path that loads a license.**
+
+### Single-product instances don't need this
+
+If the operator runs one Keysat per product (most indie setups), you
+don't need the offline cross-product check at all — the daemon only
+mints licenses for the one product. The online `validate(slug, …)` call
+still catches typos in the slug, so it's worth doing either way.
 
 ---
 
@@ -1547,6 +1552,49 @@ session, _ := client.StartPurchase(ctx, PRODUCT_SLUG, keysat.StartPurchaseOption
 // open session.CheckoutURL; poll on settle
 ```
 
+### Rendering tier cards: what to surface
+
+The `listPublicPolicies` response gives you everything the operator's
+buy page renders. To match the buy page experience inside your app:
+
+- **`policy.entitlements`** is the granted-and-visible set. The daemon
+  already filtered out any entries the operator marked
+  `metadata.hidden_entitlements` for that tier (a feature shipped in
+  v0.2.0:24 — operators use it for "Everything in Basic, plus:"
+  marketing where they don't want to repeat already-implied items on
+  higher tiers). You don't need to filter further; just render.
+- **`policy.marketingBullets`** (camelCase in TS, `marketing_bullets`
+  in Python / Rust / Go) is operator-authored copy — short ✓ items
+  rendered alongside (or instead of) the entitlements list on the buy
+  page. Render them too; they're how the operator describes the tier
+  in plain language.
+- **`policy.marketingBulletsPosition`** is `"above"` (default) or
+  `"below"` — operator decides whether the marketing bullets appear
+  before or after the entitlement chips on the card.
+- **`policy.featuredDiscount`** (nullable) — when non-null, the operator
+  has flagged this tier with an active launch-special discount.
+  Surface it on the tier card: a struck-through original price, the
+  discounted price, and a "LAUNCH SPECIAL" / "N% OFF" ribbon. Auto-apply
+  the discount in `startPurchase` by passing the featured code's
+  `code` string in the `code` option — otherwise the buyer pays the
+  un-discounted price even though the card showed otherwise.
+- **`product.priceCurrency`** controls how to format prices. Possible
+  values: `"SAT"` (use `priceSats` as-is), `"USD"` / `"EUR"` (use
+  `priceValue` in cents and format as decimal dollars / euros). A
+  product's policies inherit the product's currency; render
+  accordingly.
+
+Reference formatter (TypeScript):
+
+```ts
+function formatPrice(p: PublicPolicy, product: Product): string {
+  const cur = product.priceCurrency ?? 'SAT'
+  if (cur === 'SAT') return `${p.priceSats.toLocaleString()} sats`
+  const main = (p.priceValue ?? 0) / 100
+  return `${cur === 'USD' ? '$' : '€'}${main.toFixed(2)}`
+}
+```
+
 ### Common mistakes
 
 - **Hardcoding policy slugs in the client.** The whole point of
@@ -1563,17 +1611,25 @@ session, _ := client.StartPurchase(ctx, PRODUCT_SLUG, keysat.StartPurchaseOption
   promos and referral discounts. It can't change which tier the buyer
   ends up on. Use `policySlug`.
 - **Forgetting `policySlug` and assuming the right tier.** With
-  `policySlug` omitted, the daemon picks the policy slugged "default"
-  (if any), else the first active one. On a Core/Pro setup where
-  Core happens to be alphabetically first or named "default", every
-  buyer who hits your in-app upgrade flow without a `policySlug` ends
-  up on Core regardless of what they clicked. Always pass the slug
-  the buyer chose.
+  `policySlug` omitted, the daemon picks the highlighted ("most
+  popular") policy if any, else the cheapest. On a Core/Pro setup
+  where Pro is highlighted, every buyer who hits your in-app upgrade
+  flow without a `policySlug` ends up on Pro regardless of what they
+  clicked. Always pass the slug the buyer chose.
 - **Copying the price from your hardcoded UI rather than the API.**
   Operators legitimately edit tier pricing in admin without warning;
   if you cache a price, you'll under- or over-charge buyers vs. what
   they actually pay. Render `policy.priceSats` directly from the
   current `listPublicPolicies` response.
+- **Assuming all prices are in sats.** A multi-currency product
+  (`priceCurrency === "USD"` or `"EUR"`) has its price in cents under
+  `priceValue` and a stale-or-zero `priceSats`. Format on `priceCurrency`
+  + `priceValue`, not `priceSats` alone.
+- **Skipping the featured-discount surfacing.** The buy page auto-
+  applies featured codes; your in-app picker doesn't unless you
+  forward `featuredDiscount.code` into `startPurchase`. Without this,
+  buyers see "LAUNCH SPECIAL" on your tier card but get charged the
+  un-discounted price at checkout — a real bug.
 
 ### Architecture diagram
 
@@ -1695,12 +1751,12 @@ function checkLicense() {
     const ok = verifier.verify(raw)
     return {
       state: 'licensed',
-      licenseId: ok.payload.licenseId,
+      licenseId: ok.licenseId, // top-level shortcut on the VerifyOk result
       entitlements: new Set(ok.payload.entitlements || []),
       expiresAt: ok.payload.expiresAt
         ? new Date(ok.payload.expiresAt * 1000)
         : null,
-      isTrial: !!(ok.payload.flags & 1),
+      isTrial: ok.payload.isTrial, // SDK pre-parses the flags; don't bit-math
     }
   } catch (e) {
     return { state: 'invalid', reason: e.message, entitlements: new Set() }
@@ -1785,12 +1841,20 @@ ship it.
   against slug `bar`. Typos in the slug constant cause "license valid
   but my code rejects it" head-scratchers. Read the slug from a
   single constant.
-- **Not asserting `product_slug` after offline verify.** `ParseAndVerify`
+- **Not asserting the product after offline verify.** `verifier.verify`
   checks the signature, not the product. If the operator sells multiple
   products from the same Keysat, every product's licenses share the
   signing key — a license for Product A will signature-verify inside
-  Product B's app. Always assert `payload.product_slug === MY_PRODUCT_SLUG`
-  after the parse. See §9a for the full pattern.
+  Product B's app. The payload carries a **product UUID, not a slug**;
+  the right check is either (a) call `client.validate(key, slug, …)`
+  so the daemon resolves slug → UUID server-side, or (b) embed the
+  operator's product UUID and assert `payload.productUuid === MY_PRODUCT_UUID`
+  offline. See §9a for both patterns.
+- **Doing flag bit-arithmetic for `isTrial`.** `(payload.flags & 1)`
+  is the `FINGERPRINT_BOUND` bit, NOT `TRIAL`. The TS / Python / Go
+  SDKs pre-parse the flags into `isTrial` / `is_trial` / `IsTrial()` —
+  use those. The Rust SDK requires manual math; if you need it, use
+  the exported `FLAG_TRIAL` constant (mask `0x02`).
 - **Logging the full license key.** It's a bearer credential — log
   the `license_id` instead.
 - **Refusing to start without a license.** Boot in unlicensed mode and
@@ -1819,6 +1883,51 @@ ship it.
   unlicensed user experiences as a broken app rather than a clear
   "activate to continue" screen. See §7f for the framework-agnostic
   pattern.
+
+---
+
+## 15a. Verify your integration with curl before writing app code
+
+Before wiring anything into the app, confirm the operator's Keysat is
+reachable and configured correctly. These four commands take ~30
+seconds and catch most "we agreed on the wrong slug" failures.
+
+```bash
+# Replace with your operator's values.
+export KEYSAT_BASE_URL='https://licensing.example.com'
+export PRODUCT_SLUG='your-product-slug'
+
+# 1. Daemon is reachable.
+curl -fsSL "$KEYSAT_BASE_URL/healthz" && echo " healthz OK"
+
+# 2. Issuer public key endpoint responds (so embed-time fetch works).
+curl -fsSL "$KEYSAT_BASE_URL/v1/issuer/public-key" | head -1
+
+# 3. The product slug exists and has at least one policy. If the JSON
+#    response is { "error": "not_found" }, you have a slug typo or the
+#    operator hasn't created the product yet.
+curl -fsSL "$KEYSAT_BASE_URL/v1/products/$PRODUCT_SLUG/policies" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("policies:", [p["slug"] for p in d.get("policies", [])])'
+
+# 4. Validate a real license key (ask the operator for one — a free-
+#    license discount-code redemption is the cheapest path).
+LICENSE_KEY='LIC1-...'
+curl -fsSL -X POST "$KEYSAT_BASE_URL/v1/validate" \
+  -H 'content-type: application/json' \
+  -d '{"key":"'"$LICENSE_KEY"'","product":"'"$PRODUCT_SLUG"'"}' \
+  | python3 -m json.tool
+```
+
+If all four commands succeed, the daemon is wired correctly and you
+have a valid license key to test against. Now write the integration.
+
+If step 3 returns an empty `policies` array, the operator hasn't
+created any policies for this product yet — surface that to them
+before continuing (no policies means no buyer-purchasable tiers).
+
+If step 4 returns `{ "ok": false, "reason": "..." }`, the license
+isn't valid for this product. The most common cause is a slug typo
+in the operator's product setup vs. what they told you.
 
 ---
 
