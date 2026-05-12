@@ -1,9 +1,9 @@
 # Integrating Keysat licensing into your software
 
 This document is the complete instruction set for adding Keysat-based
-licensing to any application. It covers Node/TypeScript, Python, and Rust.
-Hand it to an LLM (or a developer) along with your codebase and ask them
-to wire it up — they should have everything they need.
+licensing to any application. It covers Node/TypeScript, Python, Rust,
+and Go. Hand it to an LLM (or a developer) along with your codebase and
+ask them to wire it up — they should have everything they need.
 
 ## How to use this document
 
@@ -51,7 +51,7 @@ hangs on these:
      but won't function without a paid license. The binary is essentially
      a locked installer until the buyer activates. Common for closed-source
      paid apps and for open-source apps that the operator chooses to
-     monetize through the registry distribution. See section **7d** for the
+     monetize through the registry distribution. See section **7e** for the
      two flavors of hard gating (refuse-to-start vs. activate-screen-only).
    - **Nag mode** — no enforcement; just a "support development" banner
      when unlicensed. Pure honor system. Useful when the app is
@@ -416,7 +416,10 @@ StartOS Actions UI for buyers to paste keys into.
 Every integration follows the same shape regardless of language and
 regardless of which enforcement model from question 4 the operator picked.
 The verify-once-at-startup primitive is the same; what you do with the
-result is what changes.
+result is what changes. The doc is structured the same way: section 7
+covers the verify primitive in each language; section 7e covers the
+hard-gate enforcement flavors; the worked examples in section 14 show
+soft-gate; the patterns are mix-and-match.
 
 ```
 on startup:
@@ -437,11 +440,11 @@ on startup:
     # Then — depending on the operator's chosen model:
     #
     #   HARD GATE  : if not licensed, exit (Flavor 1) or block all
-    #                business endpoints (Flavor 2). See section 7d.
+    #                business endpoints (Flavor 2). See section 7e.
     #
     #   SOFT GATE  : run normally; specific feature handlers consult
     #                license_state.entitlements before unlocking.
-    #                See section 7a/7b/7c.
+    #                See section 7a/7b/7c/7d.
     #
     #   NAG MODE   : run normally; show a "support development" banner
     #                in the UI when license_state.state != 'licensed'.
@@ -449,7 +452,7 @@ on startup:
 
 The verify-and-populate-state step is identical for all three models.
 The doc is structured the same way: section 7 covers the verify
-primitive in each language; section 7d covers the hard-gate enforcement
+primitive in each language; section 7e covers the hard-gate enforcement
 flavors; the worked examples in section 14 show soft-gate; the
 patterns are mix-and-match.
 
@@ -483,26 +486,11 @@ direct callers but the timer keeps humming along.
 
 ### 7a. TypeScript / Node
 
-**Install (preferred, once published):**
+**Install:**
 
 ```bash
 npm install @keysat/licensing-client
 ```
-
-**GitHub fallback** (the npm package is pending publication; the GitHub
-repo is public and installable directly):
-
-```jsonc
-// package.json
-"dependencies": {
-  "@keysat/licensing-client": "git+https://github.com/keysat-xyz/keysat-client-ts.git"
-}
-```
-
-Use the explicit `git+https://` form (not the `github:user/repo` shorthand),
-which avoids the ssh-vs-https resolution drift that bites hermetic build
-environments. The SDK's `prepare` script builds `dist/` automatically on
-git install, so no extra steps are needed.
 
 **Embed the public key.** The simplest way is to commit the PEM file
 to your repo at `assets/issuer.pub` and import it as a raw string:
@@ -592,22 +580,11 @@ app.post('/api/export', (req, res) => {
 
 ### 7b. Python
 
-**Install (preferred, once published):**
+**Install:**
 
 ```bash
 pip install keysat-licensing-client
 ```
-
-**GitHub fallback** (if the PyPI package isn't published yet). The
-`keysat-xyz/keysat-client-python` repo must be **public** on GitHub
-for this to work in clean environments:
-
-```bash
-pip install git+https://github.com/keysat-xyz/keysat-client-python.git
-```
-
-(Python's pip-from-git path is simpler than npm's — no separate build
-step is required since pure-Python packages are installable from source.)
 
 **Embed the public key** at a path your code can read:
 
@@ -694,22 +671,13 @@ def export_endpoint():
 
 ### 7c. Rust
 
-**Install (preferred, once published):**
+**Install:**
 
 ```toml
 # Cargo.toml
 [dependencies]
-keysat-licensing-client = "0.1"
+keysat-licensing-client = "0.3"
 ```
-
-**Git fallback** (if not on crates.io yet). The
-`keysat-xyz/keysat-client-rust` repo must be **public** on GitHub:
-
-```toml
-keysat-licensing-client = { git = "https://github.com/keysat-xyz/keysat-client-rust.git" }
-```
-
-Cargo builds from source, so no separate build step is required.
 
 **Embed the public key:**
 
@@ -815,7 +783,124 @@ if !lic.entitlements.contains("export") {
 }
 ```
 
-### 7d. Hard-gate patterns — "the app doesn't function without a license"
+### 7d. Go
+
+**Install:**
+
+```bash
+go get github.com/keysat-xyz/keysat-client-go@latest
+```
+
+The package is `github.com/keysat-xyz/keysat-client-go` (imported as
+`keysat`). Stdlib-only — no third-party Go dependencies.
+
+**Embed the public key:**
+
+```go
+import _ "embed"
+
+//go:embed assets/issuer.pub
+var issuerPEM string
+```
+
+**Verify on startup:**
+
+```go
+// internal/license/license.go
+package license
+
+import (
+    "crypto/ed25519"
+    _ "embed"
+    "encoding/hex"
+    "os"
+    "strings"
+    "time"
+
+    "github.com/keysat-xyz/keysat-client-go"
+)
+
+const ProductSlug = "<your-product-slug>"
+
+//go:embed ../../assets/issuer.pub
+var issuerPEM string
+
+var issuerKey ed25519.PublicKey
+
+func init() {
+    k, err := keysat.LoadPublicKeyPEM(issuerPEM)
+    if err != nil {
+        panic("bad embedded issuer pubkey: " + err.Error())
+    }
+    issuerKey = k
+}
+
+type State struct {
+    State        string // "licensed" | "unlicensed" | "invalid"
+    Reason       string
+    LicenseID    string
+    Entitlements map[string]struct{}
+    ExpiresAt    *time.Time
+    IsTrial      bool
+}
+
+func readKey() string {
+    if v := strings.TrimSpace(os.Getenv("MYAPP_LICENSE_KEY")); v != "" {
+        return v
+    }
+    path := os.Getenv("MYAPP_LICENSE_KEY_PATH")
+    if path == "" {
+        path = "/data/license.txt"
+    }
+    b, err := os.ReadFile(path)
+    if err != nil {
+        return ""
+    }
+    return strings.TrimSpace(string(b))
+}
+
+func Check() State {
+    raw := readKey()
+    if raw == "" {
+        return State{State: "unlicensed"}
+    }
+    payload, err := keysat.ParseAndVerify(raw, issuerKey)
+    if err != nil {
+        return State{State: "invalid", Reason: err.Error()}
+    }
+    ents := make(map[string]struct{}, len(payload.Entitlements))
+    for _, e := range payload.Entitlements {
+        ents[e] = struct{}{}
+    }
+    var exp *time.Time
+    if payload.ExpiresAt != 0 {
+        t := time.Unix(payload.ExpiresAt, 0).UTC()
+        exp = &t
+    }
+    return State{
+        State:        "licensed",
+        LicenseID:    hex.EncodeToString(payload.LicenseID[:]),
+        Entitlements: ents,
+        ExpiresAt:    exp,
+        IsTrial:      payload.IsTrial(), // method, not field — Go SDK pre-parses
+    }
+}
+```
+
+**Use it:**
+
+```go
+lic := license.Check()
+log.Printf("[license] state=%s entitlements=%v", lic.State, lic.Entitlements)
+
+// At a feature gate:
+if _, ok := lic.Entitlements["export"]; !ok {
+    http.Error(w, `{"error":"feature_not_in_tier","message":"Export requires a paid license."}`, http.StatusPaymentRequired)
+    return
+}
+```
+
+### 7e. Hard-gate patterns — "the app doesn't function without a license"
 
 If the operator chose **hard gate** in the section-0 questions (binary
 freely downloadable, but locked until activated), use one of these two
@@ -967,7 +1052,7 @@ favor of always-permissive boot + tier-cap enforcement at create-time.
 The pattern is a good reference for soft-gate or hard-gate-Flavor-2 in
 your own app: never block boot; gate work on entitlements.
 
-### 7e. Packaging gotchas — Docker, s9pk, hermetic builds
+### 7f. Packaging gotchas — Docker, s9pk, hermetic builds
 
 Most non-trivial integrations end up packaged in Docker (Start9 s9pk,
 generic container deploys, CI-built images). The following gotchas
@@ -1043,11 +1128,11 @@ rm myapp_x86_64.s9pk && make x86
 **5. The `--ignore-scripts` flag will skip the SDK's `prepare` build.**
 If your Dockerfile uses `npm ci --ignore-scripts` (a common security
 hardening), the SDK won't build its `dist/` and you'll hit the
-"Cannot find module" runtime error from §7a. Either drop
+"Cannot find module" runtime error from the npm install. Either drop
 `--ignore-scripts` for the builder stage, or pre-build the SDK
 elsewhere and vendor `dist/` in.
 
-### 7f. Frontend integration for hard-gate Flavor 2
+### 7g. Frontend integration for hard-gate Flavor 2
 
 If you picked hard-gate Flavor 2 (server starts, business endpoints
 return 402 until activated), **the frontend is half the work** —
@@ -1864,7 +1949,7 @@ ship it.
   If your Dockerfile lists individual server files explicitly, adding
   `server/license.js` requires its own `COPY` line. Build succeeds,
   container starts, then crashes at startup with `Cannot find module
-  './license.js'`. See §7e for the full Docker checklist.
+  './license.js'`. See §7f for the full Docker checklist.
 - **Letting the SDK ship without a built `dist/`.** Git installs of
   the Keysat client *only* work if the package has a `prepare` script
   that builds on install (or commits its `dist/` directory). Without
@@ -1881,7 +1966,7 @@ ship it.
 - **Skipping the frontend half of hard-gate Flavor 2.** A server-only
   integration boots happily but every request 402s, which the
   unlicensed user experiences as a broken app rather than a clear
-  "activate to continue" screen. See §7f for the framework-agnostic
+  "activate to continue" screen. See §7g for the framework-agnostic
   pattern.
 
 ---
