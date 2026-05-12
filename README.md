@@ -5,8 +5,36 @@
 <h1 align="center">Keysat</h1>
 
 <p align="center">
-  Bitcoin-native self-hosted licensing service for software creators. Runs on Start9.
+  Self-hosted licensing server. Sell software on payment channels you control,
+  verify licenses offline, keep the keys + customer list on your hardware. Runs on Start9.
 </p>
+
+<p align="center">
+  <a href="https://keysat.xyz">keysat.xyz</a> &middot;
+  <a href="https://docs.keysat.xyz">docs.keysat.xyz</a> &middot;
+  <a href="https://github.com/keysat-xyz/keysat/releases">Releases</a>
+</p>
+
+---
+
+## Quick start
+
+**Operator (install Keysat on your Start9):** add `registry.keysat.xyz` to your StartOS marketplace and install. Sideload the `.s9pk` from [GitHub releases](https://github.com/keysat-xyz/keysat/releases/latest) if you prefer. See [Install &amp; setup](https://docs.keysat.xyz/install.html) for the full walkthrough.
+
+**Developer (verify a license in your software):** four official SDKs ship today, all wire-compatible against the same cross-check fixtures in [`licensing-service/tests/crosscheck/`](licensing-service/tests/crosscheck/).
+
+| Language | Install |
+|---|---|
+| TypeScript | `npm install @keysat/licensing-client` |
+| Rust | `cargo add keysat-licensing-client` |
+| Python | `pip install keysat-licensing-client` |
+| Go | `go get github.com/keysat-xyz/keysat-client-go` |
+
+See [Integrate the SDK](https://docs.keysat.xyz/integrate.html) for the five-line verifier pattern.
+
+**Operator agent / automation:** the daemon exposes an OpenAPI 3.1 spec, scoped API keys with role-based access, and outbound webhooks. See [Agent integration](https://docs.keysat.xyz/agent.html).
+
+---
 
 > **About this README.** Keysat is a from-scratch service authored for
 > StartOS — there is no upstream project to differ from. The canonical
@@ -87,10 +115,12 @@ mandatory.
 4. Set your **operator name** (shown on the public homepage and in
    buyer-facing receipts).
 5. Create one or more **products** — each represents something you sell.
-6. Create at least one **policy** per product. The policy slugged
-   `default` is consumed by the standard public purchase flow; other
-   slugs are used for manual issuance. Policies define duration, grace
-   period, seat cap, entitlements, trial flag, and price overrides.
+6. Create at least one **policy** per product. Multi-tier ladders
+   (Basic / Pro / Max) are first-class: when a product has two or more
+   public policies, the buy page renders a tier picker and the buyer
+   chooses before paying. Policies define duration, grace period, seat
+   cap, entitlements, recurring cadence, trial flag, price overrides,
+   marketing bullets, and per-entitlement hide-on-buy-page toggles.
 7. Optionally create **discount / referral / free-license codes** (see
    `Create discount code` action).
 8. Share the public service URL with buyers.
@@ -146,7 +176,7 @@ Grouped as displayed in the dashboard.
 
 **Licenses**
 - *Issue license manually* — comp / press / grandfathered keys.
-- *Search licenses* — by email, Nostr npub, or BTCPay invoice id.
+- *Search licenses* — by email or BTCPay invoice id.
 - *Suspend license* — reversible lockout.
 - *Unsuspend license*.
 - *Revoke license* — terminal kill.
@@ -192,15 +222,13 @@ the container automatically.
 
 ## Limitations and Differences
 
-Known v0.1 limitations:
+Known current limitations:
 
-- **No buyer self-service portal.** Buyers cannot log in to view their licenses, transfer to a new machine, or recover a lost key without contacting the operator. Use *Search licenses* to recover.
-- **No recurring subscriptions.** Time-limited licenses expire and require a manual repurchase. BTCPay supports recurring billing but Keysat does not yet model auto-renewal.
-- **No license tier upgrade in place.** A buyer who got Standard cannot be upgraded to Pro on the existing key — they need a new key.
-- **No bulk / volume licensing.** "Buy 10 keys at once with discount" is not built in.
-- **No in-dashboard list views.** Operators query large datasets via the admin API key rather than a paginated UI.
-- **Webhook delivery retries are bounded.** A subscriber down past the retry window will miss events. BTCPay invoice reconciliation runs as a background poll so dropped *payment* webhooks are recovered.
-- **Hardware fingerprinting is client-supplied.** Keysat does not derive fingerprints itself; the buyer-side SDK passes whatever the integrator chose.
+- **Buyer self-service recovery is by-design minimal.** Buyers can re-derive a lost license at `/recover` using (invoice id, buyer email). They cannot transfer between machines without contacting the operator (use *Free a machine seat* in the admin / agent API).
+- **No bulk / volume licensing UI.** "Buy 10 keys at once with discount" is not built into the buy page. Operators can issue N comp licenses via the admin API in a loop.
+- **Webhook delivery retries are bounded.** A subscriber down past the 10-attempt retry window lands in the dead-letter queue (visible in admin UI → Webhooks → Failed). BTCPay invoice reconciliation runs as a background poll so dropped *payment* webhooks are recovered.
+- **Hardware fingerprinting is client-supplied.** Keysat does not derive fingerprints itself; the buyer-side SDK passes whatever the integrator chose. The fingerprint is bound on first activate and enforced thereafter.
+- **Card payments not shipped.** The Zaprite payment provider is in design for v0.3 — operators on Pro / Patron will get a card-payment option alongside BTCPay. Until then, payments are BTC / Lightning only.
 
 ## What Is Unchanged from Upstream
 
@@ -267,7 +295,7 @@ firstRun:
       severity: critical
       runs: configureBtcpay
 features:
-  paymentRail: btcpay-server
+  paymentRail: btcpay-server   # zaprite planned for v0.3 (card payments)
   signing: ed25519
   offlineVerification: true
   multiSeat: true
@@ -275,8 +303,24 @@ features:
   expiry: true
   gracePeriod: true
   entitlements: true
-  discountCodes: [percent, fixed_sats, free_license]
+  entitlementsCatalog: per-product   # typed slugs with display names + descriptions
+  hiddenEntitlements: per-policy    # license-granted but hidden from buy page
+  marketingBullets: per-policy      # operator-authored ✓ items on tier cards
+  multiCurrency: [SAT, USD, EUR]    # auto-converted at invoice creation
+  discountCodes: [percent, fixed_sats, set_price, free_license]
+  featuredDiscounts: true   # launch-special, auto-applies on the buy page
+  multiPolicyDiscountScope: true   # one code can apply to N policies
+  recurringSubscriptions: true   # auto-renew with trials + grace
+  tierUpgrades: true   # in-place tier upgrade with proration
   outboundWebhooks: true
+  webhookDlq: true   # failed deliveries retryable from admin UI
   auditLog: true
-  selfLicensingTier: stub-v0.1
+  scopedApiKeys: [read-only, license-issuer, support, full-admin]
+  openapiSpec: /v1/openapi.json
+  selfLicensingTier: [Creator, Pro, Patron]
+sdks:
+  - typescript: "@keysat/licensing-client (npm)"
+  - rust: "keysat-licensing-client (crates.io)"
+  - python: "keysat-licensing-client (PyPI)"
+  - go: "github.com/keysat-xyz/keysat-client-go"
 ```
