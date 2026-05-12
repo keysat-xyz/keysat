@@ -58,6 +58,12 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:38 — **Admin UI: Create-product Cancel button + modal-overflow fix across all dialogs.** Two operator-reported bugs.',
+  '',
+  '**Create product: Cancel button.** The "Create a new product" disclosure had a Create button but no way to back out without scrolling up to the chevron. Added a secondary Cancel button alongside Create — collapses the disclosure (returns to the products list) without clearing typed input, so re-expanding picks up where the operator left off.',
+  '',
+  '**Modal overflow fix.** The Edit-product modal could grow taller than the viewport when a product had a long entitlements catalog, leaving the operator unable to scroll to the Save button. Cause: the modal card lacked `max-height` + `overflow-y`. Added `max-height:90vh; overflow-y:auto` to that card AND to every other dialog card in the admin UI (11 modals total — tier-cap upgrade, force-delete confirm, value-prompt, generic-confirm, license-issued display, BTCPay-connect, scoped-API-key generate, scoped-API-key show-once, edit-product, edit-policy, edit-discount-code). Same fix, applied defensively everywhere so this class of bug can\'t recur as content grows.',
+  '',
   '0.2.0:37 — **"Limited" → "Limited discount".** Adds the word "discount" to the launch-special remaining-count label so it\'s unambiguous what\'s limited. Without it, a buyer scanning a tier card with a launch ribbon might read "Limited: 10 remaining" as "only 10 licenses left at this tier" rather than "only 10 uses of the discount code left." Both surfaces (buy page tier card + landing-page dynamic card) now render "Limited discount: N remaining". Cosmetic.',
   '',
   '0.2.0:36 — **Launch-special remaining count drops the total.** The buy-page tier card\'s "Limited: N of M remaining" line now reads just "Limited: N remaining". The total cap (M) is operator-private — there\'s no upside to exposing initial volume to buyers, and it can make a tier look smaller than the operator wants to signal. Symmetric change in the landing-page dynamic tier-card render. Cosmetic; no API or schema change.',
@@ -499,7 +505,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:37',
+  version: '0.2.0:38',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

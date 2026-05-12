@@ -562,7 +562,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const card = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
         'border-radius:12px; max-width:440px; width:100%; padding:28px 26px; ' +
-        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
     }, [
       el('div', { class: 'eyebrow', style: 'color:var(--gold-700); margin-bottom:8px' }, 'Upgrade required'),
       el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:22px; margin:0 0 12px; color:var(--navy-950); letter-spacing:-0.01em;' }, 'You\'ve hit a Creator-tier cap'),
@@ -710,7 +710,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const card = el('div', {
       style: 'background:var(--cream-50); border:2px solid var(--danger); ' +
         'border-radius:12px; max-width:480px; width:100%; padding:28px 26px; ' +
-        'box-shadow:0 16px 32px rgba(178,58,58,0.20);',
+        'box-shadow:0 16px 32px rgba(178,58,58,0.20); max-height:90vh; overflow-y:auto;',
     }, [
       el('div', { class: 'eyebrow', style: 'color:var(--danger); margin-bottom:8px' }, 'Force delete — destructive'),
       el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:22px; margin:0 0 12px; color:var(--navy-950); letter-spacing:-0.01em;' }, `Wipe ${kind} "${slug}" and everything tied to it?`),
@@ -965,7 +965,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         style:
           'background:var(--cream-50); border:1px solid var(--border-1); ' +
           'border-radius:12px; max-width:480px; width:100%; padding:24px; ' +
-          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
       }, [
         el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, opts.eyebrow || 'Confirm'),
         el('h3', {
@@ -1054,7 +1054,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         style:
           'background:var(--cream-50); border:1px solid var(--border-1); ' +
           'border-radius:12px; max-width:480px; width:100%; padding:24px; ' +
-          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
       }, [
         el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, opts.eyebrow || 'Confirm'),
         el('h3', {
@@ -1552,7 +1552,8 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const card = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
         'border-radius:12px; max-width:640px; width:100%; padding:24px; ' +
-        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); ' +
+        'max-height:90vh; overflow-y:auto;',
     }, [
       el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Edit product'),
       el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:20px; margin:0 0 6px; color:var(--navy-950);' }, p.slug),
@@ -1680,10 +1681,11 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         // over) for products. Renders inline above the submit so they
         // know what to expect before clicking.
         capPreCheckCard(tierStatus, 'products', 'products'),
-        el('button', { class: 'btn primary', style: 'margin-top:16px' }, 'Create product').addEventListener
-          ? null : null, // dummy; the real button is below for clarity
+        // Create + Cancel row. Cancel collapses the disclosure
+        // (returns the operator to the products list) without clearing
+        // typed input — re-expanding picks up where they left off.
         (() => {
-          const btn = el('button', { class: 'btn primary', style: 'margin-top:16px' }, 'Create product')
+          const btn = el('button', { class: 'btn primary' }, 'Create product')
           btn.addEventListener('click', async () => {
             const status = el('div', { class: 'muted', style: 'margin-top:8px' }, 'Creating…')
             create.querySelector('.body').appendChild(status)
@@ -1714,7 +1716,11 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
               else status.replaceWith(err(e.message))
             }
           })
-          return btn
+          const cancelBtn = el('button', {
+            class: 'btn secondary',
+            onclick: () => { create.open = false },
+          }, 'Cancel')
+          return el('div', { style: 'display:flex; gap:10px; margin-top:16px;' }, [btn, cancelBtn])
         })(),
       ].filter(Boolean)),
     ])
@@ -5086,7 +5092,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       const card = el('div', {
         style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
           'border-radius:12px; max-width:560px; width:100%; padding:28px 26px; ' +
-          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+          'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
       }, [
         el('div', { class: 'eyebrow', style: 'color:var(--gold-700); margin-bottom:8px' }, 'License issued'),
         el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:22px; margin:0 0 6px; color:var(--navy-950); letter-spacing:-0.01em;' }, 'Save the key now'),
@@ -5878,7 +5884,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     cancelBtn.addEventListener('click', () => overlay.remove())
     const cardEl = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); border-radius:12px; max-width:540px; width:100%; padding:24px; ' +
-        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
     }, [
       el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Connect'),
       el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 6px; color:var(--navy-950);' },
@@ -5987,7 +5993,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     })
     const cardEl = el('div', {
       style: 'background:var(--cream-50); border:1px solid var(--border-1); border-radius:12px; max-width:540px; width:100%; padding:24px; ' +
-        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20);',
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
     }, [
       el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'New API key'),
       el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 14px; color:var(--navy-950);' },
@@ -6024,7 +6030,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     closeBtn.addEventListener('click', () => { overlay.remove(); onClose && onClose() })
     const cardEl = el('div', {
       style: 'background:var(--cream-50); border:2px solid var(--gold-500); border-radius:12px; max-width:600px; width:100%; padding:28px 26px; ' +
-        'box-shadow:0 16px 32px rgba(14,31,51,0.20);',
+        'box-shadow:0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
     }, [
       el('div', { class: 'eyebrow', style: 'color:var(--gold-700); margin-bottom:8px' }, 'Save this token now'),
       el('h3', { style: 'font-family:var(--font-display); font-weight:700; font-size:20px; margin:0 0 12px; color:var(--navy-950);' },
