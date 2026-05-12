@@ -5794,7 +5794,13 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       } else {
         buttons.push(el('button', {
           class: 'btn sm primary',
-          onclick: () => openConnectModal(name, label, () => renderPaymentProvidersCard(host)),
+          onclick: () => {
+            if (name === 'btcpay') {
+              openBtcpayConnectModal(() => renderPaymentProvidersCard(host))
+            } else {
+              openConnectModal(name, label, () => renderPaymentProvidersCard(host))
+            }
+          },
         }, 'Connect'))
       }
       return el('div', {
@@ -5895,6 +5901,105 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     ])
     overlay.appendChild(cardEl)
     overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+  }
+
+  // BTCPay one-click connect modal.
+  //
+  // Replaces the manual base-URL / API-key / store-id / webhook-secret
+  // paste flow. BTCPay's Greenfield API has a native consent endpoint
+  // (/api-keys/authorize) — the daemon's /v1/admin/btcpay/connect returns
+  // a pre-built authorize URL we open in a new tab. After the operator
+  // clicks Authorize in BTCPay, BTCPay redirects to our
+  // /v1/btcpay/authorize/callback, which auto-detects the store,
+  // registers the webhook, and persists everything. We poll
+  // /v1/admin/btcpay/status here every 2.5s so the modal closes itself
+  // the moment connection lands.
+  async function openBtcpayConnectModal(onSuccess) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px; overflow-y:auto;',
+    })
+    const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px; min-height:18px' }, '')
+    let pollTimer = null
+    function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } }
+    function close() { stopPolling(); overlay.remove() }
+
+    const openBtn = el('button', { class: 'btn primary' }, 'Open BTCPay to authorize')
+    const cancelBtn = el('button', { class: 'btn secondary' }, 'Cancel')
+    const urlBox = el('div', {
+      style: 'display:none; margin-top:12px; padding:10px 12px; background:var(--cream-100); ' +
+        'border:1px solid var(--border-1); border-radius:8px; font-family:var(--font-mono); ' +
+        'font-size:11.5px; word-break:break-all; color:var(--ink-700)',
+    }, '')
+    const urlCopy = el('button', {
+      class: 'btn sm secondary',
+      style: 'display:none; margin-top:6px',
+    }, 'Copy URL')
+
+    openBtn.addEventListener('click', async () => {
+      openBtn.disabled = true
+      status.textContent = 'Requesting authorize URL from BTCPay…'
+      let authorizeUrl
+      try {
+        const resp = await api('/v1/admin/btcpay/connect', { method: 'POST', body: {} })
+        authorizeUrl = resp.authorize_url
+        if (!authorizeUrl) throw new Error('No authorize_url in response')
+      } catch (e) {
+        status.textContent = e.message || 'Could not start authorize flow.'
+        openBtn.disabled = false
+        return
+      }
+      window.open(authorizeUrl, '_blank', 'noopener')
+      urlBox.textContent = authorizeUrl
+      urlBox.style.display = 'block'
+      urlCopy.style.display = 'inline-block'
+      urlCopy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(authorizeUrl)
+          urlCopy.textContent = 'Copied'
+          setTimeout(() => { urlCopy.textContent = 'Copy URL' }, 1400)
+        } catch (_) {}
+      }
+      openBtn.textContent = 'Re-open authorize page'
+      openBtn.onclick = () => window.open(authorizeUrl, '_blank', 'noopener')
+      openBtn.disabled = false
+      status.textContent = 'Approve in the new tab, then return here — this dialog will close automatically.'
+
+      pollTimer = setInterval(async () => {
+        try {
+          const s = await api('/v1/admin/btcpay/status')
+          if (s && s.connected) {
+            close()
+            onSuccess && onSuccess()
+          }
+        } catch (_) {
+          // Non-fatal — keep polling. BTCPay callback might still be
+          // mid-flight or the operator hasn't approved yet.
+        }
+      }, 2500)
+    })
+    cancelBtn.addEventListener('click', close)
+
+    const cardEl = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); border-radius:12px; max-width:540px; width:100%; padding:24px; ' +
+        'box-shadow:0 0 0 1px var(--gold-500) inset, 0 16px 32px rgba(14,31,51,0.20); max-height:90vh; overflow-y:auto;',
+    }, [
+      el('div', { class: 'eyebrow', style: 'margin-bottom:8px' }, 'Connect'),
+      el('h3', { style: 'font-family:var(--font-display); font-weight:600; font-size:18px; margin:0 0 6px; color:var(--navy-950);' },
+        'Connect BTCPay Server'),
+      el('p', { class: 'muted', style: 'margin:6px 0 12px; font-size:13px; line-height:1.5' },
+        'One-click connect via BTCPay’s native authorize flow. Click below to open a consent page in your BTCPay server; ' +
+        'after you click Authorize there, Keysat auto-detects the store, registers the webhook, and finishes setup. ' +
+        'You don’t need to copy an API key or store id anywhere.'),
+      openBtn,
+      status,
+      urlBox,
+      urlCopy,
+      el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [cancelBtn]),
+    ])
+    overlay.appendChild(cardEl)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close() })
     document.body.appendChild(overlay)
   }
 
