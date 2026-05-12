@@ -158,7 +158,7 @@ pub async fn callback(
     Form(form): Form<CallbackForm>,
 ) -> AppResult<Response> {
     finish_connect(&state, &q.state, &form.api_key).await?;
-    Ok(success_page("BTCPay connected successfully. You can close this tab and return to StartOS."))
+    Ok(success_page("BTCPay connected successfully. You can close this tab and return to Keysat."))
 }
 
 /// Some BTCPay deployments send the apiKey back as a query string on a GET.
@@ -190,7 +190,7 @@ pub async fn callback_get(
     };
     match finish_connect(&state, &q.state, &api_key).await {
         Ok(()) => success_page(
-            "BTCPay connected successfully. You can close this tab and return to StartOS.",
+            "BTCPay connected successfully. You can close this tab and return to Keysat.",
         ),
         Err(e) => Html(format!(
             "<html><body><h2>BTCPay authorization failed</h2><p>{}</p></body></html>",

@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:43 — **BTCPay authorize success page now says "return to Keysat" instead of "return to StartOS".** The success page is the lightweight HTML BTCPay redirects to after the operator clicks Authorize. With the BTCPay connect flow living inside Keysat\'s admin UI (since the :40-era admin-UI redesign), "return to StartOS" was misdirecting the operator — Keysat\'s own tab is what they came from and what they want to return to. One-line copy change in `success_page()` and the GET fallback path in `btcpay_authorize.rs`; no behavior change.',
+  '',
   '0.2.0:42 — **Revert the implicit Patron→Pro entitlement expansion shipped in :41.** Reasoning on revert: the only license affected by the missing-entitlement bug was the master operator\'s own pre-launch self-license, issued under an earlier entitlement scheme. The Patron policy on the master Keysat now lists the correct entitlements, so any fresh Patron license issued today carries them in the signed payload directly. Making `patron` a magic superset at the resolution layer was paying ongoing complexity tax (entitlement-renames have to update a hardcoded list; the gate behavior diverges from what the policy literally says) for a one-shot migration that won\'t recur. Operators with a stuck old-scheme Patron license should re-issue + run "Activate Keysat license" — the new license overwrites `/data/keysat-license.txt` and the daemon picks up the fresh entitlements without a restart. The :41 BTCPay one-click authorize-flow restoration in the admin UI is unchanged.',
   '',
   '0.2.0:41 — **Two fixes: Patron tier now implies the full Pro feature surface, and BTCPay Connect is back to one-click authorize.** Both came from operator-side bugs that the admin-UI redesign exposed.',
@@ -519,7 +521,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:42',
+  version: '0.2.0:43',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
