@@ -154,6 +154,35 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // 5-min discount-redemption reaper — frees discount-code slots that
+    // were reserved at /v1/purchase time for buyers who never paid.
+    // Two failure cases get cleaned up here: (a) BTCPay fired
+    // InvoiceExpired/InvoiceInvalid but our webhook handler failed to
+    // release the slot inline, and (b) BTCPay never delivered the
+    // expiry webhook at all. 30-min stale threshold covers BTCPay's
+    // default 15-min invoice expiry plus a buffer for webhook delivery.
+    {
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Burn the immediate-fire tick so first real run is 5 min
+            // after boot — gives webhook handling a chance to settle
+            // any racing-with-startup invoices.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match db::repo::reap_stale_pending_redemptions(&pool, 30).await {
+                    Ok(n) if n > 0 => tracing::info!(
+                        "reaped {n} stale discount-code redemption(s); slots returned to pool"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("redemption reaper: {e}"),
+                }
+            }
+        });
+    }
+
     // Self-tier live refresher — re-reads the daemon's own license
     // row from the local DB every hour and updates `state.self_tier`
     // with the live entitlements. Without this, an admin Change Tier

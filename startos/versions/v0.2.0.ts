@@ -58,6 +58,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  '0.2.0:40 — **Discount-code slot reaper plugs the abandoned-cart leak.** When a buyer clicked Pay with Bitcoin with a discount code applied, the daemon reserved a slot on that code (incrementing `used_count`) BEFORE creating the BTCPay invoice. This is the right pessimistic-lock behavior — prevents two buyers from racing for the last slot of a limited code — but it meant abandoned checkouts only freed the slot when BTCPay later fired `InvoiceExpired`. If that webhook never landed (network blip, daemon offline at the firing moment, misconfigured webhook URL), the slot leaked forever. New 5-minute background reaper closes both holes: scans `discount_redemptions` where status=\'pending\' and the linked invoice is either in a terminal failure state (\'expired\' / \'invalid\') OR has been sitting in \'pending\' for more than 30 minutes, and cancels each one — flipping the redemption to \'cancelled\' and decrementing the code\'s `used_count` so the slot is available again. 30-min threshold covers BTCPay\'s default 15-min invoice expiry plus webhook-delivery buffer. Lives alongside the existing hourly session reaper in `main.rs`. Internal-only; no API or schema change. Operator-visible only in the sense that limited-discount slots no longer drift over time.',
+  '',
   '0.2.0:39 — **Buy page now renders a tier card for single-public-policy products.** Previously the tier picker only rendered when a product had two or more public policies; single-public-policy products fell back to a bare price card + form, swallowing all the operator-configured entitlements, marketing bullets, and tier descriptions. Fixed: render a single centered tier card (new `.tiers-1` grid class, ~480px max-width) whenever there\'s at least one public policy. Operators who keep most tiers private and only expose one (e.g. "Pro" public, "Core" and "Max" admin-only) now see the same rich tier-card render that multi-tier products get. The price card below still renders unchanged as the buy-confirmation summary.',
   '',
   '0.2.0:38 — **Admin UI: Create-product Cancel button + modal-overflow fix across all dialogs.** Two operator-reported bugs.',
@@ -507,7 +509,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:39',
+  version: '0.2.0:40',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under

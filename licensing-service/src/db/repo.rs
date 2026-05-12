@@ -2817,6 +2817,55 @@ pub async fn delete_all_sessions(pool: &SqlitePool) -> AppResult<()> {
     Ok(())
 }
 
+/// Background cleanup: find pending discount redemptions whose linked
+/// invoice is either in a terminal failure state (`expired` / `invalid`)
+/// OR has been sitting in `pending` past the BTCPay invoice-expiry
+/// window. For each, mark the redemption `cancelled` and decrement the
+/// code's `used_count` so the slot becomes available again.
+///
+/// Plugs two leaks:
+///   (a) the `InvoiceExpired`/`InvoiceInvalid` webhook fired but the
+///       inline `cancel_redemption` call inside webhook handling failed
+///       (already warned at webhook.rs but the slot stays stuck), and
+///   (b) the provider never delivered the expiry webhook at all
+///       (network blip, daemon offline at the exact moment it fired,
+///       BTCPay misconfigured webhook URL).
+///
+/// `stale_after_minutes` is the threshold for case (b): an invoice still
+/// in `pending` whose `created_at` is older than this is treated as
+/// abandoned. BTCPay's default invoice expiry is 15 min, so 30 gives a
+/// comfortable buffer.
+///
+/// Returns the number of redemptions reaped (for logging).
+pub async fn reap_stale_pending_redemptions(
+    pool: &SqlitePool,
+    stale_after_minutes: i64,
+) -> AppResult<u64> {
+    let threshold = (Utc::now() - chrono::Duration::minutes(stale_after_minutes)).to_rfc3339();
+    let rows = sqlx::query(
+        "SELECT r.id
+         FROM discount_redemptions r
+         JOIN invoices i ON i.id = r.invoice_id
+         WHERE r.status = 'pending'
+           AND (
+               i.status IN ('expired', 'invalid')
+               OR (i.status = 'pending' AND i.created_at < ?)
+           )",
+    )
+    .bind(&threshold)
+    .fetch_all(pool)
+    .await?;
+
+    let mut reaped: u64 = 0;
+    for row in rows {
+        let id: String = row.get("id");
+        if cancel_redemption(pool, &id).await.is_ok() {
+            reaped += 1;
+        }
+    }
+    Ok(reaped)
+}
+
 /// Background cleanup: drop sessions whose `expires_at` is in the past.
 /// Returns the number of rows removed (for logging).
 pub async fn reap_expired_sessions(pool: &SqlitePool) -> AppResult<u64> {
