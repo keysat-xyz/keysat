@@ -1,40 +1,128 @@
-Source-Available License
+Keysat Source-Available License 1.0
+SPDX-Short-Identifier: LicenseRef-Keysat-1.0
 Copyright (c) 2026 Keysat
 
-This source code is made available so that users and operators may audit,
-study, and self-host this software. It is NOT open source. The following
-terms apply:
+The terms below govern Your rights to access and use this software.
+By using the software in any way, You accept these terms in full.
 
-1. GRANT. Subject to the restrictions below, you are permitted to:
-   (a) view, study, and audit the source code;
-   (b) compile and run the software for your own internal use on a server
-       you own or control, including operating it to sell licenses to your
-       own software products;
-   (c) modify the source code for the purposes of (a) and (b), provided
-       modified copies remain subject to this license.
 
-2. RESTRICTIONS. You may NOT:
-   (a) redistribute the source code, compiled binaries, or derivative works
-       to third parties, whether free of charge or for a fee;
-   (b) sell, sublicense, lease, rent, or otherwise commercialize the
-       software itself (as distinguished from selling licenses to your own
-       software products via an instance of the software);
-   (c) remove or obscure copyright notices or this license text;
-   (d) publicly host a copy of this software that is accessible to or
-       operable by parties other than yourself, your employees, or your
-       contractors acting on your behalf.
+1. DEFINITIONS
 
-3. CONTRIBUTIONS. Any contributions you submit to the upstream project are
-   licensed back to the copyright holder under the same terms and may be
-   incorporated, relicensed, or redistributed by the copyright holder at
-   its discretion.
+   "the Software" means this source code distribution and any
+   binaries built from it, in whole or in part, including any
+   Modifications.
 
-4. NO WARRANTY. The software is provided "AS IS", WITHOUT WARRANTY OF ANY
-   KIND, express or implied. In no event shall the copyright holder be
-   liable for any claim, damages, or other liability arising from the
-   software or its use.
+   "You" means the individual or legal entity exercising rights
+   under this license.
 
-5. TERMINATION. Any violation of these terms terminates your rights under
-   this license automatically.
+   "Internal Use" means use of the Software by You, Your employees,
+   or Your contractors acting on Your behalf, including operating
+   the Software on infrastructure deployed by You (including rented
+   compute such as VPS or cloud instances You control) to support
+   Your own products and operations.
 
-For commercial redistribution or resale rights, contact licensing@keysat.xyz.
+   "Modifications" means any changes, additions, deletions, or
+   derivative works that You make to the Software's source code.
+
+   "Managed Service" means hosting the Software, or any substantial
+   portion of its functionality, in a manner that allows third
+   parties (other than Your employees or contractors acting on Your
+   behalf) to use it through a network interface, or to take
+   advantage of its functionality as a service or product offered
+   to them. Your own customers receiving signed license keys from
+   an instance of the Software You operate are NOT a Managed Service
+   under this definition — that is the intended use case.
+
+
+2. GRANT OF RIGHTS
+
+   Subject to the restrictions in Section 3, the copyright holder
+   grants You a non-exclusive, worldwide, royalty-free license to:
+
+   (a) view, study, and audit the source code of the Software;
+
+   (b) compile, install, and run the Software for Internal Use,
+       including operating an instance as Your private licensing
+       service to issue signed license keys for software products
+       You sell or distribute;
+
+   (c) make Modifications to the Software for the purposes of (a)
+       and (b), provided that Modifications remain subject to this
+       license.
+
+
+3. RESTRICTIONS
+
+   You may NOT, without prior written permission from the copyright
+   holder:
+
+   (a) distribute compiled binaries of the Software, or any
+       derivative works in compiled form, to third parties, whether
+       free of charge or for a fee;
+
+   (b) provide the Software, or any substantial portion of its
+       functionality, as a Managed Service;
+
+   (c) sell, sublicense, lease, rent, or otherwise commercialize the
+       Software itself (as distinguished from selling licenses to
+       Your own software products through an instance of the
+       Software You operate, which is expressly permitted under
+       Section 2(b));
+
+   (d) remove, alter, or obscure any copyright notices, license
+       text, attribution lines, or this license file embedded in or
+       accompanying the Software.
+
+   Public source-code forks (for example, on GitHub) are permitted
+   provided that the fork carries this license unchanged and does
+   not enable, facilitate, or attempt to circumvent any of the
+   prohibitions above.
+
+
+4. CONTRIBUTIONS
+
+   By submitting any contribution to the upstream project (code,
+   documentation, designs, or other materials), You grant the
+   copyright holder a perpetual, worldwide, non-exclusive,
+   royalty-free, irrevocable license to use, reproduce, modify,
+   relicense, distribute, and incorporate Your contribution as part
+   of the Software or any future version of it, under the terms of
+   this license or any later license the copyright holder adopts.
+   You retain ownership of Your contribution; this Section grants
+   a license-back, not an assignment of copyright.
+
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+   OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+   NON-INFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE
+   LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR
+   IN CONNECTION WITH THE SOFTWARE OR ITS USE OR OTHER DEALINGS IN
+   THE SOFTWARE.
+
+
+6. TERMINATION
+
+   This license, and all rights granted to You under it, terminate
+   automatically upon any breach of its terms. Upon termination,
+   You must immediately cease all use of the Software and destroy
+   or permanently delete all copies in Your possession or control.
+   Sections 4 (Contributions), 5 (No Warranty), and 6 (Termination)
+   survive any termination.
+
+
+7. ENTIRE AGREEMENT
+
+   This license constitutes the entire agreement between You and
+   the copyright holder regarding the Software and supersedes any
+   prior agreements, oral or written. No modification of this
+   license is effective unless made in writing and signed by the
+   copyright holder.
+
+
+For commercial redistribution, resale, hosted-service, or any
+other rights not expressly granted above, contact:
+licensing@keysat.xyz.
