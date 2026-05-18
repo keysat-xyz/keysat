@@ -75,12 +75,15 @@ impl PaymentProvider for ZapriteProvider {
             customer_data: params.buyer_email.map(|email| {
                 serde_json::json!({ "email": email })
             }),
-            // For one-shot purchases, don't prompt the buyer to
-            // save their card. The recurring-subscriptions
-            // renewal flow sets this to true on the FIRST
-            // purchase of a sub so subsequent cycles can charge
-            // the saved profile.
-            allow_save_payment_profile: None,
+            // For one-shot purchases (`None` / `Some(false)`) we
+            // don't prompt the buyer to save their card. The
+            // recurring-subscriptions purchase path sets this to
+            // `Some(true)` on the FIRST cycle of a sub so Zaprite
+            // shows the save-payment-profile prompt; subsequent
+            // cycles are then merchant-initiated charges against
+            // the saved profile via
+            // `charge_order_with_profile`.
+            allow_save_payment_profile: params.allow_save_payment_profile,
         };
 
         let order = self

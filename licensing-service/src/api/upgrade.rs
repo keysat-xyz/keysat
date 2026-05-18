@@ -148,6 +148,12 @@ pub async fn start(
             }),
             external_order_id: &internal_invoice_id,
             buyer_email: license.buyer_email.as_deref(),
+            // Tier-change invoices ride on an existing license; if
+            // the underlying subscription already captured a saved
+            // payment profile on its first cycle, we keep using it
+            // for future renewals. No need to re-prompt for
+            // save-card here.
+            allow_save_payment_profile: None,
         })
         .await
         .map_err(|e| AppError::Upstream(format!("provider create_invoice: {e:#}")))?;
@@ -470,6 +476,10 @@ pub async fn admin_change(
             }),
             external_order_id: &internal_invoice_id,
             buyer_email: license.buyer_email.as_deref(),
+            // Admin-driven tier change — same as the buyer-driven
+            // tier-change path above: existing subscription keeps
+            // its saved profile (if any), so no re-prompt.
+            allow_save_payment_profile: None,
         })
         .await
         .map_err(|e| AppError::Upstream(format!("provider create_invoice: {e:#}")))?;

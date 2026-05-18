@@ -180,6 +180,14 @@ table.t {
   border-radius:10px; overflow:hidden;
 }
 .card > table.t { border:0; border-radius:0 0 10px 10px; }
+/* Horizontally scrollable wrapper for tables on narrow screens. When the
+   table is wider than the card, the wrapper scrolls instead of the row
+   clipping. The wrapper carries the bottom rounding so the table itself
+   can stay square; otherwise the rounded table corners would clip mid-row
+   when scrolled. */
+.t-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.card > .t-wrap { border-radius:0 0 10px 10px; }
+.card > .t-wrap > table.t { border:0; border-radius:0; }
 table.t thead th {
   text-align:left; font-size:11px; font-weight:700;
   letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-500);
@@ -315,6 +323,29 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   margin-top:22px;
 }
 
+/* ---------- Mobile nav (hamburger + off-canvas drawer) ---------- */
+/* The hamburger button lives in the topbar and is hidden by default; the
+   ≤720px breakpoint below reveals it and reframes the sidebar as a slide-in
+   drawer. The backdrop dims the content and provides a tap target for
+   closing. */
+.nav-toggle {
+  display:none;
+  align-items:center; justify-content:center;
+  width:38px; height:38px; padding:0;
+  background:transparent; color:var(--navy-900);
+  border:1px solid var(--border-2); border-radius:7px;
+  cursor:pointer; transition:all 120ms;
+}
+.nav-toggle:hover { background:var(--cream-200); }
+.nav-toggle [data-lucide] { width:20px; height:20px; }
+.sidebar-backdrop {
+  display:none;
+  position:fixed; inset:0; background:rgba(14,31,51,0.45);
+  z-index:40; opacity:0; pointer-events:none;
+  transition:opacity 200ms;
+}
+.sidebar-backdrop.open { opacity:1; pointer-events:auto; }
+
 @media (max-width: 980px) {
   .app { grid-template-columns:1fr; }
   .sidebar { position:static; max-height:none; height:auto; }
@@ -322,6 +353,41 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   .row-2 { grid-template-columns:1fr; }
   .content { padding:20px; }
   .topbar { padding:14px 20px; }
+}
+
+/* Tablet/phone: collapse the sidebar into a true off-canvas drawer. Above
+   720px the stacked-sidebar layout from the 980px breakpoint is fine; below
+   720px the sidebar takes too much vertical space before content, so we
+   convert it to a slide-in instead. */
+@media (max-width: 720px) {
+  .nav-toggle { display:inline-flex; }
+  .sidebar-backdrop { display:block; }
+  .sidebar {
+    position:fixed; top:0; left:0; bottom:0;
+    width:min(280px, 80vw); height:100vh; max-height:100vh;
+    padding:20px 12px;
+    transform:translateX(-100%); transition:transform 200ms ease;
+    z-index:50; overflow-y:auto;
+  }
+  .sidebar.open { transform:translateX(0); }
+  .sidebar a.nav { padding:12px 12px; font-size:14.5px; }
+  .sidebar a.nav [data-lucide] { width:18px; height:18px; }
+}
+
+/* Phone tier: tighten chrome, drop stats to a single column, let toolbar
+   inputs fill the row, bump button tap targets. */
+@media (max-width: 640px) {
+  .stats { grid-template-columns:1fr; }
+  .content { padding:14px 14px 56px; }
+  .topbar { padding:12px 14px; gap:10px; }
+  .topbar h1 { font-size:18px; }
+  .topbar .who { display:none; }
+  .toolbar .input, .toolbar .select { min-width:0; width:100%; }
+  .card .card-head { padding:12px 14px; flex-wrap:wrap; }
+  .card .card-head .sub { margin-left:0; flex-basis:100%; }
+  .card .card-body { padding:14px; }
+  .btn { padding:10px 14px; }
+  .btn.sm { padding:8px 12px; }
 }
 
 /* Featured (launch special) pill toggle — used on the Discount Codes
@@ -422,7 +488,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
 <!-- Main app shell (shown after login) -->
 <section id="app-view" class="hide">
   <div class="app">
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="brand">
         <svg viewBox="0 0 100 100" fill="none" aria-hidden="true" style="width:26px; height:26px">
           <ellipse cx="50" cy="22" rx="28" ry="5" fill="#1E3A5F"></ellipse>
@@ -495,6 +561,10 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     </aside>
     <main class="main">
       <header class="topbar">
+        <button class="nav-toggle" id="nav-toggle" type="button"
+          aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">
+          <i data-lucide="menu"></i>
+        </button>
         <div>
           <div class="crumb" id="crumb">Workspace</div>
           <h1 id="page-title">Overview</h1>
@@ -506,6 +576,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       </header>
       <div class="content" id="route-target"></div>
     </main>
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
   </div>
 </section>
 
@@ -1129,7 +1200,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const tb = el('tbody')
     for (const r of rows) tb.appendChild(r)
     t.appendChild(tb)
-    return el('div', { class: 'card' }, [head, t])
+    return el('div', { class: 'card' }, [head, el('div', { class: 't-wrap' }, t)])
   }
   function statusBadge(status) {
     const map = {
@@ -3827,7 +3898,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       const tb = el('tbody')
       rows.forEach((r) => tb.appendChild(r))
       t.appendChild(tb)
-      return t
+      return el('div', { class: 't-wrap' }, t)
     }
 
     function render() {
@@ -6467,8 +6538,35 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     }
   }
   document.querySelectorAll('.sidebar a.nav').forEach((a) => {
-    a.addEventListener('click', (e) => { e.preventDefault(); setRoute(a.getAttribute('data-route')) })
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      setRoute(a.getAttribute('data-route'))
+      // Close the off-canvas drawer on phones after navigating, otherwise
+      // the sidebar stays parked over the content the operator just opened.
+      closeSidebarDrawer()
+    })
   })
+
+  // Mobile nav drawer. Above 720px the sidebar is a static column and these
+  // toggles are no-ops (the CSS keeps it visible regardless of `.open`).
+  const sidebarEl = document.getElementById('sidebar')
+  const backdropEl = document.getElementById('sidebar-backdrop')
+  const toggleEl = document.getElementById('nav-toggle')
+  function openSidebarDrawer() {
+    sidebarEl.classList.add('open')
+    backdropEl.classList.add('open')
+    toggleEl.setAttribute('aria-expanded', 'true')
+  }
+  function closeSidebarDrawer() {
+    sidebarEl.classList.remove('open')
+    backdropEl.classList.remove('open')
+    toggleEl.setAttribute('aria-expanded', 'false')
+  }
+  toggleEl.addEventListener('click', () => {
+    if (sidebarEl.classList.contains('open')) closeSidebarDrawer()
+    else openSidebarDrawer()
+  })
+  backdropEl.addEventListener('click', closeSidebarDrawer)
 
   // Tier status (label + usage + caps) — cached after first fetch so
   // multiple consumers within a single route render don't all re-hit

@@ -157,6 +157,34 @@ impl ZapriteClient {
         serde_json::from_str(&raw).context("parse charge response")
     }
 
+    /// `GET /v1/contacts/{id}` — fetch a Zaprite contact, which
+    /// includes the `paymentProfiles[]` array we mine for the
+    /// saved-card id after a recurring first-cycle settle. Each
+    /// profile has `id`, `method`, `expiresAt`, and a `sourceOrder`
+    /// nested object whose `externalUniqId` is the invoice UUID we
+    /// passed when creating the order — that's how we identify the
+    /// profile the buyer just saved on the order that triggered
+    /// this lookup.
+    pub async fn get_contact(&self, contact_id: &str) -> Result<Value> {
+        let encoded = urlencoding::encode(contact_id);
+        let url = format!("{}/v1/contacts/{encoded}", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Zaprite get_contact request")?;
+        let status = resp.status();
+        let raw = resp.text().await.context("read get_contact body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Zaprite get_contact({contact_id}) returned HTTP {status}: {raw}"
+            ));
+        }
+        serde_json::from_str(&raw).context("parse get_contact response")
+    }
+
     /// Smoke test for Connect-flow validation. Pings `GET /v1/orders`
     /// (the list endpoint) — auth-guarded, so a 200 confirms the
     /// API key works against the right org.

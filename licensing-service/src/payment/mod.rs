@@ -137,6 +137,15 @@ pub struct CreateInvoiceParams<'a> {
     pub external_order_id: &'a str,
     /// Buyer email if known. Some providers use this for receipts.
     pub buyer_email: Option<&'a str>,
+    /// Ask the provider to prompt the buyer to save their payment
+    /// profile for future merchant-initiated charges. Zaprite honors
+    /// this for autopay-supporting rails (Stripe card, etc.); BTCPay
+    /// has no equivalent concept and silently ignores it. Set
+    /// `Some(true)` on the FIRST cycle of a recurring purchase so the
+    /// renewal worker can later call `charge_order_with_profile`
+    /// against the saved profile. `None` / `Some(false)` is the
+    /// one-shot default.
+    pub allow_save_payment_profile: Option<bool>,
 }
 
 /// Result of `create_invoice`. Whatever the provider returned, narrowed

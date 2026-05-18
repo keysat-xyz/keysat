@@ -450,6 +450,20 @@ pub async fn start(
             return Err(e);
         }
     };
+    // Recurring policy: ask the provider to prompt the buyer to
+    // save their payment profile at checkout so the renewal worker
+    // can later auto-charge it via `charge_order_with_profile`.
+    // Zaprite honors this for autopay-supporting rails (Stripe card
+    // via a connected merchant account); BTCPay has no equivalent
+    // and silently ignores the flag. We always set this on
+    // recurring purchases — if the buyer ends up paying with
+    // Bitcoin / Lightning, or declines the save-card prompt at
+    // Zaprite's checkout, no profile gets created and the post-
+    // settle profile-capture step finds nothing. The sub then
+    // behaves like a pre-feature recurring sub: renewals still
+    // create fresh invoices the buyer pays manually.
+    let allow_save_profile =
+        chosen_policy.as_ref().map(|p| p.is_recurring).unwrap_or(false);
     let created = match provider
         .create_invoice(CreateInvoiceParams {
             amount: Money::sats(final_price),
@@ -461,6 +475,7 @@ pub async fn start(
             metadata: json!({ "productId": product.id }),
             external_order_id: &internal_id,
             buyer_email: req.buyer_email.as_deref(),
+            allow_save_payment_profile: if allow_save_profile { Some(true) } else { None },
         })
         .await
     {

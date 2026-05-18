@@ -35,10 +35,29 @@
 //! through the end of the current cycle.
 //!
 //! Auto-charge via saved payment profiles (Zaprite's
-//! `paymentProfileId` flow) is NOT in this version. The first
-//! renewal-worker iteration creates fresh invoices that the buyer
-//! pays manually. v0.2.0:5+ adds the auto-charge path so cycles
-//! after the first don't require buyer interaction.
+//! `paymentProfileId` flow) is now wired. When a buyer pays the
+//! first cycle of a recurring subscription via Zaprite AND saves
+//! a card at checkout, the renewal worker calls
+//! `POST /v1/orders/charge` against the saved profile on each
+//! cycle instead of waiting for manual pay. The wiring lives in
+//! three places:
+//!   - `api::purchase` sets `allow_save_payment_profile=Some(true)`
+//!     on the first-cycle invoice when the policy is recurring,
+//!     prompting Zaprite to show the save-card UI at checkout.
+//!   - `on_invoice_settled` here calls
+//!     `capture_zaprite_payment_profile`, which fetches the
+//!     buyer's contact from Zaprite and persists the resulting
+//!     profile id onto the subscriptions row.
+//!   - `renew_one` here invokes `try_auto_charge_zaprite` after
+//!     creating each renewal order. On success the buyer does
+//!     nothing — the order settles via the usual webhook. On
+//!     failure (decline, expired card, network) we fall through
+//!     to the existing manual-pay `subscription.renewal_pending`
+//!     event so the buyer can still recover the cycle.
+//! BTCPay subscriptions and Zaprite subscriptions whose buyer
+//! paid with Bitcoin / declined the save-card prompt have NULL
+//! profile fields and continue to use the manual-pay branch
+//! exclusively.
 
 use crate::api::AppState;
 use crate::db::repo;
@@ -80,6 +99,29 @@ pub struct Subscription {
     pub next_renewal_at: Option<String>,
     pub cancelled_at: Option<String>,
     pub consecutive_failures: i64,
+    /// Zaprite contact id for the buyer who paid the first cycle.
+    /// Only ever populated for subs whose first-cycle invoice was
+    /// settled via Zaprite AND whose buyer saved a payment profile
+    /// at checkout. NULL otherwise (BTCPay subs, Bitcoin-paid
+    /// Zaprite subs, declined-the-save-prompt Zaprite subs).
+    pub zaprite_contact_id: Option<String>,
+    /// Zaprite saved-profile id used by the renewal worker to
+    /// auto-charge subsequent cycles via
+    /// `POST /v1/orders/charge`. NULL means "no saved profile,
+    /// fall through to manual-pay renewal" — the pre-feature
+    /// behavior.
+    pub zaprite_payment_profile_id: Option<String>,
+    /// e.g. "CARD" / "BANK" — informational for the admin UI's
+    /// subscription detail card. Not consulted by the worker
+    /// today; Zaprite returns a decline error if the method
+    /// doesn't support merchant-initiated charges.
+    pub zaprite_payment_profile_method: Option<String>,
+    /// ISO-8601. Informational for the admin UI ("card expires
+    /// 03/27"). The renewal worker doesn't gate on this — if
+    /// Zaprite reports the profile as expired we'll see it as
+    /// an `/v1/orders/charge` failure and fall through to the
+    /// manual-pay branch.
+    pub zaprite_payment_profile_expires_at: Option<String>,
 }
 
 fn row_to_subscription(row: sqlx::sqlite::SqliteRow) -> Subscription {
@@ -96,12 +138,20 @@ fn row_to_subscription(row: sqlx::sqlite::SqliteRow) -> Subscription {
         next_renewal_at: row.get("next_renewal_at"),
         cancelled_at: row.get("cancelled_at"),
         consecutive_failures: row.get("consecutive_failures"),
+        zaprite_contact_id: row.try_get("zaprite_contact_id").ok(),
+        zaprite_payment_profile_id: row.try_get("zaprite_payment_profile_id").ok(),
+        zaprite_payment_profile_method: row.try_get("zaprite_payment_profile_method").ok(),
+        zaprite_payment_profile_expires_at: row
+            .try_get("zaprite_payment_profile_expires_at")
+            .ok(),
     }
 }
 
 const SUB_COLS: &str = "id, license_id, policy_id, product_id, period_days, \
     listed_currency, listed_value, status, started_at, next_renewal_at, \
-    cancelled_at, consecutive_failures";
+    cancelled_at, consecutive_failures, \
+    zaprite_contact_id, zaprite_payment_profile_id, \
+    zaprite_payment_profile_method, zaprite_payment_profile_expires_at";
 
 /// Subs that are due for the worker to act on right now: status
 /// is `active` or `past_due`, `next_renewal_at` is in the past,
@@ -143,7 +193,10 @@ pub async fn find_lapsing_subscriptions(
     let rows = sqlx::query(&format!(
         "SELECT s.id AS id, s.license_id, s.policy_id, s.product_id, s.period_days, \
                 s.listed_currency, s.listed_value, s.status, s.started_at, \
-                s.next_renewal_at, s.cancelled_at, s.consecutive_failures \
+                s.next_renewal_at, s.cancelled_at, s.consecutive_failures, \
+                s.zaprite_contact_id, s.zaprite_payment_profile_id, \
+                s.zaprite_payment_profile_method, \
+                s.zaprite_payment_profile_expires_at \
          FROM subscriptions s \
          JOIN policies p ON p.id = s.policy_id \
          WHERE s.status = 'past_due' \
@@ -375,6 +428,14 @@ pub async fn create_subscription(
         next_renewal_at: Some(next_renewal_at),
         cancelled_at: None,
         consecutive_failures: 0,
+        // Zaprite saved-profile metadata is populated by a separate
+        // post-settle hook (see `capture_zaprite_payment_profile`),
+        // not here — at create-subscription time we don't yet know
+        // whether the buyer saved a card.
+        zaprite_contact_id: None,
+        zaprite_payment_profile_id: None,
+        zaprite_payment_profile_method: None,
+        zaprite_payment_profile_expires_at: None,
     })
 }
 
@@ -679,6 +740,14 @@ async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
             metadata,
             external_order_id: &internal_invoice_id,
             buyer_email: None, // renewal email comes from the license, not solicited fresh
+            // The save-card prompt only matters on the FIRST cycle.
+            // By the time we're here the sub either already has a
+            // `zaprite_payment_profile_id` (we'll auto-charge below)
+            // or doesn't (it never will — buyer paid with Bitcoin /
+            // declined the prompt). Either way, re-prompting on
+            // every renewal would be confusing UX; renewals always
+            // pass `None` here.
+            allow_save_payment_profile: None,
         })
         .await
         .context("provider.create_invoice for renewal")?;
@@ -765,7 +834,93 @@ async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
     .await
     .context("UPDATE subscriptions on renewal create")?;
 
-    // 9. Webhook event: operator's app gets notified that a
+    // 9. If this subscription has a saved Zaprite payment profile
+    //    (captured on first-cycle settle via
+    //    `capture_zaprite_payment_profile`), try to merchant-
+    //    initiate the charge against it now. On success, the buyer
+    //    is NOT expected to do anything — Zaprite will run the
+    //    charge and fire the usual `order.paid` webhook, which
+    //    `on_invoice_settled` will pick up to flip the sub back to
+    //    `active` and dispatch `subscription.renewed`. On failure
+    //    (declined card, expired profile, Zaprite hiccup) we log
+    //    + audit + fall through to the manual-pay
+    //    `subscription.renewal_pending` event below so the buyer
+    //    still has a path to recover this cycle.
+    let auto_charged = match try_auto_charge_zaprite(
+        state,
+        sub,
+        &handle.provider_invoice_id,
+    )
+    .await
+    {
+        Ok(charged) => charged,
+        Err(e) => {
+            tracing::warn!(
+                sub_id = %sub.id,
+                invoice_id = %internal_invoice_id,
+                error = %e,
+                "Zaprite auto-charge failed; falling back to manual-pay renewal"
+            );
+            let _ = repo::insert_audit(
+                &state.db,
+                "renewal_worker",
+                None,
+                "subscription.auto_charge_failed",
+                Some("subscription"),
+                Some(&sub.id),
+                None,
+                None,
+                &json!({
+                    "invoice_id": internal_invoice_id,
+                    "provider_invoice_id": handle.provider_invoice_id,
+                    "error": format!("{e:#}"),
+                }),
+            )
+            .await;
+            crate::webhooks::dispatch(
+                state,
+                "subscription.auto_charge_failed",
+                &json!({
+                    "subscription_id": sub.id,
+                    "license_id": sub.license_id,
+                    "invoice_id": internal_invoice_id,
+                    "reason": format!("{e:#}"),
+                }),
+            )
+            .await;
+            false
+        }
+    };
+
+    if auto_charged {
+        // Auto-charge succeeded — Zaprite will fire `order.paid`
+        // shortly and the webhook handler runs the rest of the
+        // renewal lifecycle. Fire an operator-visible event so
+        // the operator's app can render "renewed automatically"
+        // copy in their notification UI, distinct from "buyer
+        // needs to pay" copy.
+        crate::webhooks::dispatch(
+            state,
+            "subscription.auto_charge_initiated",
+            &json!({
+                "subscription_id": sub.id,
+                "license_id": sub.license_id,
+                "product_id": sub.product_id,
+                "policy_id": sub.policy_id,
+                "invoice_id": internal_invoice_id,
+                "amount_sats": amount_sats,
+                "listed_currency": sub.listed_currency,
+                "listed_value": sub.listed_value,
+                "cycle_number": next_cycle_num,
+                "cycle_start_at": cycle_start.to_rfc3339(),
+                "cycle_end_at": cycle_end.to_rfc3339(),
+            }),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // 10. Manual-pay path. Operator's app gets notified that a
     //    renewal invoice exists and the buyer needs to pay. The
     //    operator's webhook receiver renders an email / push /
     //    in-app notification with `checkout_url` and sends it to
@@ -874,6 +1029,22 @@ pub async fn on_invoice_settled(state: &AppState, invoice: &Invoice) -> Result<(
         None => return Ok(()), // not a subscription invoice
     };
     mark_active_after_settle(&state.db, &sub_id).await?;
+
+    // Best-effort: if this was the FIRST cycle of a Zaprite-paid
+    // recurring subscription AND the buyer saved a payment profile
+    // at checkout, capture the profile id so the renewal worker can
+    // auto-charge subsequent cycles. Failures here are logged but
+    // never block — the sub stays valid; renewals just fall back to
+    // the manual-pay branch.
+    if let Err(e) = capture_zaprite_payment_profile(state, &sub_id, invoice).await {
+        tracing::warn!(
+            sub_id = %sub_id,
+            invoice_id = %invoice.id,
+            error = %e,
+            "capture_zaprite_payment_profile failed; renewals will fall back to manual pay"
+        );
+    }
+
     crate::webhooks::dispatch(
         state,
         "subscription.renewed",
@@ -885,4 +1056,209 @@ pub async fn on_invoice_settled(state: &AppState, invoice: &Invoice) -> Result<(
     )
     .await;
     Ok(())
+}
+
+/// Best-effort capture of the Zaprite saved-payment-profile after a
+/// first-cycle settle. No-ops in any of these cases:
+///   - sub already has `zaprite_payment_profile_id` set (idempotent
+///     re-delivery of the same settle webhook)
+///   - active provider isn't Zaprite (BTCPay subs have no equivalent)
+///   - the invoice predates the saved-profile feature (pre-:44
+///     Zaprite subs)
+///   - buyer paid with Bitcoin/Lightning, or declined the save-card
+///     prompt — no profile gets created on Zaprite's side
+///
+/// When it does fire, we:
+///   1. Fetch the Zaprite order to find the buyer's `contact.id`
+///   2. Fetch the contact to enumerate `paymentProfiles[]`
+///   3. Find the profile whose `sourceOrder.externalUniqId` matches
+///      our local invoice id (= the externalUniqId we set at order
+///      creation) — that's the profile saved on THIS purchase
+///   4. UPDATE the subscriptions row with id / method / expiresAt
+pub async fn capture_zaprite_payment_profile(
+    state: &AppState,
+    sub_id: &str,
+    invoice: &Invoice,
+) -> Result<()> {
+    use crate::payment::ProviderKind;
+
+    // Idempotency: already captured?
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT zaprite_payment_profile_id FROM subscriptions WHERE id = ?",
+    )
+    .bind(sub_id)
+    .fetch_optional(&state.db)
+    .await
+    .context("read existing zaprite_payment_profile_id")?
+    .flatten();
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    // Active provider must be Zaprite for any of the rest to be
+    // meaningful — `as_any` downcast keeps the trait clean.
+    let provider = match state.payment_provider().await {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    if provider.kind() != ProviderKind::Zaprite {
+        return Ok(());
+    }
+    let zaprite = match provider
+        .as_any()
+        .downcast_ref::<crate::payment::zaprite::ZapriteProvider>()
+    {
+        Some(z) => z,
+        None => return Ok(()),
+    };
+    let client = zaprite.client();
+
+    // 1. Fetch the order so we can read its contact.
+    let order = client
+        .get_order(&invoice.btcpay_invoice_id)
+        .await
+        .context("fetch Zaprite order for profile capture")?;
+    let contact_id = order
+        .pointer("/contact/id")
+        .or_else(|| order.get("contactId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let contact_id = match contact_id {
+        Some(c) => c,
+        None => {
+            // Order has no contact — buyer paid without an email /
+            // Zaprite didn't materialize a contact. No profile to
+            // capture; renewals fall back to manual pay.
+            return Ok(());
+        }
+    };
+
+    // 2. Fetch the contact and enumerate its payment profiles.
+    let contact = client
+        .get_contact(&contact_id)
+        .await
+        .context("fetch Zaprite contact for profile capture")?;
+    let profiles = match contact.get("paymentProfiles").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Ok(()), // no profiles array — nothing to capture
+    };
+
+    // 3. Find the profile whose sourceOrder.externalUniqId is
+    //    THIS invoice. Zaprite scopes saved profiles to a contact,
+    //    but a contact may have multiple profiles from prior
+    //    purchases (e.g. the buyer subscribed to another product
+    //    too). The sourceOrder pin is how we identify the one
+    //    Zaprite just minted on this purchase.
+    let matching = profiles.iter().find(|p| {
+        p.pointer("/sourceOrder/externalUniqId")
+            .and_then(|v| v.as_str())
+            .map(|s| s == invoice.id)
+            .unwrap_or(false)
+    });
+    let profile = match matching {
+        Some(p) => p,
+        None => {
+            // Most common reason: buyer paid with Bitcoin / Lightning
+            // (no autopay-supporting rail) OR declined the save-
+            // payment-profile prompt on the card form. Both are
+            // legitimate; renewals fall back to manual pay.
+            return Ok(());
+        }
+    };
+
+    let profile_id = match profile.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let method = profile.get("method").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let expires_at = profile
+        .get("expiresAt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // 4. Persist.
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE subscriptions \
+         SET zaprite_contact_id = ?, zaprite_payment_profile_id = ?, \
+             zaprite_payment_profile_method = ?, \
+             zaprite_payment_profile_expires_at = ?, \
+             updated_at = ? \
+         WHERE id = ?",
+    )
+    .bind(&contact_id)
+    .bind(&profile_id)
+    .bind(&method)
+    .bind(&expires_at)
+    .bind(&now)
+    .bind(sub_id)
+    .execute(&state.db)
+    .await
+    .context("UPDATE subscriptions with Zaprite profile metadata")?;
+
+    tracing::info!(
+        sub_id = %sub_id,
+        contact_id = %contact_id,
+        profile_id = %profile_id,
+        method = method.as_deref().unwrap_or("?"),
+        "captured Zaprite saved payment profile for auto-charge on renewal"
+    );
+    Ok(())
+}
+
+/// Attempt a merchant-initiated charge against the saved Zaprite
+/// payment profile on this subscription. Called by the renewal
+/// worker *after* it has created the order; this turns the order
+/// from "buyer must pay" into "auto-charged, will settle via the
+/// usual webhook." Returns:
+///   - `Ok(true)`  — the charge call succeeded; the buyer is not
+///                   expected to pay manually. The settle webhook
+///                   will fire on its own and flip the sub to
+///                   `active` via `on_invoice_settled`.
+///   - `Ok(false)` — sub has no saved profile, or active provider
+///                   isn't Zaprite. Caller proceeds with manual-pay
+///                   fallback (`subscription.renewal_pending`).
+///   - `Err(_)`    — Zaprite returned an error (declined card,
+///                   expired profile, network blip). Caller treats
+///                   this as a soft failure: log, audit, and ALSO
+///                   fall through to manual-pay so the buyer has
+///                   a path to recover.
+async fn try_auto_charge_zaprite(
+    state: &AppState,
+    sub: &Subscription,
+    provider_invoice_id: &str,
+) -> Result<bool> {
+    use crate::payment::ProviderKind;
+
+    let profile_id = match sub.zaprite_payment_profile_id.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(false),
+    };
+
+    let provider = state
+        .payment_provider()
+        .await
+        .map_err(|e| anyhow!("payment provider unavailable: {e:#}"))?;
+    if provider.kind() != ProviderKind::Zaprite {
+        return Ok(false);
+    }
+    let zaprite = provider
+        .as_any()
+        .downcast_ref::<crate::payment::zaprite::ZapriteProvider>()
+        .ok_or_else(|| anyhow!("provider.kind is Zaprite but downcast failed"))?;
+
+    let resp = zaprite
+        .client()
+        .charge_order_with_profile(provider_invoice_id, profile_id)
+        .await
+        .context("Zaprite charge_order_with_profile")?;
+
+    tracing::info!(
+        sub_id = %sub.id,
+        order_id = %provider_invoice_id,
+        profile_id = %profile_id,
+        order_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+        "Zaprite auto-charge succeeded; awaiting settle webhook"
+    );
+    Ok(true)
 }
