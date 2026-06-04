@@ -2891,3 +2891,472 @@ pub async fn settings_set(pool: &SqlitePool, key: &str, value: Option<&str>) -> 
     .await?;
     Ok(())
 }
+
+// =========================================================================
+// Merchant profiles (migration 0020)
+// =========================================================================
+
+const MERCHANT_PROFILE_COLS: &str =
+    "id, name, legal_name, support_url, support_email, brand_color, \
+     post_purchase_redirect_url, is_default, \
+     smtp_host, smtp_port, smtp_username, smtp_password, \
+     smtp_from_address, smtp_from_name, smtp_use_starttls, \
+     created_at, updated_at";
+
+fn row_to_merchant_profile(
+    row: sqlx::sqlite::SqliteRow,
+) -> crate::merchant_profiles::MerchantProfile {
+    use sqlx::Row;
+    crate::merchant_profiles::MerchantProfile {
+        id: row.get("id"),
+        name: row.get("name"),
+        legal_name: row.try_get("legal_name").ok(),
+        support_url: row.try_get("support_url").ok(),
+        support_email: row.try_get("support_email").ok(),
+        brand_color: row.try_get("brand_color").ok(),
+        post_purchase_redirect_url: row.try_get("post_purchase_redirect_url").ok(),
+        is_default: row.get::<i64, _>("is_default") != 0,
+        smtp_host: row.try_get("smtp_host").ok(),
+        smtp_port: row.try_get("smtp_port").ok(),
+        smtp_username: row.try_get("smtp_username").ok(),
+        smtp_password: row.try_get("smtp_password").ok(),
+        smtp_from_address: row.try_get("smtp_from_address").ok(),
+        smtp_from_name: row.try_get("smtp_from_name").ok(),
+        smtp_use_starttls: row.get::<i64, _>("smtp_use_starttls") != 0,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_merchant_profile(
+    pool: &SqlitePool,
+    id: &str,
+    name: &str,
+    legal_name: Option<&str>,
+    support_url: Option<&str>,
+    support_email: Option<&str>,
+    brand_color: Option<&str>,
+    post_purchase_redirect_url: Option<&str>,
+    is_default: bool,
+    now: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO merchant_profiles(\
+            id, name, legal_name, support_url, support_email, brand_color, \
+            post_purchase_redirect_url, is_default, \
+            smtp_use_starttls, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(legal_name)
+    .bind(support_url)
+    .bind(support_email)
+    .bind(brand_color)
+    .bind(post_purchase_redirect_url)
+    .bind(is_default as i64)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_merchant_profile_by_id(
+    pool: &SqlitePool,
+    id: &str,
+) -> AppResult<Option<crate::merchant_profiles::MerchantProfile>> {
+    let row = sqlx::query(&format!(
+        "SELECT {MERCHANT_PROFILE_COLS} FROM merchant_profiles WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_merchant_profile))
+}
+
+pub async fn get_default_merchant_profile(
+    pool: &SqlitePool,
+) -> AppResult<Option<crate::merchant_profiles::MerchantProfile>> {
+    let row = sqlx::query(&format!(
+        "SELECT {MERCHANT_PROFILE_COLS} FROM merchant_profiles WHERE is_default = 1 LIMIT 1"
+    ))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_merchant_profile))
+}
+
+pub async fn get_merchant_profile_for_product(
+    pool: &SqlitePool,
+    product_id: &str,
+) -> AppResult<Option<crate::merchant_profiles::MerchantProfile>> {
+    let row = sqlx::query(&format!(
+        "SELECT {MERCHANT_PROFILE_COLS} FROM merchant_profiles mp \
+         JOIN products p ON p.merchant_profile_id = mp.id \
+         WHERE p.id = ? LIMIT 1"
+    ))
+    .bind(product_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_merchant_profile))
+}
+
+pub async fn list_merchant_profiles(
+    pool: &SqlitePool,
+) -> AppResult<Vec<crate::merchant_profiles::MerchantProfile>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {MERCHANT_PROFILE_COLS} FROM merchant_profiles \
+         ORDER BY is_default DESC, created_at DESC"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(row_to_merchant_profile).collect())
+}
+
+pub async fn update_merchant_profile(
+    pool: &SqlitePool,
+    id: &str,
+    patch: &crate::merchant_profiles::MerchantProfileUpdate,
+) -> AppResult<()> {
+    use crate::merchant_profiles::MerchantProfileUpdate;
+    let MerchantProfileUpdate {
+        name,
+        legal_name,
+        support_url,
+        support_email,
+        brand_color,
+        post_purchase_redirect_url,
+        smtp_host,
+        smtp_port,
+        smtp_username,
+        smtp_password,
+        smtp_from_address,
+        smtp_from_name,
+        smtp_use_starttls,
+    } = patch;
+
+    // Build the SET clause dynamically — only update fields the caller
+    // explicitly set. Outer Option means "skip if None"; inner Option
+    // (on nullable fields) means "set to NULL if Some(None), set to a
+    // value if Some(Some(value))."
+    let mut sets: Vec<&'static str> = Vec::new();
+    if name.is_some() { sets.push("name = ?"); }
+    if legal_name.is_some() { sets.push("legal_name = ?"); }
+    if support_url.is_some() { sets.push("support_url = ?"); }
+    if support_email.is_some() { sets.push("support_email = ?"); }
+    if brand_color.is_some() { sets.push("brand_color = ?"); }
+    if post_purchase_redirect_url.is_some() { sets.push("post_purchase_redirect_url = ?"); }
+    if smtp_host.is_some() { sets.push("smtp_host = ?"); }
+    if smtp_port.is_some() { sets.push("smtp_port = ?"); }
+    if smtp_username.is_some() { sets.push("smtp_username = ?"); }
+    if smtp_password.is_some() { sets.push("smtp_password = ?"); }
+    if smtp_from_address.is_some() { sets.push("smtp_from_address = ?"); }
+    if smtp_from_name.is_some() { sets.push("smtp_from_name = ?"); }
+    if smtp_use_starttls.is_some() { sets.push("smtp_use_starttls = ?"); }
+
+    if sets.is_empty() {
+        return Ok(()); // nothing to update
+    }
+    sets.push("updated_at = ?");
+
+    let sql = format!(
+        "UPDATE merchant_profiles SET {} WHERE id = ?",
+        sets.join(", ")
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = name { q = q.bind(v); }
+    if let Some(v) = legal_name { q = q.bind(v.as_deref()); }
+    if let Some(v) = support_url { q = q.bind(v.as_deref()); }
+    if let Some(v) = support_email { q = q.bind(v.as_deref()); }
+    if let Some(v) = brand_color { q = q.bind(v.as_deref()); }
+    if let Some(v) = post_purchase_redirect_url { q = q.bind(v.as_deref()); }
+    if let Some(v) = smtp_host { q = q.bind(v.as_deref()); }
+    if let Some(v) = smtp_port { q = q.bind(*v); }
+    if let Some(v) = smtp_username { q = q.bind(v.as_deref()); }
+    if let Some(v) = smtp_password { q = q.bind(v.as_deref()); }
+    if let Some(v) = smtp_from_address { q = q.bind(v.as_deref()); }
+    if let Some(v) = smtp_from_name { q = q.bind(v.as_deref()); }
+    if let Some(v) = smtp_use_starttls { q = q.bind(*v as i64); }
+    let now = Utc::now().to_rfc3339();
+    q = q.bind(&now).bind(id);
+    q.execute(pool).await?;
+    Ok(())
+}
+
+/// Flip a profile to be the default. Two-step UPDATE in a single
+/// transaction to maintain the partial unique index on is_default = 1.
+pub async fn set_default_merchant_profile(
+    pool: &SqlitePool,
+    new_default_id: &str,
+) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE merchant_profiles SET is_default = 0, updated_at = ? WHERE is_default = 1")
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query("UPDATE merchant_profiles SET is_default = 1, updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(new_default_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("merchant profile {new_default_id}")));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn delete_merchant_profile(pool: &SqlitePool, id: &str) -> AppResult<()> {
+    // Also cascade the rail_preferences entries (no ON DELETE CASCADE
+    // on that table since it's a composite primary key; cleaner to
+    // delete explicitly).
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM merchant_profile_rail_preferences WHERE merchant_profile_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query("DELETE FROM merchant_profiles WHERE id = ? AND is_default = 0")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(AppError::BadRequest(format!(
+            "merchant profile {id} not found or is the default"
+        )));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn count_products_for_profile(pool: &SqlitePool, profile_id: &str) -> anyhow::Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM products WHERE merchant_profile_id = ?",
+    )
+    .bind(profile_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+pub async fn count_active_subscriptions_for_profile(
+    pool: &SqlitePool,
+    profile_id: &str,
+) -> anyhow::Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM subscriptions \
+         WHERE merchant_profile_id = ? AND status IN ('active', 'past_due')",
+    )
+    .bind(profile_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+// =========================================================================
+// Payment providers (migration 0020) — replaces btcpay_config + zaprite_config
+// =========================================================================
+
+/// Stored shape of a payment_providers row. Used by the provider factory
+/// in `payment::build_provider` to reconstruct a typed PaymentProvider
+/// trait object from a row.
+#[derive(Debug, Clone)]
+pub struct PaymentProviderRow {
+    pub id: String,
+    pub merchant_profile_id: String,
+    pub kind: String,
+    pub label: String,
+    pub api_key: String,
+    pub base_url: String,
+    pub webhook_id: Option<String>,
+    pub webhook_secret: Option<String>,
+    pub store_id: Option<String>,
+    pub connected_at: String,
+    pub updated_at: String,
+}
+
+const PAYMENT_PROVIDER_COLS: &str =
+    "id, merchant_profile_id, kind, label, api_key, base_url, \
+     webhook_id, webhook_secret, store_id, connected_at, updated_at";
+
+fn row_to_payment_provider(row: sqlx::sqlite::SqliteRow) -> PaymentProviderRow {
+    use sqlx::Row;
+    PaymentProviderRow {
+        id: row.get("id"),
+        merchant_profile_id: row.get("merchant_profile_id"),
+        kind: row.get("kind"),
+        label: row.get("label"),
+        api_key: row.get("api_key"),
+        base_url: row.get("base_url"),
+        webhook_id: row.try_get("webhook_id").ok(),
+        webhook_secret: row.try_get("webhook_secret").ok(),
+        store_id: row.try_get("store_id").ok(),
+        connected_at: row.get("connected_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_payment_provider(
+    pool: &SqlitePool,
+    id: &str,
+    merchant_profile_id: &str,
+    kind: &str,
+    label: &str,
+    api_key: &str,
+    base_url: &str,
+    webhook_id: Option<&str>,
+    webhook_secret: Option<&str>,
+    store_id: Option<&str>,
+    now: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO payment_providers(\
+            id, merchant_profile_id, kind, label, api_key, base_url, \
+            webhook_id, webhook_secret, store_id, connected_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(merchant_profile_id)
+    .bind(kind)
+    .bind(label)
+    .bind(api_key)
+    .bind(base_url)
+    .bind(webhook_id)
+    .bind(webhook_secret)
+    .bind(store_id)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_payment_provider_by_id(
+    pool: &SqlitePool,
+    id: &str,
+) -> AppResult<Option<PaymentProviderRow>> {
+    let row = sqlx::query(&format!(
+        "SELECT {PAYMENT_PROVIDER_COLS} FROM payment_providers WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_payment_provider))
+}
+
+pub async fn list_payment_providers_for_profile(
+    pool: &SqlitePool,
+    profile_id: &str,
+) -> AppResult<Vec<PaymentProviderRow>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {PAYMENT_PROVIDER_COLS} FROM payment_providers \
+         WHERE merchant_profile_id = ? ORDER BY connected_at ASC"
+    ))
+    .bind(profile_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(row_to_payment_provider).collect())
+}
+
+pub async fn list_all_payment_providers(pool: &SqlitePool) -> AppResult<Vec<PaymentProviderRow>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {PAYMENT_PROVIDER_COLS} FROM payment_providers ORDER BY connected_at ASC"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(row_to_payment_provider).collect())
+}
+
+pub async fn delete_payment_provider(pool: &SqlitePool, id: &str) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    // Cascade rail preferences pointing at this provider.
+    sqlx::query("DELETE FROM merchant_profile_rail_preferences WHERE payment_provider_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query("DELETE FROM payment_providers WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("payment provider {id}")));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+// =========================================================================
+// Merchant profile rail preferences
+// =========================================================================
+
+/// (rail, provider_id) tuple representing one preference row.
+#[derive(Debug, Clone)]
+pub struct RailPreference {
+    pub rail: String,
+    pub payment_provider_id: String,
+}
+
+pub async fn list_rail_preferences_for_profile(
+    pool: &SqlitePool,
+    profile_id: &str,
+) -> AppResult<Vec<RailPreference>> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT rail, payment_provider_id FROM merchant_profile_rail_preferences \
+         WHERE merchant_profile_id = ?",
+    )
+    .bind(profile_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RailPreference {
+            rail: r.get("rail"),
+            payment_provider_id: r.get("payment_provider_id"),
+        })
+        .collect())
+}
+
+/// Upsert a (profile, rail) → provider mapping. Replaces any existing
+/// preference for the same (profile, rail) pair.
+pub async fn set_rail_preference(
+    pool: &SqlitePool,
+    profile_id: &str,
+    rail: &str,
+    provider_id: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO merchant_profile_rail_preferences(\
+            merchant_profile_id, rail, payment_provider_id) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(merchant_profile_id, rail) DO UPDATE SET \
+            payment_provider_id = excluded.payment_provider_id",
+    )
+    .bind(profile_id)
+    .bind(rail)
+    .bind(provider_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_rail_preference(
+    pool: &SqlitePool,
+    profile_id: &str,
+    rail: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "DELETE FROM merchant_profile_rail_preferences \
+         WHERE merchant_profile_id = ? AND rail = ?",
+    )
+    .bind(profile_id)
+    .bind(rail)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

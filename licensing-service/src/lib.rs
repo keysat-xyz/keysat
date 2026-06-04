@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod license_self;
+pub mod merchant_profiles;
 pub mod models;
 pub mod payment;
 pub mod rate_limit;

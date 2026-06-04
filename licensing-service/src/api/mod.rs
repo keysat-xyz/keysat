@@ -174,6 +174,143 @@ impl AppState {
         let mut guard = self.payment.write().await;
         *guard = None;
     }
+
+    // ---------------------------------------------------------------------
+    // Merchant-profile-aware resolution layer (migration 0020+)
+    // ---------------------------------------------------------------------
+    //
+    // The legacy `payment_provider()` / `set_payment_provider()` accessors
+    // above continue to work as a "default provider for the default
+    // profile" compatibility shim during the multi-provider transition.
+    // New call sites should use one of the methods below instead.
+
+    /// Look up a payment provider by its row id. Reads the row from the
+    /// DB, instantiates a typed `PaymentProvider` impl via
+    /// `payment::build_provider`. Not cached today — the caller is
+    /// usually invoking it once per request lifecycle so the cost is
+    /// nil. Add a cache here when profiling says we need one.
+    pub async fn payment_provider_by_id(
+        &self,
+        provider_id: &str,
+    ) -> AppResult<Arc<dyn crate::payment::PaymentProvider>> {
+        let row = crate::db::repo::get_payment_provider_by_id(&self.db, provider_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("payment provider {provider_id}"))
+            })?;
+        crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
+            .map_err(AppError::Internal)
+    }
+
+    /// Resolve the merchant profile a product belongs to. Falls back to
+    /// the default profile if the product has no `merchant_profile_id`
+    /// set (defensive — shouldn't happen post-migration, but handles
+    /// any rows that slip through).
+    pub async fn merchant_profile_for_product(
+        &self,
+        product_id: &str,
+    ) -> AppResult<crate::merchant_profiles::MerchantProfile> {
+        crate::merchant_profiles::for_product(self, product_id).await
+    }
+
+    /// Pick the provider on `profile_id` that serves the given `rail`.
+    /// Resolution order:
+    ///   1. Honor `merchant_profile_rail_preferences` if the operator
+    ///      set an explicit preference for this (profile, rail) pair.
+    ///   2. If exactly one attached provider serves the rail, use it.
+    ///   3. If multiple serve the rail and no preference is set, use
+    ///      the earliest-`connected_at` one (deterministic) and log a
+    ///      warning so the operator knows to set an explicit preference.
+    ///   4. If no attached provider serves the rail, return
+    ///      `AppError::BadRequest` — caller should treat this as
+    ///      "buyer's pick isn't available for this merchant."
+    pub async fn resolve_provider_for_profile_rail(
+        &self,
+        profile_id: &str,
+        rail: crate::payment::Rail,
+    ) -> AppResult<(crate::db::repo::PaymentProviderRow, Arc<dyn crate::payment::PaymentProvider>)> {
+        // 1. Check the explicit preference table first.
+        let preferences = crate::db::repo::list_rail_preferences_for_profile(&self.db, profile_id).await?;
+        if let Some(pref) = preferences.iter().find(|p| p.rail == rail.as_str()) {
+            let row = crate::db::repo::get_payment_provider_by_id(&self.db, &pref.payment_provider_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(anyhow::anyhow!(
+                        "rail preference points at missing provider {}",
+                        pref.payment_provider_id
+                    ))
+                })?;
+            let provider =
+                crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
+                    .map_err(AppError::Internal)?;
+            return Ok((row, provider));
+        }
+
+        // 2. + 3. No explicit preference — find providers on this profile
+        //    whose kind serves the requested rail.
+        let providers = crate::db::repo::list_payment_providers_for_profile(&self.db, profile_id).await?;
+        let mut candidates: Vec<&crate::db::repo::PaymentProviderRow> = providers
+            .iter()
+            .filter(|row| {
+                crate::payment::ProviderKind::parse(&row.kind)
+                    .map(|kind| crate::payment::rails_for_kind(kind).contains(&rail))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Earliest-connected-first is already the order from list_payment_providers_for_profile
+        // (ORDER BY connected_at ASC), but be explicit for clarity.
+        candidates.sort_by(|a, b| a.connected_at.cmp(&b.connected_at));
+
+        match candidates.as_slice() {
+            [] => Err(AppError::BadRequest(format!(
+                "merchant profile {profile_id} has no provider that serves the '{}' rail. \
+                 Connect one in the admin UI's Merchant Profiles page, or set a rail \
+                 preference if multiple providers serve this rail.",
+                rail.as_str()
+            ))),
+            [only] => {
+                let row = (*only).clone();
+                let provider =
+                    crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
+                        .map_err(AppError::Internal)?;
+                Ok((row, provider))
+            }
+            [first, ..] => {
+                tracing::warn!(
+                    profile_id = %profile_id,
+                    rail = rail.as_str(),
+                    chosen = %first.id,
+                    candidate_count = candidates.len(),
+                    "multiple providers serve this rail on the profile; using earliest-connected \
+                     deterministically. Set an explicit rail preference in the admin UI to silence \
+                     this warning."
+                );
+                let row = (*first).clone();
+                let provider =
+                    crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
+                        .map_err(AppError::Internal)?;
+                Ok((row, provider))
+            }
+        }
+    }
+
+    /// Convenience for the most common purchase-flow case: given a
+    /// product id and a buyer-picked rail, resolve to (profile, provider
+    /// row, provider impl). Used by `purchase.rs` and `subscriptions.rs`
+    /// renewals.
+    pub async fn resolve_provider_for_product_rail(
+        &self,
+        product_id: &str,
+        rail: crate::payment::Rail,
+    ) -> AppResult<(
+        crate::merchant_profiles::MerchantProfile,
+        crate::db::repo::PaymentProviderRow,
+        Arc<dyn crate::payment::PaymentProvider>,
+    )> {
+        let profile = self.merchant_profile_for_product(product_id).await?;
+        let (row, provider) = self.resolve_provider_for_profile_rail(&profile.id, rail).await?;
+        Ok((profile, row, provider))
+    }
 }
 
 impl FromRef<AppState> for SqlitePool {

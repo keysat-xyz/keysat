@@ -40,43 +40,63 @@ use std::any::Any;
 pub mod btcpay;
 pub mod zaprite;
 
-/// Settings-table key that records which provider the operator
-/// last activated. Used by the boot-time loader to pick which
-/// provider to load when both `btcpay_config` and `zaprite_config`
-/// are populated. Values: `'btcpay'` | `'zaprite'`. Absent means
-/// "use whichever single provider is configured" (back-compat
-/// for installs that pre-date this setting).
+// =========================================================================
+// Legacy compatibility shims — DEPRECATED, will be removed once all call
+// sites migrate to the merchant-profile-aware resolution layer.
+// =========================================================================
+//
+// During the multi-provider transition the singleton-config-and-active-
+// provider-preference helpers stay callable so the existing connect flows
+// (`btcpay_authorize.rs`, `zaprite_authorize.rs`) and the boot loader in
+// `main.rs` keep working. Each shim wraps the new schema with the old
+// semantics: `read_active_provider_preference` looks up the first provider
+// attached to the default merchant profile and returns its kind;
+// `write_active_provider_preference` is a no-op (the new model doesn't
+// track an "active provider" preference — providers attach to profiles,
+// profiles attach to products).
+
+#[deprecated(
+    note = "use merchant-profile-aware resolution: \
+            state.payment_provider_for(product_id, rail)"
+)]
 pub const SETTING_ACTIVE_PROVIDER: &str = "active_payment_provider";
 
-/// Convenience getter for the active-provider setting. Returns
-/// `Some(ProviderKind)` if the operator has explicitly chosen
-/// one, `None` if they haven't (caller falls back to the
-/// load-order heuristic).
+#[deprecated(
+    note = "look up providers via list_payment_providers_for_profile or \
+            payment_provider_by_id on AppState"
+)]
 pub async fn read_active_provider_preference(
     pool: &sqlx::SqlitePool,
 ) -> Option<ProviderKind> {
+    // Post-migration: derive from the first provider attached to the
+    // default merchant profile (deterministic by connected_at ASC).
+    // Pre-migration (if the migration hasn't run yet on this DB):
+    // fall back to the legacy settings-table read.
+    let default_profile = crate::db::repo::get_default_merchant_profile(pool).await.ok().flatten();
+    if let Some(profile) = default_profile {
+        if let Ok(rows) = crate::db::repo::list_payment_providers_for_profile(pool, &profile.id).await {
+            if let Some(first) = rows.first() {
+                return ProviderKind::parse(&first.kind);
+            }
+        }
+    }
+    // Legacy fallback for the pre-migration window.
     match crate::db::repo::settings_get(pool, SETTING_ACTIVE_PROVIDER).await {
-        Ok(Some(s)) => match s.as_str() {
-            "btcpay" => Some(ProviderKind::Btcpay),
-            "zaprite" => Some(ProviderKind::Zaprite),
-            _ => None,
-        },
+        Ok(Some(s)) => ProviderKind::parse(&s),
         _ => None,
     }
 }
 
-/// Persist the operator's active-provider preference. Called by
-/// the connect endpoints (Connect BTCPay, Connect Zaprite) and
-/// by the new "Activate <provider>" endpoint that flips between
-/// already-configured providers without re-authorizing.
+#[deprecated(
+    note = "providers are now attached to merchant profiles, not implicitly active. \
+            This shim is a no-op; remove the call."
+)]
 pub async fn write_active_provider_preference(
-    pool: &sqlx::SqlitePool,
-    kind: ProviderKind,
+    _pool: &sqlx::SqlitePool,
+    _kind: ProviderKind,
 ) -> anyhow::Result<()> {
-    let value = kind.as_str();
-    crate::db::repo::settings_set(pool, SETTING_ACTIVE_PROVIDER, Some(value))
-        .await
-        .map_err(|e| anyhow::anyhow!("write active provider preference: {e:#}"))?;
+    // No-op. In the multi-provider model there's no "active" preference
+    // to write — providers are looked up by id (per-product) or by profile.
     Ok(())
 }
 
@@ -93,6 +113,95 @@ impl ProviderKind {
             ProviderKind::Btcpay => "btcpay",
             ProviderKind::Zaprite => "zaprite",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "btcpay" => Some(Self::Btcpay),
+            "zaprite" => Some(Self::Zaprite),
+            _ => None,
+        }
+    }
+}
+
+/// Buyer-facing payment method. The buy page renders a picker over these
+/// (when a merchant profile exposes more than one); the routing layer maps
+/// the buyer's pick to a specific provider via the profile's attached
+/// providers + optional `merchant_profile_rail_preferences` tie-breakers.
+///
+/// Rails-per-provider-kind are **inherent** (declared by each provider
+/// impl's `served_rails()` trait method), not configurable per provider
+/// row. BTCPay serves Lightning + OnChain. Zaprite serves Card +
+/// Lightning + OnChain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rail {
+    Lightning,
+    Onchain,
+    Card,
+}
+
+impl Rail {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Rail::Lightning => "lightning",
+            Rail::Onchain => "onchain",
+            Rail::Card => "card",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "lightning" => Some(Self::Lightning),
+            "onchain" | "on-chain" | "on_chain" => Some(Self::Onchain),
+            "card" => Some(Self::Card),
+            _ => None,
+        }
+    }
+}
+
+/// Static rails served by a provider kind. Returned by
+/// `PaymentProvider::served_rails()`; centralized here so callers that
+/// just want to know "what does kind X support" (e.g., the admin UI's
+/// connect-flow guidance) don't have to instantiate a provider.
+pub fn rails_for_kind(kind: ProviderKind) -> Vec<Rail> {
+    match kind {
+        ProviderKind::Btcpay => vec![Rail::Lightning, Rail::Onchain],
+        ProviderKind::Zaprite => vec![Rail::Card, Rail::Lightning, Rail::Onchain],
+    }
+}
+
+/// Build a typed `PaymentProvider` trait object from a `payment_providers`
+/// row. Dispatch on `kind`. Used by the AppState provider cache when
+/// resolving by provider id.
+pub fn build_provider(
+    row: &crate::db::repo::PaymentProviderRow,
+    public_base_url: Option<&str>,
+) -> anyhow::Result<std::sync::Arc<dyn PaymentProvider>> {
+    use crate::btcpay::client::BtcpayClient;
+    use crate::payment::btcpay::BtcpayProvider;
+    use crate::payment::zaprite::{ZapriteClient, ZapriteProvider};
+
+    match ProviderKind::parse(&row.kind) {
+        Some(ProviderKind::Btcpay) => {
+            let store_id = row.store_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("BTCPay provider row {} missing store_id", row.id)
+            })?;
+            let webhook_secret = row.webhook_secret.clone().unwrap_or_default();
+            let client = BtcpayClient::new(&row.base_url, &row.api_key, store_id);
+            let provider = BtcpayProvider::new(client, webhook_secret)
+                .with_public_base(public_base_url.map(|s| s.to_string()));
+            Ok(std::sync::Arc::new(provider))
+        }
+        Some(ProviderKind::Zaprite) => {
+            let client = ZapriteClient::new(row.base_url.clone(), row.api_key.clone());
+            Ok(std::sync::Arc::new(ZapriteProvider::new(client)))
+        }
+        None => Err(anyhow::anyhow!(
+            "unknown payment provider kind {:?} on row {}",
+            row.kind,
+            row.id
+        )),
     }
 }
 
@@ -229,6 +338,14 @@ pub struct PaymentReceipt {
 #[async_trait::async_trait]
 pub trait PaymentProvider: Send + Sync + Any {
     fn kind(&self) -> ProviderKind;
+
+    /// Payment rails this provider can settle. Default impl uses the
+    /// static `rails_for_kind()` mapping; impls only override if they
+    /// expose a non-default set (e.g., a degraded BTCPay configured
+    /// without Lightning support — not currently a Keysat concern).
+    fn served_rails(&self) -> Vec<Rail> {
+        rails_for_kind(self.kind())
+    }
 
     async fn create_invoice(
         &self,
