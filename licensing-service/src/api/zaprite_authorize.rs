@@ -1,48 +1,58 @@
 //! Zaprite connect / disconnect / status admin endpoints.
 //!
-//! Zaprite doesn't expose an OAuth-style consent flow the way
-//! BTCPay does — there's no `/authorize` redirect chain. Operators
-//! just create an API key in their Zaprite dashboard and paste it
-//! in. So this module is much smaller than `btcpay_authorize.rs`:
-//! a single connect endpoint validates + stores the key, a
-//! disconnect endpoint wipes it, a status endpoint reports state.
+//! Zaprite doesn't expose an OAuth-style consent flow the way BTCPay
+//! does — there's no `/authorize` redirect chain. Operators just create
+//! an API key in their Zaprite dashboard and paste it in. So this
+//! module is much smaller than `btcpay_authorize.rs`: a single connect
+//! endpoint validates + stores the key, a disconnect endpoint wipes it,
+//! a status endpoint reports state.
 //!
-//! The active provider on `AppState` is swapped atomically as part
-//! of connect/disconnect so request handlers immediately see the
-//! new state without a daemon restart.
+//! Multi-merchant-profile model (migration 0020+): the connect endpoint
+//! now takes a `merchant_profile_id` (defaulting to the default profile)
+//! and INSERTs a row in `payment_providers` attached to that profile.
+//! The disconnect endpoint takes a provider id and deletes that row.
+//! Old "active provider" semantics are gone — profiles attach to
+//! products explicitly.
 
 use crate::api::admin::{request_context, require_admin};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
-use crate::payment::zaprite::{
-    config as zaprite_config, ZapriteClient, ZapriteProvider,
-};
+use crate::payment::zaprite::{ZapriteClient, ZapriteProvider};
 use axum::{extract::State, http::HeaderMap, Json};
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use uuid::Uuid;
 
 const DEFAULT_BASE_URL: &str = "https://api.zaprite.com";
 
 #[derive(Debug, Deserialize)]
 pub struct ConnectReq {
     pub api_key: String,
-    /// Optional override — defaults to https://api.zaprite.com.
-    /// Useful for sandbox orgs that point at a different host or
-    /// for future regional endpoints.
+    /// Optional override — defaults to https://api.zaprite.com. Useful
+    /// for sandbox orgs (which point at a different host) or for future
+    /// regional endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional operator-set label distinguishing this Zaprite account
+    /// from other providers in the admin UI (e.g. "Recaps Zaprite" vs
+    /// "Keysat Zaprite"). Defaults to "Zaprite — {merchant profile name}".
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Which merchant profile to attach this Zaprite account to. NULL =
+    /// the default profile. Operators with Pro/Patron tier can name a
+    /// non-default profile to set up per-business Zaprite orgs.
+    #[serde(default)]
+    pub merchant_profile_id: Option<String>,
 }
 
-/// `POST /v1/admin/zaprite/connect` — validate + store an API
-/// key, then swap the active payment provider to Zaprite. The
-/// operator pastes the key from
-/// `app.zaprite.com/.../settings/api`.
-///
+/// `POST /v1/admin/zaprite/connect` — validate + store an API key as a
+/// `payment_providers` row attached to the requested merchant profile.
 /// Validates the key by calling `GET /v1/orders?limit=1` against
-/// Zaprite — auth-guarded, so a 200 confirms the key works for
-/// the right org. A 401 / 403 / network error short-circuits
-/// before we persist anything.
+/// Zaprite — auth-guarded, so a 200 confirms the key works for the
+/// right org. A 401 / 403 / network error short-circuits before we
+/// persist anything.
 pub async fn connect(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -57,17 +67,32 @@ pub async fn connect(
         return Err(AppError::BadRequest("api_key is required".into()));
     }
 
-    // Short-circuit: refuse to overwrite an existing config silently.
-    // Operators get confused when they re-run Connect after already
-    // being connected — they expect a "you're already set up" message,
-    // not a form re-prompt that can clobber their working config.
-    if let Ok(Some(_)) = zaprite_config::load(&state.db).await {
-        return Err(AppError::Conflict(
-            "Zaprite is already connected. Run 'Disconnect Zaprite' first \
-             if you want to rotate the API key or switch organizations."
-                .into(),
-        ));
+    // Resolve the target merchant profile. Defaults to the auto-created
+    // default profile when not specified — single-profile operators
+    // never see this concept.
+    let profile = match req.merchant_profile_id.as_deref() {
+        Some(id) => crate::merchant_profiles::get(&state.db, id)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("merchant profile {id} not found"))
+            })?,
+        None => crate::merchant_profiles::require_default(&state.db).await?,
+    };
+
+    // Refuse if this profile already has a Zaprite provider attached —
+    // the unique index on (merchant_profile_id, kind) would also catch
+    // this but a clean 409 message is friendlier than a constraint error.
+    let existing = crate::db::repo::list_payment_providers_for_profile(&state.db, &profile.id)
+        .await?;
+    if existing.iter().any(|p| p.kind == "zaprite") {
+        return Err(AppError::Conflict(format!(
+            "merchant profile '{}' already has a Zaprite provider attached. \
+             Disconnect it first if you want to rotate the API key or switch \
+             organizations, or pick a different merchant profile.",
+            profile.name
+        )));
     }
+
     let base_url = req
         .base_url
         .as_deref()
@@ -81,10 +106,9 @@ pub async fn connect(
         ));
     }
 
-    // Smoke-test the key before saving anything. Zaprite will
-    // 401 a bad key — surface that as a clean operator-facing
-    // error rather than letting it crash later in the purchase
-    // flow.
+    // Smoke-test the key before saving anything. Zaprite will 401 a
+    // bad key — surface that as a clean operator-facing error rather
+    // than letting it crash later in the purchase flow.
     let client = ZapriteClient::new(&base_url, &api_key);
     client.ping().await.map_err(|e| {
         AppError::Upstream(format!(
@@ -92,159 +116,195 @@ pub async fn connect(
         ))
     })?;
 
-    // Persist + swap.
-    zaprite_config::save(
+    // Persist the new payment_providers row.
+    let label = req
+        .label
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("Zaprite — {}", profile.name));
+    let provider_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    crate::db::repo::create_payment_provider(
         &state.db,
-        &zaprite_config::ZapriteConfig {
-            api_key: api_key.clone(),
-            base_url: base_url.clone(),
-            webhook_id: None, // operator configures the webhook in Zaprite's dashboard
-        },
+        &provider_id,
+        &profile.id,
+        "zaprite",
+        &label,
+        &api_key,
+        &base_url,
+        None, // webhook_id — operator configures the webhook on Zaprite's dashboard
+        None, // webhook_secret — Zaprite doesn't sign webhooks
+        None, // store_id — BTCPay only
+        &now,
     )
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("save zaprite_config: {e:#}")))?;
+    .await?;
 
-    let provider = ZapriteProvider::new(client);
-    state
-        .set_payment_provider(Arc::new(provider))
-        .await;
-    // Persist the operator's preference so the boot-time loader
-    // picks Zaprite on next restart, even if BTCPay's config row
-    // is also still in the DB.
-    crate::payment::write_active_provider_preference(
-        &state.db,
-        crate::payment::ProviderKind::Zaprite,
-    )
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("write provider preference: {e:#}")))?;
+    // If this is the very first provider on the default profile, also
+    // populate the legacy state.payment singleton so back-compat call
+    // sites (the few that still use state.payment_provider()) work
+    // without waiting for a daemon restart. Per-product resolution
+    // doesn't use this singleton.
+    if profile.is_default && existing.is_empty() {
+        let provider = ZapriteProvider::new(client);
+        state.set_payment_provider(Arc::new(provider)).await;
+    }
 
     let _ = crate::db::repo::insert_audit(
         &state.db,
         "admin_api_key",
         Some(&actor_hash),
-        "zaprite.connect",
+        "payment_provider.connect",
         Some("payment_provider"),
-        Some("zaprite"),
+        Some(&provider_id),
         ip.as_deref(),
         ua.as_deref(),
-        &json!({ "base_url": base_url }),
+        &json!({
+            "kind": "zaprite",
+            "merchant_profile_id": profile.id,
+            "base_url": base_url,
+        }),
     )
     .await;
 
-    // Compute the absolute webhook URL so the StartOS Action can
-    // surface the full https://... endpoint to the operator. They
-    // paste this into the Zaprite dashboard exactly. Zaprite's
-    // webhook form requires a full URL, not a path; the previous
-    // copy showed a placeholder which was confusing.
+    // The webhook URL is now path-keyed by provider id so multiple
+    // Zaprite orgs (one per profile) get isolated webhook deliveries.
+    // Operator pastes this exact URL into the corresponding Zaprite
+    // dashboard's webhooks page.
     let webhook_url = format!(
-        "{}/v1/zaprite/webhook",
-        state.config.public_base_url.trim_end_matches('/')
+        "{}/v1/zaprite/webhook/{}",
+        state.config.public_base_url.trim_end_matches('/'),
+        provider_id
     );
 
     Ok(Json(json!({
         "ok": true,
         "provider": "zaprite",
+        "provider_id": provider_id,
+        "merchant_profile_id": profile.id,
+        "merchant_profile_name": profile.name,
+        "label": label,
         "base_url": base_url,
         "webhook_url": webhook_url,
     })))
 }
 
-/// `POST /v1/admin/zaprite/disconnect` — wipe the stored key,
-/// clear the active provider. Operator should also delete the
-/// corresponding webhook on Zaprite's side, but we don't reach
-/// out to Zaprite to delete it — the operator uses Zaprite's
-/// dashboard for that. We can't delete it programmatically because
+#[derive(Debug, Deserialize)]
+pub struct DisconnectReq {
+    /// Which provider row to disconnect. NULL = disconnect the Zaprite
+    /// provider on the default profile (back-compat for the single-
+    /// profile case).
+    #[serde(default)]
+    pub provider_id: Option<String>,
+}
+
+/// `POST /v1/admin/zaprite/disconnect` — delete the named provider
+/// row (or the default-profile Zaprite row when no id is supplied).
+/// Operator should also delete the corresponding webhook on Zaprite's
+/// dashboard — we don't reach out to Zaprite to delete it because
 /// Zaprite's webhook-management endpoints aren't on the public
 /// OpenAPI we have access to.
 pub async fn disconnect(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<DisconnectReq>>,
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_admin(&state, &headers)?;
     let (ip, ua) = request_context(&headers);
+    let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // No-op if nothing's connected.
-    let existing = zaprite_config::load(&state.db).await.map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("load zaprite_config: {e:#}"))
-    })?;
-    if existing.is_none() {
-        return Ok(Json(json!({
-            "ok": true,
-            "noop": true,
-            "message": "Zaprite was not connected",
-        })));
-    }
+    let provider_id = match req.provider_id {
+        Some(id) => id,
+        None => {
+            // Default-profile fallback: find the Zaprite provider on the
+            // default profile, if any.
+            let default = crate::merchant_profiles::require_default(&state.db).await?;
+            let rows = crate::db::repo::list_payment_providers_for_profile(&state.db, &default.id)
+                .await?;
+            match rows.into_iter().find(|p| p.kind == "zaprite") {
+                Some(row) => row.id,
+                None => {
+                    return Ok(Json(json!({
+                        "ok": true,
+                        "noop": true,
+                        "message": "no Zaprite provider connected on the default merchant profile",
+                    })));
+                }
+            }
+        }
+    };
 
-    zaprite_config::clear(&state.db).await.map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("clear zaprite_config: {e:#}"))
-    })?;
+    crate::db::repo::delete_payment_provider(&state.db, &provider_id).await?;
+    // Clear the back-compat singleton if it happens to be the one we
+    // just deleted. This is best-effort — the singleton may be holding
+    // a different provider entirely.
     state.clear_payment_provider().await;
-    // If the active-provider preference was Zaprite, clear it.
-    // Don't blindly clear if it was BTCPay — that's a different
-    // operator's choice we shouldn't undo just because they ran
-    // Disconnect Zaprite.
-    if matches!(
-        crate::payment::read_active_provider_preference(&state.db).await,
-        Some(crate::payment::ProviderKind::Zaprite)
-    ) {
-        let _ = crate::db::repo::settings_set(
-            &state.db,
-            crate::payment::SETTING_ACTIVE_PROVIDER,
-            None,
-        )
-        .await;
-    }
 
     let _ = crate::db::repo::insert_audit(
         &state.db,
         "admin_api_key",
         Some(&actor_hash),
-        "zaprite.disconnect",
+        "payment_provider.disconnect",
         Some("payment_provider"),
-        Some("zaprite"),
+        Some(&provider_id),
         ip.as_deref(),
         ua.as_deref(),
-        &json!({}),
+        &json!({ "kind": "zaprite" }),
     )
     .await;
 
     Ok(Json(json!({
         "ok": true,
         "noop": false,
-        "message": "Zaprite disconnected. Don't forget to delete the corresponding webhook on Zaprite's side at app.zaprite.com.",
+        "provider_id": provider_id,
+        "message": "Zaprite provider disconnected. Don't forget to delete the corresponding webhook on Zaprite's side at app.zaprite.com.",
     })))
 }
 
-/// `GET /v1/admin/zaprite/status` — operator-facing connection
-/// snapshot. Reports whether Zaprite is the active provider, the
-/// base URL, and whether a webhook id has been recorded. Does NOT
-/// return the API key (mirroring how btcpay/status redacts).
+impl Default for DisconnectReq {
+    fn default() -> Self {
+        Self { provider_id: None }
+    }
+}
+
+/// `GET /v1/admin/zaprite/status` — connection snapshot for the
+/// default profile (back-compat with the existing admin UI's
+/// payment-providers card). Multi-profile operators should use the
+/// new `/v1/admin/merchant-profiles/{id}` endpoint instead, which
+/// lists ALL providers across all profiles.
 pub async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let cfg = zaprite_config::load(&state.db).await.map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("load zaprite_config: {e:#}"))
-    })?;
-    let active_provider = match state.payment.read().await.as_ref() {
-        Some(p) => Some(p.kind().as_str().to_string()),
+    let default = crate::merchant_profiles::get_default(&state.db).await?;
+    let connected_row = match &default {
+        Some(profile) => {
+            let rows = crate::db::repo::list_payment_providers_for_profile(&state.db, &profile.id)
+                .await?;
+            rows.into_iter().find(|p| p.kind == "zaprite")
+        }
         None => None,
     };
-    let webhook_url = format!(
-        "{}/v1/zaprite/webhook",
-        state.config.public_base_url.trim_end_matches('/')
-    );
+    let webhook_url = match &connected_row {
+        Some(row) => format!(
+            "{}/v1/zaprite/webhook/{}",
+            state.config.public_base_url.trim_end_matches('/'),
+            row.id
+        ),
+        None => format!(
+            "{}/v1/zaprite/webhook",
+            state.config.public_base_url.trim_end_matches('/')
+        ),
+    };
     Ok(Json(json!({
-        "connected": cfg.is_some(),
-        "active_provider": active_provider,
-        "base_url": cfg.as_ref().map(|c| c.base_url.clone()),
-        "webhook_id": cfg.as_ref().and_then(|c| c.webhook_id.clone()),
-        // Surfaced unconditionally so an operator who lost the
-        // first-connect message can still find the URL to paste
-        // into Zaprite's dashboard. Webhook-not-yet-registered
-        // doesn't change the URL — it's the same address Zaprite
-        // would POST to once registered.
+        "connected": connected_row.is_some(),
+        "provider_id": connected_row.as_ref().map(|r| r.id.clone()),
+        "base_url": connected_row.as_ref().map(|r| r.base_url.clone()),
+        "label": connected_row.as_ref().map(|r| r.label.clone()),
+        "webhook_id": connected_row.as_ref().and_then(|r| r.webhook_id.clone()),
+        "merchant_profile_id": default.as_ref().map(|p| p.id.clone()),
+        "merchant_profile_name": default.as_ref().map(|p| p.name.clone()),
         "webhook_url": webhook_url,
         "webhook_explainer": "Zaprite doesn't sign webhook deliveries. \
             Keysat authenticates each delivery via the externalUniqId we attach \
