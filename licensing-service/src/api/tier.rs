@@ -221,6 +221,39 @@ pub async fn enforce_policy_cap(state: &AppState, product_id: &str) -> AppResult
     Ok(())
 }
 
+/// Refuse a new merchant profile if the operator is at the Creator-tier
+/// merchant-profile cap (= 1) and lacks `unlimited_merchant_profiles`.
+/// Counts every profile including the auto-created default. So Creator
+/// operators have the default profile (auto-created by migration 0020)
+/// and can't add more; Pro and Patron operators are unlimited.
+///
+/// The `unlimited_merchant_profiles` entitlement needs to be added to
+/// the master Keysat's Pro and Patron policies as a separate admin
+/// action — see plans/multi-provider-payment-model.md "Tier gating"
+/// section.
+pub async fn enforce_merchant_profile_cap(state: &AppState) -> AppResult<()> {
+    let tier = current(state).await;
+    if tier.has("unlimited_merchant_profiles") {
+        return Ok(());
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merchant_profiles")
+        .fetch_one(&state.db)
+        .await?;
+    // Creator gets 1 (the default profile).
+    if count >= 1 {
+        return Err(AppError::PaymentRequired {
+            message: format!(
+                "Your {} tier allows a single merchant profile (the default). \
+                 You're at {}. Upgrade to Pro to run multiple businesses \
+                 from one Keysat instance.",
+                tier.display_name, count
+            ),
+            upgrade_url: UPGRADE_URL_PRO.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Refuse to mark a policy as recurring unless the operator's self-tier
 /// carries the `recurring_billing` entitlement. Pro and Patron tiers
 /// have it; Creator does not. Called from both create-policy and

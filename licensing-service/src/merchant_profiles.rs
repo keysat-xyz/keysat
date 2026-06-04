@@ -138,11 +138,11 @@ pub async fn create(
     state: &AppState,
     input: NewMerchantProfile,
 ) -> AppResult<MerchantProfile> {
-    let _ = state; // tier check goes here once tier::check_cap supports merchant_profiles
-    // TODO: tier::check_cap(state, EntitlementSlug::UnlimitedMerchantProfiles)
-    //       — refuses with AppError::TierCap when Creator already has 1
-    //       profile. Skipped in the initial cut; admin UI also enforces
-    //       at the form layer. Wire when tier.rs is updated.
+    // Tier gate: Creator gets 1 profile (the auto-created default).
+    // Pro / Patron with `unlimited_merchant_profiles` get N. Returns
+    // AppError::PaymentRequired (HTTP 402) with the upgrade URL so the
+    // admin UI can render the existing tier-cap modal.
+    crate::api::tier::enforce_merchant_profile_cap(state).await?;
 
     if input.name.trim().is_empty() {
         return Err(AppError::BadRequest("merchant profile name required".into()));

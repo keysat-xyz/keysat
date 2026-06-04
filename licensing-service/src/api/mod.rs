@@ -75,6 +75,7 @@ pub mod tier;
 pub mod validate;
 pub mod community;
 pub mod db_info;
+pub mod merchant_profiles;
 pub mod payment_provider;
 pub mod rates_admin;
 pub mod recover;
@@ -395,10 +396,30 @@ pub fn router(state: AppState) -> Router {
         // model providers attach to profiles and products pick a profile
         // at resolution time; there's no singleton "active" preference to
         // flip. Multi-profile operators should use the new
-        // /v1/admin/merchant-profiles endpoints instead.
+        // /v1/admin/merchant-profiles endpoints below.
         .route(
             "/v1/admin/payment-provider/status",
             get(payment_provider::status),
+        )
+        // Merchant profile CRUD + rail preferences.
+        .route(
+            "/v1/admin/merchant-profiles",
+            get(merchant_profiles::list).post(merchant_profiles::create),
+        )
+        .route(
+            "/v1/admin/merchant-profiles/:id",
+            get(merchant_profiles::get)
+                .patch(merchant_profiles::update)
+                .delete(merchant_profiles::delete),
+        )
+        .route(
+            "/v1/admin/merchant-profiles/:id/set-default",
+            post(merchant_profiles::set_default),
+        )
+        .route(
+            "/v1/admin/merchant-profiles/:id/rail-preferences/:rail",
+            axum::routing::put(merchant_profiles::set_rail_preference)
+                .delete(merchant_profiles::clear_rail_preference),
         )
         // Zaprite webhook landing — operator points Zaprite's
         // webhook setting at this URL. Same handler as
