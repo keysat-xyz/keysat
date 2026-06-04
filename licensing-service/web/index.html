@@ -511,6 +511,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       <a class="nav" data-route="licenses"><i data-lucide="key-round"></i>Licenses</a>
       <a class="nav" data-route="machines"><i data-lucide="cpu"></i>Machines</a>
       <div class="group-label">System</div>
+      <a class="nav" data-route="merchant-profiles"><i data-lucide="store"></i>Merchant profiles</a>
       <a class="nav" data-route="webhooks"><i data-lucide="webhook"></i>Webhooks</a>
       <a class="nav" data-route="audit"><i data-lucide="scroll-text"></i>Audit log</a>
       <a class="nav" data-route="settings"><i data-lucide="settings"></i>Settings</a>
@@ -1228,6 +1229,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     codes:     { title: 'Discount codes',   crumb: 'Workspace · Discount codes' },
     licenses:  { title: 'Licenses',         crumb: 'Workspace · Licenses' },
     machines:  { title: 'Machines',         crumb: 'Workspace · Machines' },
+    'merchant-profiles': { title: 'Merchant profiles', crumb: 'System · Merchant profiles' },
     webhooks:  { title: 'Webhooks',         crumb: 'System · Webhooks' },
     settings:  { title: 'Settings',         crumb: 'System · Settings' },
     audit:     { title: 'Audit log',        crumb: 'System · Audit log' },
@@ -5717,6 +5719,439 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     ]))
     target.appendChild(out)
     load()
+  }
+
+  // -------- Merchant profiles (multi-provider model, :52+) --------
+  // Each profile represents one "business" the operator is running on
+  // this Keysat instance. Owns business identity (brand, support contact,
+  // post-purchase redirect, optional SMTP override) and a set of payment
+  // providers (BTCPay / Zaprite) that legally settle to that business.
+  // Products attach to a profile. Tier-gated: Creator gets 1, Pro/Patron
+  // get unlimited.
+  routes['merchant-profiles'] = async function () {
+    const target = document.getElementById('route-target')
+    target.innerHTML = ''
+
+    // Lead-in explainer + Create button.
+    const createBtn = el('button', { class: 'btn primary' }, [
+      el('i', { 'data-lucide': 'plus' }), 'Add merchant profile',
+    ])
+    createBtn.addEventListener('click', () => openCreateMerchantProfileModal(reload))
+    target.appendChild(plainCard([
+      el('p', { class: 'muted', style: 'margin:0 0 12px' },
+        'A merchant profile bundles one business’s brand, post-purchase redirect, ' +
+        'and a set of payment providers (BTCPay / Zaprite). Products attach to a profile; ' +
+        'the buyer sees the profile’s brand at checkout and the payment-method picker ' +
+        'reflects whichever rails its providers serve.'),
+      el('div', { class: 'toolbar' }, [createBtn]),
+    ]))
+
+    const listHost = el('div', { style: 'margin-top:18px' })
+    target.appendChild(listHost)
+
+    async function reload() {
+      listHost.innerHTML = ''
+      listHost.appendChild(el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Loading…')))
+      try {
+        const j = await api('/v1/admin/merchant-profiles')
+        const profiles = j.profiles || []
+        listHost.innerHTML = ''
+        if (profiles.length === 0) {
+          listHost.appendChild(plainCard([el('div', { class: 'empty' }, 'No merchant profiles yet.')]))
+          return
+        }
+        for (const p of profiles) {
+          listHost.appendChild(renderMerchantProfileCard(p, reload))
+        }
+      } catch (e) {
+        listHost.innerHTML = ''
+        listHost.appendChild(plainCard([err(e.message)]))
+      }
+    }
+    reload()
+  }
+
+  function renderMerchantProfileCard(p, reload) {
+    const head = el('div', { class: 'card-head' }, [
+      el('div', null, [
+        el('h3', null, [
+          p.name,
+          p.is_default ? el('span', {
+            class: 'badge b-gold',
+            style: 'margin-left:10px; vertical-align:middle;',
+          }, 'default') : null,
+        ].filter(Boolean)),
+        p.support_email
+          ? el('div', { class: 'sub' }, p.support_email)
+          : null,
+      ].filter(Boolean)),
+      el('div', { class: 'actions-row' }, [
+        !p.is_default
+          ? el('button', { class: 'btn ghost sm' }, [
+              el('i', { 'data-lucide': 'star' }), 'Set default',
+            ])
+          : null,
+        el('button', { class: 'btn ghost sm' }, [
+          el('i', { 'data-lucide': 'pencil' }), 'Edit',
+        ]),
+        !p.is_default
+          ? el('button', { class: 'btn danger sm' }, [
+              el('i', { 'data-lucide': 'trash-2' }), 'Delete',
+            ])
+          : null,
+      ].filter(Boolean)),
+    ])
+    // Wire action buttons.
+    const setDefaultBtn = head.querySelectorAll('button')[0]
+    if (setDefaultBtn && !p.is_default) {
+      setDefaultBtn.addEventListener('click', async () => {
+        if (!confirm('Make "' + p.name + '" the default profile?')) return
+        try {
+          await api('/v1/admin/merchant-profiles/' + encodeURIComponent(p.id) + '/set-default', {
+            method: 'POST',
+          })
+          reload()
+        } catch (e) {
+          alert('Set-default failed: ' + e.message)
+        }
+      })
+    }
+    const editBtn = head.querySelector('button.ghost:not(:first-child)') ||
+      head.querySelectorAll('button.ghost')[p.is_default ? 0 : 1]
+    if (editBtn) {
+      editBtn.addEventListener('click', () => openEditMerchantProfileModal(p, reload))
+    }
+    const deleteBtn = head.querySelector('button.danger')
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', async () => {
+        if (!confirm('Delete merchant profile "' + p.name + '"? Refused if products or active subs are attached.')) return
+        try {
+          await api('/v1/admin/merchant-profiles/' + encodeURIComponent(p.id), { method: 'DELETE' })
+          reload()
+        } catch (e) {
+          alert('Delete failed: ' + e.message)
+        }
+      })
+    }
+
+    const body = el('div', { class: 'card-body' })
+
+    // Brand / redirect summary.
+    const meta = el('div', { class: 'row-2', style: 'margin-bottom:14px' }, [
+      el('div', null, [
+        el('div', { class: 'field' }, [
+          el('div', { class: 'lbl' }, 'Post-purchase redirect URL'),
+          el('div', { class: p.post_purchase_redirect_url ? '' : 'muted' },
+            p.post_purchase_redirect_url || 'Keysat default /thank-you page'),
+        ]),
+      ]),
+      el('div', null, [
+        el('div', { class: 'field' }, [
+          el('div', { class: 'lbl' }, 'Brand color'),
+          el('div', { class: p.brand_color ? '' : 'muted' },
+            p.brand_color || 'Keysat default navy'),
+        ]),
+      ]),
+    ])
+    body.appendChild(meta)
+
+    // Providers list.
+    body.appendChild(el('div', { class: 'eyebrow', style: 'margin-bottom:6px' }, 'Payment providers'))
+    const providers = p.providers || []
+    if (providers.length === 0) {
+      body.appendChild(el('div', { class: 'empty', style: 'padding:14px' },
+        'No providers connected. Buyers can’t pay on products attached to this profile until you add one.'))
+    } else {
+      const tb = el('tbody')
+      for (const pr of providers) {
+        const rails = (pr.served_rails || []).join(', ')
+        const disconnectBtn = el('button', { class: 'btn danger sm' }, [
+          el('i', { 'data-lucide': 'unplug' }), 'Disconnect',
+        ])
+        disconnectBtn.addEventListener('click', async () => {
+          if (!confirm('Disconnect ' + pr.kind + ' provider "' + pr.label + '"?')) return
+          try {
+            const path = pr.kind === 'btcpay' ? '/v1/admin/btcpay/disconnect' : '/v1/admin/zaprite/disconnect'
+            await api(path, {
+              method: 'POST',
+              body: JSON.stringify({ provider_id: pr.id }),
+            })
+            reload()
+          } catch (e) {
+            alert('Disconnect failed: ' + e.message)
+          }
+        })
+        tb.appendChild(el('tr', null, [
+          el('td', null, el('strong', null, pr.label || pr.kind)),
+          el('td', { class: 'muted' }, pr.kind),
+          el('td', { class: 'muted' }, rails || '—'),
+          el('td', null, disconnectBtn),
+        ]))
+      }
+      const table = el('table', { class: 't' }, [
+        el('thead', null, el('tr', null, [
+          el('th', null, 'Label'),
+          el('th', null, 'Kind'),
+          el('th', null, 'Rails'),
+          el('th', null, ''),
+        ])),
+        tb,
+      ])
+      body.appendChild(el('div', { class: 't-wrap' }, table))
+    }
+
+    // Connect buttons (offer whichever provider kinds aren't yet attached).
+    const haveBtcpay = providers.some((pr) => pr.kind === 'btcpay')
+    const haveZaprite = providers.some((pr) => pr.kind === 'zaprite')
+    const connectActions = el('div', { class: 'toolbar', style: 'margin-top:14px' }, [])
+    if (!haveBtcpay) {
+      const btn = el('button', { class: 'btn secondary' }, [
+        el('i', { 'data-lucide': 'bitcoin' }), 'Connect BTCPay',
+      ])
+      btn.addEventListener('click', () => connectBtcpayForProfile(p.id, reload))
+      connectActions.appendChild(btn)
+    }
+    if (!haveZaprite) {
+      const btn = el('button', { class: 'btn secondary' }, [
+        el('i', { 'data-lucide': 'credit-card' }), 'Connect Zaprite',
+      ])
+      btn.addEventListener('click', () => connectZapriteForProfile(p.id, reload))
+      connectActions.appendChild(btn)
+    }
+    if (connectActions.children.length) body.appendChild(connectActions)
+
+    if (window.lucide) lucide.createIcons()
+    return el('div', { class: 'card' }, [head, body])
+  }
+
+  function openCreateMerchantProfileModal(onDone) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px;',
+    })
+    const nameInput = el('input', { class: 'input', placeholder: 'e.g. Recaps' })
+    const supportUrlInput = el('input', { class: 'input', placeholder: 'https://recaps.cc/support (optional)' })
+    const supportEmailInput = el('input', { class: 'input', placeholder: 'support@recaps.cc (optional)' })
+    const redirectInput = el('input', { class: 'input', placeholder: 'https://recaps.cc/welcome?invoice_id={invoice_id} (optional)' })
+    const brandColorInput = el('input', { class: 'input', type: 'color', value: '#1E3A5F' })
+    const errBox = el('div')
+    const submitBtn = el('button', { class: 'btn primary' }, 'Create profile')
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:520px; width:100%; padding:24px; max-height:90vh; overflow-y:auto;',
+    }, [
+      el('h3', { style: 'margin:0 0 14px' }, 'New merchant profile'),
+      el('p', { class: 'muted', style: 'margin:0 0 18px; font-size:13px' },
+        'Each profile is one business identity. Buyers see the brand on the buy page; ' +
+        'products attached to this profile route their payments through the providers you connect to it.'),
+      el('div', { class: 'field' }, [el('div', { class: 'lbl' }, 'Name'), nameInput]),
+      el('div', { class: 'field' }, [
+        el('div', { class: 'lbl' }, 'Support URL'),
+        supportUrlInput,
+        el('div', { class: 'hint' }, 'Linked from the buy page so buyers can contact your team.'),
+      ]),
+      el('div', { class: 'field' }, [
+        el('div', { class: 'lbl' }, 'Support email'),
+        supportEmailInput,
+      ]),
+      el('div', { class: 'field' }, [
+        el('div', { class: 'lbl' }, 'Post-purchase redirect URL'),
+        redirectInput,
+        el('div', { class: 'hint' }, '{invoice_id} is substituted at purchase time. Leave blank to use Keysat’s /thank-you page.'),
+      ]),
+      el('div', { class: 'field' }, [
+        el('div', { class: 'lbl' }, 'Brand color'),
+        brandColorInput,
+      ]),
+      errBox,
+      el('div', { style: 'display:flex; gap:10px; margin-top:18px; justify-content:flex-end;' }, [
+        el('button', { class: 'btn ghost', onclick: () => overlay.remove() }, 'Cancel'),
+        submitBtn,
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+    nameInput.focus()
+
+    submitBtn.addEventListener('click', async () => {
+      errBox.innerHTML = ''
+      const name = nameInput.value.trim()
+      if (!name) {
+        errBox.appendChild(err('Name is required.'))
+        return
+      }
+      submitBtn.disabled = true
+      try {
+        await api('/v1/admin/merchant-profiles', {
+          method: 'POST',
+          body: JSON.stringify({
+            name,
+            support_url: supportUrlInput.value.trim() || null,
+            support_email: supportEmailInput.value.trim() || null,
+            post_purchase_redirect_url: redirectInput.value.trim() || null,
+            brand_color: brandColorInput.value || null,
+          }),
+        })
+        overlay.remove()
+        if (onDone) onDone()
+      } catch (e) {
+        errBox.appendChild(err(e.message))
+        submitBtn.disabled = false
+      }
+    })
+  }
+
+  function openEditMerchantProfileModal(profile, onDone) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px;',
+    })
+    const nameInput = el('input', { class: 'input', value: profile.name || '' })
+    const supportUrlInput = el('input', { class: 'input', value: profile.support_url || '' })
+    const supportEmailInput = el('input', { class: 'input', value: profile.support_email || '' })
+    const redirectInput = el('input', { class: 'input', value: profile.post_purchase_redirect_url || '' })
+    const brandColorInput = el('input', { class: 'input', type: 'color', value: profile.brand_color || '#1E3A5F' })
+    const errBox = el('div')
+    const submitBtn = el('button', { class: 'btn primary' }, 'Save')
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:520px; width:100%; padding:24px; max-height:90vh; overflow-y:auto;',
+    }, [
+      el('h3', { style: 'margin:0 0 14px' }, 'Edit merchant profile'),
+      el('div', { class: 'field' }, [el('div', { class: 'lbl' }, 'Name'), nameInput]),
+      el('div', { class: 'field' }, [el('div', { class: 'lbl' }, 'Support URL'), supportUrlInput]),
+      el('div', { class: 'field' }, [el('div', { class: 'lbl' }, 'Support email'), supportEmailInput]),
+      el('div', { class: 'field' }, [
+        el('div', { class: 'lbl' }, 'Post-purchase redirect URL'),
+        redirectInput,
+        el('div', { class: 'hint' }, '{invoice_id} substituted at purchase time.'),
+      ]),
+      el('div', { class: 'field' }, [el('div', { class: 'lbl' }, 'Brand color'), brandColorInput]),
+      errBox,
+      el('div', { style: 'display:flex; gap:10px; margin-top:18px; justify-content:flex-end;' }, [
+        el('button', { class: 'btn ghost', onclick: () => overlay.remove() }, 'Cancel'),
+        submitBtn,
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+
+    submitBtn.addEventListener('click', async () => {
+      errBox.innerHTML = ''
+      submitBtn.disabled = true
+      try {
+        // Build the patch: outer Option means "leave unchanged" (omit
+        // the key); we always send all the editable fields so the
+        // operator can also CLEAR them by leaving the input empty.
+        const patch = {
+          name: nameInput.value.trim() || null,
+          support_url: [supportUrlInput.value.trim() || null],
+          support_email: [supportEmailInput.value.trim() || null],
+          post_purchase_redirect_url: [redirectInput.value.trim() || null],
+          brand_color: [brandColorInput.value || null],
+        }
+        // Wire-format note: the Rust patch uses double-Option (outer Some
+        // wraps inner None for "set to NULL"). serde_json deserializes
+        // a single value into outer Some(value); arrays into Some(Some(v)).
+        // We use the bare value for outer Some/Some(v), and the [null]
+        // array trick to express Some(None) (clear). For simplicity here
+        // we just send the bare value — Rust treats null → Some(None) →
+        // sets to NULL; a string → Some(Some(s)) → updates.
+        const wirePatch = {}
+        if (patch.name !== null) wirePatch.name = patch.name
+        wirePatch.support_url = patch.support_url[0]
+        wirePatch.support_email = patch.support_email[0]
+        wirePatch.post_purchase_redirect_url = patch.post_purchase_redirect_url[0]
+        wirePatch.brand_color = patch.brand_color[0]
+        await api('/v1/admin/merchant-profiles/' + encodeURIComponent(profile.id), {
+          method: 'PATCH',
+          body: JSON.stringify(wirePatch),
+        })
+        overlay.remove()
+        if (onDone) onDone()
+      } catch (e) {
+        errBox.appendChild(err(e.message))
+        submitBtn.disabled = false
+      }
+    })
+  }
+
+  async function connectBtcpayForProfile(profileId, onDone) {
+    try {
+      const r = await api('/v1/admin/btcpay/connect', {
+        method: 'POST',
+        body: JSON.stringify({ merchant_profile_id: profileId }),
+      })
+      if (r.authorize_url) {
+        if (confirm('Open BTCPay’s consent page in a new tab to complete connection?')) {
+          window.open(r.authorize_url, '_blank', 'noopener')
+        }
+      }
+      if (onDone) onDone()
+    } catch (e) {
+      alert('Connect BTCPay failed: ' + e.message)
+    }
+  }
+
+  function connectZapriteForProfile(profileId, onDone) {
+    const overlay = el('div', {
+      style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
+        'display:flex; align-items:center; justify-content:center; padding:20px;',
+    })
+    const apiKeyInput = el('input', { class: 'input', type: 'password', placeholder: 'paste Zaprite API key' })
+    const baseUrlInput = el('input', { class: 'input', placeholder: 'https://api.zaprite.com (default)' })
+    const errBox = el('div')
+    const submitBtn = el('button', { class: 'btn primary' }, 'Connect')
+    const card = el('div', {
+      style: 'background:var(--cream-50); border:1px solid var(--border-1); ' +
+        'border-radius:12px; max-width:480px; width:100%; padding:24px;',
+    }, [
+      el('h3', { style: 'margin:0 0 12px' }, 'Connect Zaprite'),
+      el('p', { class: 'muted', style: 'margin:0 0 14px; font-size:13px' },
+        'Paste an API key from app.zaprite.com Settings → API.'),
+      el('div', { class: 'field' }, [el('div', { class: 'lbl' }, 'API key'), apiKeyInput]),
+      el('div', { class: 'field' }, [
+        el('div', { class: 'lbl' }, 'Base URL (optional)'),
+        baseUrlInput,
+        el('div', { class: 'hint' }, 'Override only for sandbox orgs that point at a different host.'),
+      ]),
+      errBox,
+      el('div', { style: 'display:flex; gap:10px; margin-top:14px; justify-content:flex-end;' }, [
+        el('button', { class: 'btn ghost', onclick: () => overlay.remove() }, 'Cancel'),
+        submitBtn,
+      ]),
+    ])
+    overlay.appendChild(card)
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
+    document.body.appendChild(overlay)
+    apiKeyInput.focus()
+
+    submitBtn.addEventListener('click', async () => {
+      errBox.innerHTML = ''
+      const key = apiKeyInput.value.trim()
+      if (!key) { errBox.appendChild(err('API key required.')); return }
+      submitBtn.disabled = true
+      try {
+        const r = await api('/v1/admin/zaprite/connect', {
+          method: 'POST',
+          body: JSON.stringify({
+            api_key: key,
+            base_url: baseUrlInput.value.trim() || undefined,
+            merchant_profile_id: profileId,
+          }),
+        })
+        overlay.remove()
+        if (r.webhook_url) {
+          alert('Zaprite connected. Register this webhook URL on the Zaprite dashboard:\n\n' + r.webhook_url)
+        }
+        if (onDone) onDone()
+      } catch (e) {
+        errBox.appendChild(err(e.message))
+        submitBtn.disabled = false
+      }
+    })
   }
 
   // -------- Settings --------
