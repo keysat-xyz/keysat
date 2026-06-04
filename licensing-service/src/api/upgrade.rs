@@ -123,7 +123,40 @@ pub async fn start(
     // Create provider invoice. Same trait method the purchase + renewal
     // paths use, so any provider-specific concerns (URL rewriting,
     // metadata enrichment) live inside the impl.
-    let provider = state.payment_provider().await?;
+    //
+    // Tier-change invoices ride on an existing license. The right provider
+    // is whichever one the license's existing subscription is snapshotted
+    // to — so the proration charge settles to the same merchant identity
+    // that's been collecting renewal fees. Falls back to the license's
+    // first-cycle invoice provider, then the legacy default, for licenses
+    // with no subscription (one-shot upgrades) or pre-snapshot rows.
+    let snapshot_provider_id = crate::subscriptions::get_subscription_by_license_id(
+        &state.db, &license.id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| s.payment_provider_id);
+    let provider_id_for_upgrade = match snapshot_provider_id {
+        Some(p) => Some(p),
+        None => {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT i.payment_provider_id FROM invoices i \
+                 JOIN licenses l ON l.invoice_id = i.id \
+                 WHERE l.id = ?",
+            )
+            .bind(&license.id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+        }
+    };
+    let provider = match provider_id_for_upgrade.as_deref() {
+        Some(pid) => state.payment_provider_by_id(pid).await?,
+        None => state.payment_provider().await?,
+    };
     let internal_invoice_id = Uuid::new_v4().to_string();
     let default_redirect = format!(
         "{}/thank-you?invoice_id={}",
@@ -175,6 +208,7 @@ pub async fn start(
         Some(quote.proration_charge_value),
         conversion.rate_centibps,
         Some(conversion.source.as_str()),
+        provider_id_for_upgrade.as_deref(),
     )
     .await?;
 
@@ -456,7 +490,36 @@ pub async fn admin_change(
     .map_err(|e| AppError::Upstream(format!("rate conversion failed: {e:#}")))?;
     let amount_sats = conversion.sats.max(1);
 
-    let provider = state.payment_provider().await?;
+    // Same provider-resolution pattern as the buyer-driven tier-change
+    // above: prefer the license's snapshotted subscription provider so
+    // the admin charge settles to the same merchant identity.
+    let snapshot_provider_id = crate::subscriptions::get_subscription_by_license_id(
+        &state.db, &license.id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| s.payment_provider_id);
+    let provider_id_for_upgrade = match snapshot_provider_id {
+        Some(p) => Some(p),
+        None => {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT i.payment_provider_id FROM invoices i \
+                 JOIN licenses l ON l.invoice_id = i.id \
+                 WHERE l.id = ?",
+            )
+            .bind(&license.id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+        }
+    };
+    let provider = match provider_id_for_upgrade.as_deref() {
+        Some(pid) => state.payment_provider_by_id(pid).await?,
+        None => state.payment_provider().await?,
+    };
     let internal_invoice_id = Uuid::new_v4().to_string();
     let default_redirect = format!(
         "{}/thank-you?invoice_id={}",
@@ -498,6 +561,7 @@ pub async fn admin_change(
         Some(quote.proration_charge_value),
         conversion.rate_centibps,
         Some(conversion.source.as_str()),
+        provider_id_for_upgrade.as_deref(),
     )
     .await?;
 

@@ -355,6 +355,7 @@ pub async fn create_invoice(
     buyer_email: Option<&str>,
     buyer_note: Option<&str>,
     policy_id: Option<&str>,
+    payment_provider_id: Option<&str>,
 ) -> AppResult<Invoice> {
     create_invoice_with_currency(
         pool,
@@ -370,6 +371,7 @@ pub async fn create_invoice(
         None,
         None,
         None,
+        payment_provider_id,
     )
     .await
 }
@@ -395,6 +397,7 @@ pub async fn create_invoice_with_currency(
     listed_value: Option<i64>,
     exchange_rate_centibps: Option<i64>,
     exchange_rate_source: Option<&str>,
+    payment_provider_id: Option<&str>,
 ) -> AppResult<Invoice> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
@@ -402,8 +405,9 @@ pub async fn create_invoice_with_currency(
          (id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
           amount_sats, checkout_url, policy_id,
           listed_currency, listed_value, exchange_rate_centibps, exchange_rate_source,
+          payment_provider_id,
           created_at, updated_at)
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(btcpay_invoice_id)
@@ -417,6 +421,7 @@ pub async fn create_invoice_with_currency(
     .bind(listed_value)
     .bind(exchange_rate_centibps)
     .bind(exchange_rate_source)
+    .bind(payment_provider_id)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -466,7 +471,8 @@ pub async fn create_free_invoice(
 pub async fn get_invoice_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Invoice>> {
     let row = sqlx::query(
         "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at, policy_id
+                amount_sats, checkout_url, created_at, updated_at, policy_id,
+                listed_currency, listed_value, payment_provider_id
          FROM invoices WHERE id = ?",
     )
     .bind(id)
@@ -481,7 +487,8 @@ pub async fn get_invoice_by_btcpay_id(
 ) -> AppResult<Option<Invoice>> {
     let row = sqlx::query(
         "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at, policy_id
+                amount_sats, checkout_url, created_at, updated_at, policy_id,
+                listed_currency, listed_value, payment_provider_id
          FROM invoices WHERE btcpay_invoice_id = ?",
     )
     .bind(btcpay_invoice_id)
@@ -517,7 +524,8 @@ pub async fn list_pending_invoices(
     let cutoff = (Utc::now() - chrono::Duration::hours(max_age_hours)).to_rfc3339();
     let rows = sqlx::query(
         "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at, policy_id
+                amount_sats, checkout_url, created_at, updated_at, policy_id,
+                listed_currency, listed_value, payment_provider_id
          FROM invoices
          WHERE status = 'pending' AND created_at >= ?
          ORDER BY created_at ASC",
@@ -546,6 +554,10 @@ fn row_to_invoice(row: sqlx::sqlite::SqliteRow) -> Invoice {
             .ok()
             .flatten(),
         listed_value: row.try_get::<Option<i64>, _>("listed_value").ok().flatten(),
+        payment_provider_id: row
+            .try_get::<Option<String>, _>("payment_provider_id")
+            .ok()
+            .flatten(),
     }
 }
 

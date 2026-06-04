@@ -114,6 +114,13 @@ pub struct Invoice {
     /// `amount_sats` (which is correct for SAT-priced products).
     #[serde(default)]
     pub listed_value: Option<i64>,
+    /// Which payment provider settled this invoice. Added by migration
+    /// 0021 alongside the multi-merchant-profile work; NULL on pre-0021
+    /// invoices (backfilled by the migration to the first provider on
+    /// the default profile). Required for reconcile.rs to dispatch
+    /// status checks to the right provider when multiple are configured.
+    #[serde(default)]
+    pub payment_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

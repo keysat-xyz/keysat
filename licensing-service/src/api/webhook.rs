@@ -278,6 +278,21 @@ pub async fn issue_license_for_invoice(
             .ok()
             .flatten();
             if existing.is_none() {
+                // Snapshot the merchant profile + payment provider that
+                // settled this purchase, so the renewal worker uses the
+                // SAME business + payment account on subsequent cycles
+                // even if the operator later moves the product to a
+                // different profile. Falls back to the product's
+                // current profile (and the invoice's recorded provider)
+                // when the snapshot fields aren't already on the invoice.
+                let snapshot_profile_id = crate::db::repo::get_merchant_profile_for_product(
+                    &state.db, &invoice.product_id,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.id);
+                let snapshot_provider_id = invoice.payment_provider_id.clone();
                 match crate::subscriptions::create_subscription(
                     &state.db,
                     &license_id,
@@ -287,6 +302,8 @@ pub async fn issue_license_for_invoice(
                     &listed_currency,
                     listed_value,
                     &invoice.id,
+                    snapshot_profile_id.as_deref(),
+                    snapshot_provider_id.as_deref(),
                 )
                 .await
                 {

@@ -45,11 +45,15 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     // provider-specific status-string normalization (BTCPay's
     // "Settled"/"Complete"/"Expired"/"Invalid" → ProviderInvoiceStatus
     // enum); this loop just operates on the typed result.
-    let provider = match state.payment_provider().await {
-        Ok(p) => p,
-        Err(_) => return Ok(()), // not configured yet — skip silently
-    };
-
+    //
+    // With multi-provider, each pending invoice is reconciled against
+    // its OWN provider (recorded on the invoice row, migration 0021).
+    // We can't iterate against a single global provider because the
+    // operator may have multiple providers configured across multiple
+    // merchant profiles. Pre-0021 invoices that slipped through with
+    // a NULL provider id fall back to the legacy `payment_provider()`
+    // accessor (which the migration's backfill should prevent from
+    // ever being needed in practice).
     let pending = repo::list_pending_invoices(&state.db, MAX_AGE_HOURS)
         .await
         .map_err(|e| anyhow::anyhow!("listing pending invoices: {e:?}"))?;
@@ -60,6 +64,24 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     tracing::debug!(count = pending.len(), "reconciling pending invoices");
 
     for inv in pending {
+        let provider = match inv.payment_provider_id.as_deref() {
+            Some(pid) => match state.payment_provider_by_id(pid).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        invoice_id = %inv.id,
+                        provider_id = pid,
+                        "reconciler skipping invoice — its provider is unavailable"
+                    );
+                    continue;
+                }
+            },
+            None => match state.payment_provider().await {
+                Ok(p) => p,
+                Err(_) => continue, // not configured yet — skip silently
+            },
+        };
         match provider.get_invoice_status(&inv.btcpay_invoice_id).await {
             Ok(status) => {
                 use crate::payment::ProviderInvoiceStatus::*;

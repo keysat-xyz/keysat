@@ -122,6 +122,19 @@ pub struct Subscription {
     /// an `/v1/orders/charge` failure and fall through to the
     /// manual-pay branch.
     pub zaprite_payment_profile_expires_at: Option<String>,
+    /// Merchant profile the subscription was attached to at
+    /// creation. Frozen for the lifetime of the sub so an operator
+    /// editing the product's profile attachment doesn't redirect
+    /// existing buyers to a different business mid-cycle. NULL on
+    /// subs created pre-migration 0020 (backfilled to the default
+    /// profile during the migration).
+    pub merchant_profile_id: Option<String>,
+    /// Payment provider used for THIS subscription's billing cycle.
+    /// Frozen at creation (same rationale as merchant_profile_id).
+    /// The renewal worker uses this to look up the provider — it
+    /// never re-resolves from the product (which might have moved
+    /// to a different profile / different providers).
+    pub payment_provider_id: Option<String>,
 }
 
 fn row_to_subscription(row: sqlx::sqlite::SqliteRow) -> Subscription {
@@ -144,6 +157,8 @@ fn row_to_subscription(row: sqlx::sqlite::SqliteRow) -> Subscription {
         zaprite_payment_profile_expires_at: row
             .try_get("zaprite_payment_profile_expires_at")
             .ok(),
+        merchant_profile_id: row.try_get("merchant_profile_id").ok().flatten(),
+        payment_provider_id: row.try_get("payment_provider_id").ok().flatten(),
     }
 }
 
@@ -151,7 +166,8 @@ const SUB_COLS: &str = "id, license_id, policy_id, product_id, period_days, \
     listed_currency, listed_value, status, started_at, next_renewal_at, \
     cancelled_at, consecutive_failures, \
     zaprite_contact_id, zaprite_payment_profile_id, \
-    zaprite_payment_profile_method, zaprite_payment_profile_expires_at";
+    zaprite_payment_profile_method, zaprite_payment_profile_expires_at, \
+    merchant_profile_id, payment_provider_id";
 
 /// Subs that are due for the worker to act on right now: status
 /// is `active` or `past_due`, `next_renewal_at` is in the past,
@@ -196,7 +212,8 @@ pub async fn find_lapsing_subscriptions(
                 s.next_renewal_at, s.cancelled_at, s.consecutive_failures, \
                 s.zaprite_contact_id, s.zaprite_payment_profile_id, \
                 s.zaprite_payment_profile_method, \
-                s.zaprite_payment_profile_expires_at \
+                s.zaprite_payment_profile_expires_at, \
+                s.merchant_profile_id, s.payment_provider_id \
          FROM subscriptions s \
          JOIN policies p ON p.id = s.policy_id \
          WHERE s.status = 'past_due' \
@@ -373,6 +390,8 @@ pub async fn create_subscription(
     listed_currency: &str,
     listed_value: i64,
     first_cycle_invoice_id: &str,
+    merchant_profile_id: Option<&str>,
+    payment_provider_id: Option<&str>,
 ) -> Result<Subscription> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -382,8 +401,9 @@ pub async fn create_subscription(
     sqlx::query(
         "INSERT INTO subscriptions(id, license_id, policy_id, product_id, period_days, \
          listed_currency, listed_value, status, started_at, next_renewal_at, \
-         consecutive_failures, created_at, updated_at) \
-         VALUES(?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?)",
+         consecutive_failures, merchant_profile_id, payment_provider_id, \
+         created_at, updated_at) \
+         VALUES(?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(license_id)
@@ -394,6 +414,8 @@ pub async fn create_subscription(
     .bind(listed_value)
     .bind(&started_at)
     .bind(&next_renewal_at)
+    .bind(merchant_profile_id)
+    .bind(payment_provider_id)
     .bind(&started_at)
     .bind(&started_at)
     .execute(pool)
@@ -436,6 +458,8 @@ pub async fn create_subscription(
         zaprite_payment_profile_id: None,
         zaprite_payment_profile_method: None,
         zaprite_payment_profile_expires_at: None,
+        merchant_profile_id: merchant_profile_id.map(|s| s.to_string()),
+        payment_provider_id: payment_provider_id.map(|s| s.to_string()),
     })
 }
 
@@ -696,12 +720,24 @@ async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
             .context("rate conversion")?;
     let amount_sats = conversion.sats.max(1);
 
-    // 2. Get the active provider. If no provider is configured
-    //    we can't bill — surfaces as a renewal failure that
-    //    backs off (operator probably mid-Disconnect).
-    let provider = state.payment_provider().await.map_err(|e| {
-        anyhow!("payment provider unavailable for renewal: {e:#}")
-    })?;
+    // 2. Get the provider snapshotted on this sub at creation. The
+    //    snapshot semantics protect existing buyers from operator-side
+    //    re-routing: if the product was moved to a different merchant
+    //    profile or its providers changed, this sub keeps renewing
+    //    through the same business + payment account it started with.
+    //    Falls back to the default profile's first provider if the
+    //    snapshot is NULL (pre-migration subs that the 0020 backfill
+    //    missed, or any rows that slipped through with NULL).
+    let provider = match sub.payment_provider_id.as_deref() {
+        Some(pid) => state
+            .payment_provider_by_id(pid)
+            .await
+            .map_err(|e| anyhow!("snapshotted provider {pid} unavailable: {e:#}"))?,
+        None => state
+            .payment_provider()
+            .await
+            .map_err(|e| anyhow!("payment provider unavailable for renewal: {e:#}"))?,
+    };
 
     // 3. Compute the next cycle window.
     let now = Utc::now();
@@ -786,6 +822,7 @@ async fn renew_one(state: &AppState, sub: &Subscription) -> Result<()> {
         } else {
             Some(conversion.source.as_str())
         },
+        None, // payment_provider_id — set when this call site is ported to the multi-provider resolution layer
     )
     .await
     .map_err(|e: AppError| anyhow!("repo create_invoice: {e:?}"))?;
@@ -1103,16 +1140,39 @@ pub async fn capture_zaprite_payment_profile(
         return Ok(());
     }
 
-    // Active provider must be Zaprite for any of the rest to be
-    // meaningful — `as_any` downcast keeps the trait clean.
-    let provider = match state.payment_provider().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                sub_id = %sub_id, error = %e,
-                "capture: no active payment provider — skipping"
-            );
-            return Ok(());
+    // The provider that settled THIS invoice — not "the active one." With
+    // multi-merchant-profile, the operator may have several providers
+    // configured across different profiles; capturing the saved profile
+    // has to talk to the SAME Zaprite org that the order was created
+    // against (saved-profile ids are scoped per org).
+    let provider = match invoice.payment_provider_id.as_deref() {
+        Some(pid) => match state.payment_provider_by_id(pid).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    sub_id = %sub_id,
+                    provider_id = pid,
+                    error = %e,
+                    "capture: invoice's provider unavailable — skipping"
+                );
+                return Ok(());
+            }
+        },
+        None => {
+            // Pre-0021 invoice with NULL provider — fall back to the legacy
+            // default. The 0021 backfill should have populated this column
+            // on the first migration run, so this branch is defensive only.
+            match state.payment_provider().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        sub_id = %sub_id, error = %e,
+                        "capture: no active payment provider AND invoice has no \
+                         payment_provider_id — skipping"
+                    );
+                    return Ok(());
+                }
+            }
         }
     };
     if provider.kind() != ProviderKind::Zaprite {
@@ -1313,10 +1373,19 @@ async fn try_auto_charge_zaprite(
         _ => return Ok(false),
     };
 
-    let provider = state
-        .payment_provider()
-        .await
-        .map_err(|e| anyhow!("payment provider unavailable: {e:#}"))?;
+    // Use the provider snapshotted on the sub — saved-profile ids are
+    // scoped per Zaprite org, so we can't fall back to "the active
+    // provider" if the operator added another Zaprite provider since.
+    let provider = match sub.payment_provider_id.as_deref() {
+        Some(pid) => state
+            .payment_provider_by_id(pid)
+            .await
+            .map_err(|e| anyhow!("snapshotted provider {pid} unavailable: {e:#}"))?,
+        None => state
+            .payment_provider()
+            .await
+            .map_err(|e| anyhow!("payment provider unavailable: {e:#}"))?,
+    };
     if provider.kind() != ProviderKind::Zaprite {
         return Ok(false);
     }

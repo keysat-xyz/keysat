@@ -57,61 +57,70 @@ async fn main() -> anyhow::Result<()> {
         keypair.public_key_pem.trim()
     );
 
-    // --- payment provider (may be None until operator connects) ---
-    // Resolution order:
-    //   1. operator's explicit preference from the
-    //      active_payment_provider setting (set by the most recent
-    //      Connect or Activate action),
-    //   2. fallback for legacy installs without the setting:
-    //      BTCPay first, Zaprite second. Once we ship v0.3 with the
-    //      multi-provider routing layer this fallback retires.
-    let preferred = payment::read_active_provider_preference(&pool).await;
-    let provider: Option<Arc<dyn payment::PaymentProvider>> = match preferred {
-        Some(payment::ProviderKind::Zaprite) => {
-            // Operator explicitly chose Zaprite. Try Zaprite; if it
-            // can't be loaded (e.g., the row was deleted out from
-            // under the setting), fall through to BTCPay rather
-            // than booting unconfigured.
-            load_zaprite_provider(&pool)
-                .await
-                .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>)
-                .or_else(|| {
-                    tracing::warn!(
-                        "active_payment_provider=zaprite but zaprite_config is missing; \
-                         falling back to BTCPay"
-                    );
-                    None
-                })
-                .or(load_btcpay_provider(&pool, &cfg)
-                    .await
-                    .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>))
-        }
-        Some(payment::ProviderKind::Btcpay) | None => {
-            // Either operator chose BTCPay, or no preference recorded
-            // yet (legacy install). Either way, BTCPay wins if
-            // configured; Zaprite as fallback.
+    // --- payment provider boot-time warm-up ---
+    //
+    // With the multi-merchant-profile model (migration 0020+) we no longer
+    // load a single "active" provider at boot. Providers are looked up by
+    // id on demand via `AppState::payment_provider_by_id` (which builds
+    // from a `payment_providers` row each time it's called) and resolved
+    // per purchase via `resolve_provider_for_product_rail`.
+    //
+    // For back-compat we still populate the legacy `state.payment`
+    // singleton with the FIRST provider attached to the default merchant
+    // profile — this is what `state.payment_provider()` returns to the
+    // remaining legacy call sites (and is a sensible fallback for any
+    // code path that runs before the operator has linked a product to a
+    // specific profile). Empty profile → empty singleton; the on-demand
+    // resolution layer takes over from there.
+    let provider: Option<Arc<dyn payment::PaymentProvider>> = match keysat::db::repo::get_default_merchant_profile(&pool).await {
+        Ok(Some(profile)) => match keysat::db::repo::list_payment_providers_for_profile(&pool, &profile.id).await {
+            Ok(rows) => match rows.first() {
+                Some(row) => match payment::build_provider(row, cfg.btcpay_public_url.as_deref()) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider_id = %row.id,
+                            error = %e,
+                            "failed to build provider from default-profile row; \
+                             leaving legacy state.payment empty"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    profile_id = %profile.id,
+                    error = %e,
+                    "failed to list providers on default profile at boot"
+                );
+                None
+            }
+        },
+        Ok(None) => {
+            // Pre-migration: no default profile exists yet (operator hasn't
+            // installed :52 yet). Fall back to the legacy singleton-config
+            // loaders so the daemon still boots cleanly during the upgrade
+            // window — these run against btcpay_config / zaprite_config
+            // until migration 0020 drops those tables.
             load_btcpay_provider(&pool, &cfg)
                 .await
                 .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>)
-                .or_else(|| {
-                    if preferred == Some(payment::ProviderKind::Btcpay) {
-                        tracing::warn!(
-                            "active_payment_provider=btcpay but btcpay_config is missing; \
-                             falling back to Zaprite"
-                        );
-                    }
-                    None
-                })
                 .or(load_zaprite_provider(&pool)
                     .await
                     .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>))
         }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read default merchant profile at boot");
+            None
+        }
     };
     match &provider {
-        Some(p) => tracing::info!(provider = p.kind().as_str(), "payment provider connected"),
+        Some(p) => tracing::info!(provider = p.kind().as_str(), "default payment provider warmed up"),
         None => tracing::warn!(
             "no payment provider yet configured — purchases will return 503 until the \
-             operator completes the 'Connect BTCPay' or 'Connect Zaprite' flow"
+             operator completes 'Connect BTCPay' or 'Connect Zaprite' in the admin UI"
         ),
     }
 

@@ -199,12 +199,29 @@ async fn run_tip(
         }
     };
 
-    // Pay it via the active provider's LN node. Provider-agnostic;
-    // BTCPay implements `pay_lightning_invoice` today, future
-    // providers either implement it (Zaprite via Strike?) or fall
-    // through to the trait default which returns a "not supported"
-    // error that we record as a failed tip.
-    let provider = match state.payment_provider().await {
+    // Pay it via the provider's LN node — same provider that settled
+    // this license's purchase invoice (so the tip draws from the right
+    // Bitcoin balance). Provider-agnostic; BTCPay implements
+    // `pay_lightning_invoice` today, future providers either implement
+    // it (Zaprite via Strike?) or fall through to the trait default
+    // which returns a "not supported" error that we record as a failed
+    // tip. Falls back to the legacy active-provider accessor if the
+    // license's invoice has no payment_provider_id set (pre-0021).
+    let invoice_provider_id: Option<String> = sqlx::query_scalar(
+        "SELECT i.payment_provider_id FROM invoices i \
+         JOIN licenses l ON l.invoice_id = i.id \
+         WHERE l.id = ?",
+    )
+    .bind(license_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let provider_result = match invoice_provider_id.as_deref() {
+        Some(pid) => state.payment_provider_by_id(pid).await,
+        None => state.payment_provider().await,
+    };
+    let provider = match provider_result {
         Ok(p) => p,
         Err(e) => {
             let detail = format!("payment provider unavailable: {e:?}");

@@ -37,6 +37,14 @@ pub struct StartPurchaseReq {
     /// issuance time. When omitted, the daemon falls back to the product's
     /// default policy at issuance — same as pre-:27 behaviour.
     pub policy_slug: Option<String>,
+    /// Optional payment rail the buyer picked on the buy page. One of
+    /// `lightning` / `onchain` / `card`. When omitted, the daemon picks
+    /// the first rail the product's merchant profile exposes — which is
+    /// the right behavior for single-rail profiles AND back-compat for
+    /// pre-:52 callers that don't know about rails yet. When the buyer
+    /// is on a multi-rail profile and the buy page surfaces a picker,
+    /// this field carries the choice.
+    pub rail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,29 +427,16 @@ pub async fn start(
     // before we've persisted the BTCPay invoice id.
     let internal_id = uuid::Uuid::new_v4().to_string();
 
-    // If the caller didn't supply a redirect_url, default to our own
-    // /thank-you page with the invoice id baked in. After payment
-    // BTCPay sends the buyer's browser there; the page polls
-    // /v1/purchase/<invoice_id> until the license is issued, then
-    // renders it. Internal ID (UUID) goes in the URL so the buyer can
-    // bookmark it / refresh later if they close the tab.
-    let default_redirect = format!(
-        "{}/thank-you?invoice_id={}",
-        state.config.public_base_url, internal_id
-    );
-    let redirect_url = req
-        .redirect_url
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&default_redirect);
-
-    // Step C: provider-agnostic invoice creation. The trait method
-    // handles provider-specific concerns (HMAC-headered request, URL
-    // rewriting from internal hostname to public, metadata enrichment
-    // with `orderId`/`source`) inside its impl, so this code path is
-    // identical for any future provider (Zaprite, etc.). On failure,
-    // release the slot and bail.
-    let provider = match state.payment_provider().await {
+    // Step B.5: resolve the merchant profile + payment provider for THIS
+    // purchase. The product is attached to exactly one merchant profile;
+    // the profile exposes one or more payment providers (BTCPay / Zaprite).
+    // The buyer (or their UA) names a rail via `req.rail` if the buy page's
+    // multi-rail picker surfaced one — otherwise we pick the first rail the
+    // profile exposes, which is the right behavior for the common
+    // single-rail-per-profile case. The resolution layer also returns the
+    // provider row so we can record its id on the invoice; the renewal
+    // worker reads that id off the snapshot when auto-charging future cycles.
+    let merchant_profile = match state.merchant_profile_for_product(&product.id).await {
         Ok(p) => p,
         Err(e) => {
             if let Some(code) = &reservation {
@@ -450,6 +445,77 @@ pub async fn start(
             return Err(e);
         }
     };
+    let requested_rail = req
+        .rail
+        .as_deref()
+        .and_then(crate::payment::Rail::parse);
+    let rail = match requested_rail {
+        Some(r) => r,
+        None => {
+            // No buyer pick — collect the union of rails this profile's
+            // providers offer and use the first. With one provider this
+            // is its primary rail; with multiple, this is whatever the
+            // earliest-connected provider serves first.
+            let providers = repo::list_payment_providers_for_profile(
+                &state.db, &merchant_profile.id,
+            )
+            .await?;
+            let first_rail = providers.iter().find_map(|row| {
+                crate::payment::ProviderKind::parse(&row.kind)
+                    .and_then(|kind| crate::payment::rails_for_kind(kind).into_iter().next())
+            });
+            match first_rail {
+                Some(r) => r,
+                None => {
+                    if let Some(code) = &reservation {
+                        let _ = repo::release_code_slot(&state.db, &code.id).await;
+                    }
+                    return Err(AppError::BadRequest(format!(
+                        "merchant profile '{}' has no payment providers connected — \
+                         buyers can't pay yet. Connect one in the admin UI.",
+                        merchant_profile.name
+                    )));
+                }
+            }
+        }
+    };
+    let (provider_row, provider) = match state
+        .resolve_provider_for_profile_rail(&merchant_profile.id, rail)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(code) = &reservation {
+                let _ = repo::release_code_slot(&state.db, &code.id).await;
+            }
+            return Err(e);
+        }
+    };
+
+    // If the caller didn't supply a redirect_url, prefer the merchant
+    // profile's configured post_purchase_redirect_url (operator's app
+    // landing page — e.g. recaps.cc/welcome). Fall back to Keysat's own
+    // /thank-you?invoice_id=… page if neither is set.
+    let default_redirect = format!(
+        "{}/thank-you?invoice_id={}",
+        state.config.public_base_url, internal_id
+    );
+    let profile_redirect = merchant_profile
+        .post_purchase_redirect_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|tmpl| {
+            // Allow `{invoice_id}` substitution so operators can land
+            // buyers on a per-purchase URL on their own app.
+            tmpl.replace("{invoice_id}", &internal_id)
+        });
+    let profile_redirect_ref = profile_redirect.as_deref();
+    let redirect_url = req
+        .redirect_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or(profile_redirect_ref)
+        .unwrap_or(&default_redirect);
     // Recurring policy: ask the provider to prompt the buyer to
     // save their payment profile at checkout so the renewal worker
     // can later auto-charge it via `charge_order_with_profile`.
@@ -528,6 +594,7 @@ pub async fn start(
         listed_value,
         exchange_rate_centibps,
         exchange_rate_source.as_deref(),
+        Some(&provider_row.id),
     )
     .await
     {
