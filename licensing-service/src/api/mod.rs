@@ -573,6 +573,41 @@ async fn thank_you(
         .or(state.config.operator_name.as_deref())
         .unwrap_or("Keysat");
     let operator = html_escape(operator_str);
+
+    // Provider-aware confirmation copy. BTCPay is Bitcoin-only (Lightning
+    // + on-chain); Zaprite brokers card payments too (Stripe / etc.) plus
+    // Bitcoin. The lede and the polling-status copy should reflect which
+    // payment rails are actually in play so a buyer who paid by card
+    // doesn't see "your Bitcoin payment was received" while their Stripe
+    // transaction shows up in the operator's dashboard.
+    //
+    // Today this reads `SETTING_ACTIVE_PROVIDER` (the singleton model).
+    // When the multi-provider work lands, swap this for a lookup of the
+    // invoice's own `payment_provider_id` so the copy matches the rail
+    // that actually settled THIS purchase, not whatever's currently
+    // active on the daemon.
+    let provider_kind = crate::payment::read_active_provider_preference(&state.db).await;
+    let (lede_text, provider_kind_str) = match provider_kind {
+        Some(crate::payment::ProviderKind::Zaprite) => (
+            "Your payment was received. We\u{2019}re waiting for it to settle and \
+             for the license to be signed. Card payments confirm in seconds; \
+             Bitcoin Lightning also settles in seconds; on-chain Bitcoin typically \
+             settles in 10\u{2013}20 minutes (one block confirmation).",
+            "zaprite",
+        ),
+        // BTCPay or unconfigured → original Bitcoin-only copy. Unconfigured
+        // is rare on this page (operator hit /thank-you without a provider
+        // connected) so we keep it Bitcoin-flavored rather than introducing
+        // a third "unknown" branch.
+        _ => (
+            "Your Bitcoin payment was received. We\u{2019}re waiting for it to settle \
+             and for the license to be signed. Lightning settles in seconds; on-chain \
+             typically settles in 10\u{2013}20 minutes (one block confirmation).",
+            "btcpay",
+        ),
+    };
+    let provider_kind_json = serde_json::to_string(provider_kind_str)
+        .unwrap_or_else(|_| "\"btcpay\"".into());
     let body = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -748,7 +783,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 <div class="wrap">
   <div class="eyebrow">Payment received</div>
   <h1 id="page-title">Issuing your license&hellip;</h1>
-  <p class="lede" id="page-lede">Your Bitcoin payment was received. We&rsquo;re waiting for it to settle and for the license to be signed. Lightning settles in seconds; on-chain typically settles in 10&ndash;20 minutes (one block confirmation).</p>
+  <p class="lede" id="page-lede">{lede_text}</p>
 
   <!-- pending state (default): polling for the license -->
   <div class="pending-card" id="pending-card">
@@ -788,6 +823,10 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 <script>
 (function() {{
   const INVOICE_ID = {invoice_id_json};
+  // 'zaprite' | 'btcpay' — selects which payment-rail copy the
+  // polling status uses (Zaprite: card + Lightning + on-chain; BTCPay:
+  // Lightning + on-chain only).
+  const PROVIDER_KIND = {provider_kind_json};
   if (!INVOICE_ID) {{
     document.getElementById('pending-card').classList.add('hide');
     document.getElementById('error-card').classList.remove('hide');
@@ -857,10 +896,21 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 
   function waitingCopy(status) {{
     const min = Math.floor(elapsedMs / 60000);
+    const isZaprite = PROVIDER_KIND === 'zaprite';
     if (status === 'pending' || status === 'processing') {{
-      if (min < 2) return 'invoice ' + status + ' — Lightning settles in seconds; on-chain takes a block (~10 min).';
-      if (min < 10) return 'invoice ' + status + ' — looks like an on-chain payment, waiting for block confirmation. Safe to leave this tab open or bookmark this URL.';
-      return 'invoice ' + status + ' — slow block. Still polling. Bookmark this URL and refresh later if you close the tab.';
+      if (min < 2) {{
+        return isZaprite
+          ? 'invoice ' + status + ' — card payments confirm in seconds; Bitcoin Lightning in seconds; on-chain takes a block (~10 min).'
+          : 'invoice ' + status + ' — Lightning settles in seconds; on-chain takes a block (~10 min).';
+      }}
+      if (min < 10) {{
+        return isZaprite
+          ? 'invoice ' + status + ' — waiting for confirmation. Card auth or on-chain Bitcoin can take a few minutes. Safe to leave this tab open or bookmark this URL.'
+          : 'invoice ' + status + ' — looks like an on-chain payment, waiting for block confirmation. Safe to leave this tab open or bookmark this URL.';
+      }}
+      return isZaprite
+        ? 'invoice ' + status + ' — slow confirmation. Still polling. Bookmark this URL and refresh later if you close the tab.'
+        : 'invoice ' + status + ' — slow block. Still polling. Bookmark this URL and refresh later if you close the tab.';
     }}
     return 'invoice status: ' + (status || 'pending');
   }}

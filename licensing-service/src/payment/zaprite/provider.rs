@@ -61,6 +61,63 @@ impl PaymentProvider for ZapriteProvider {
             }
         };
 
+        // If we're going to ask Zaprite to save the buyer's payment
+        // profile (recurring first cycle), Zaprite REQUIRES an
+        // explicit `contactId` on the order — passing only
+        // `customerData: { email }` returns
+        // `400 contactId is required when allowSavePaymentProfile is true`
+        // even though their llms.txt docs claim contactId is
+        // optional. The API is the source of truth, so we create a
+        // contact first and pass its id below.
+        //
+        // Three paths:
+        //   1. Recurring + buyer_email present → create contact,
+        //      attach contactId, set allow_save_payment_profile=true.
+        //   2. Recurring + buyer_email MISSING → can't create a
+        //      contact (Zaprite requires email). Log a warning and
+        //      degrade to one-shot mode for THIS cycle — the buyer
+        //      gets a license, but subsequent renewals will fall
+        //      through to manual-pay (zaprite_payment_profile_id
+        //      stays NULL). Reason for degrading rather than failing:
+        //      blocking the purchase entirely is worse than letting
+        //      the operator collect cycle-1 revenue and prompt the
+        //      buyer for an email at next renewal.
+        //   3. Non-recurring → no contact needed; pass customerData
+        //      only (current behavior preserved).
+        let want_save_profile = params.allow_save_payment_profile == Some(true);
+        let (contact_id, effective_allow_save) = if want_save_profile {
+            match params.buyer_email {
+                Some(email) => {
+                    let contact = self
+                        .client
+                        .create_contact(email, None)
+                        .await
+                        .context("ZapriteProvider.create_invoice: create_contact")?;
+                    let id = contact
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Zaprite create_contact response missing 'id': {contact}"
+                            )
+                        })?
+                        .to_string();
+                    (Some(id), Some(true))
+                }
+                None => {
+                    tracing::warn!(
+                        external_order_id = %params.external_order_id,
+                        "recurring purchase has no buyer_email; degrading to one-shot \
+                         (allow_save_payment_profile=false). Renewals for this \
+                         subscription will fall back to manual-pay."
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, params.allow_save_payment_profile)
+        };
+
         // Build the Zaprite order. externalUniqId carries OUR
         // invoice UUID; this is what the webhook handler uses as
         // the trust anchor (see `validate_webhook` below).
@@ -82,8 +139,11 @@ impl PaymentProvider for ZapriteProvider {
             // shows the save-payment-profile prompt; subsequent
             // cycles are then merchant-initiated charges against
             // the saved profile via
-            // `charge_order_with_profile`.
-            allow_save_payment_profile: params.allow_save_payment_profile,
+            // `charge_order_with_profile`. May be reset to None
+            // above if we couldn't satisfy Zaprite's contactId
+            // requirement.
+            allow_save_payment_profile: effective_allow_save,
+            contact_id,
         };
 
         let order = self
@@ -179,19 +239,47 @@ impl PaymentProvider for ZapriteProvider {
         let v: Value = serde_json::from_slice(body)
             .context("Zaprite webhook body must be JSON")?;
 
-        // Zaprite event shape (from OpenAPI excerpt + ecosystem
-        // conventions): top-level `event` string + `data.id`
-        // (the order UUID). Examples expected:
-        //   order.paid, order.complete, order.overpaid, order.underpaid,
-        //   order.pending, order.expired, order.refunded
-        // We map liberally and let unknowns fall through to Other.
-        let event_type = v
-            .get("event")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
+        // Zaprite event shape: their docs don't enumerate event names
+        // or payload shape. The `:49` sandbox test surfaced an empty
+        // event_type because we were only checking the top-level
+        // `event` field; Zaprite seems to put it elsewhere. We now
+        // probe four common top-level field names — first non-empty
+        // string wins. If even that fails, dump the raw payload at
+        // WARN so we can see what Zaprite actually sends and add the
+        // correct field name here.
+        let event_type = ["event", "eventType", "type", "name"]
+            .iter()
+            .find_map(|field| {
+                v.get(*field)
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
+        if event_type.is_empty() {
+            // Truncated to 2KB to bound log volume on weird payloads.
+            let raw_preview = String::from_utf8_lossy(body);
+            let truncated = if raw_preview.len() > 2048 {
+                format!(
+                    "{}…[truncated {} bytes]",
+                    &raw_preview[..2048],
+                    raw_preview.len() - 2048
+                )
+            } else {
+                raw_preview.to_string()
+            };
+            tracing::warn!(
+                payload = %truncated,
+                "Zaprite webhook: no event/eventType/type/name field found at top \
+                 level — webhook will be treated as non-actionable. Inspect the \
+                 payload above to find the actual event-name field and add it to \
+                 the probe list in validate_webhook."
+            );
+        }
         let provider_invoice_id = v
             .pointer("/data/id")
+            .or_else(|| v.pointer("/data/object/id"))
             .or_else(|| v.get("orderId"))
             .or_else(|| v.get("id"))
             .and_then(|s| s.as_str())
@@ -217,6 +305,55 @@ impl PaymentProvider for ZapriteProvider {
                 provider_invoice_id: id,
                 refunded_amount: None, // amount field shape TBD when we see a real refund event
             },
+            // Zaprite's primary delivery shape (sandbox-confirmed :50):
+            // a generic `order.change` event that just says "something
+            // about this order changed" — the receiver has to look at
+            // `/data/status` to figure out what actually changed. They
+            // do NOT (empirically) send the convention-suggested
+            // `order.paid` / `order.complete` events — every state
+            // transition comes through as `order.change` and the
+            // payload's status field tells the story. Branch on
+            // status here so we dispatch the right action.
+            //
+            // Status values from Zaprite's get_invoice_status mapping:
+            //   PAID | COMPLETE | OVERPAID  → settled
+            //   EXPIRED                     → expired
+            //   INVALID | CANCELLED         → invalid
+            //   PENDING | PROCESSING |
+            //   UNDERPAID                   → in-flight; no action yet
+            //   <anything else>             → Other (logged + ignored)
+            "order.change" => {
+                let status = v
+                    .pointer("/data/status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                match status {
+                    "PAID" | "COMPLETE" | "OVERPAID" => {
+                        ProviderWebhookEvent::InvoiceSettled {
+                            provider_invoice_id: id,
+                        }
+                    }
+                    "EXPIRED" => ProviderWebhookEvent::InvoiceExpired {
+                        provider_invoice_id: id,
+                    },
+                    "INVALID" | "CANCELLED" => {
+                        ProviderWebhookEvent::InvoiceInvalid {
+                            provider_invoice_id: id,
+                        }
+                    }
+                    // In-flight transitions (PENDING/PROCESSING/UNDERPAID)
+                    // and anything unfamiliar fall through to Other — the
+                    // handler logs them as non-actionable, which is right:
+                    // we don't want to fire the settle hook every time
+                    // Zaprite transitions an order from PENDING to
+                    // PROCESSING on the way to PAID. The terminal-state
+                    // delivery is what actually drives our state machine.
+                    _ => ProviderWebhookEvent::Other {
+                        kind: format!("order.change[status={status}]"),
+                        provider_invoice_id: provider_invoice_id,
+                    },
+                }
+            }
             other => ProviderWebhookEvent::Other {
                 kind: other.to_string(),
                 provider_invoice_id: provider_invoice_id,

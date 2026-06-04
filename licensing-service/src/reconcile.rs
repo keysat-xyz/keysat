@@ -137,10 +137,46 @@ async fn ensure_license(
         .map_err(|e| anyhow::anyhow!("{e:?}"))?
         .is_some()
     {
+        // Even if the license already exists, the reconciler may be
+        // running because the webhook never delivered. In that case
+        // `on_invoice_settled` (which runs the Zaprite-saved-profile
+        // capture for recurring first-cycle subs) never fired either.
+        // Try the post-settle hook now — it's idempotent (early-returns
+        // if the sub already has a captured profile, or if the active
+        // provider isn't Zaprite, or if no matching profile exists on
+        // the contact). Without this, a subscription created via the
+        // reconciler path never gets its `zaprite_payment_profile_id`
+        // populated, and renewals fall back to manual-pay forever
+        // even though the saved profile is sitting on Zaprite's side.
+        if let Err(e) =
+            crate::subscriptions::on_invoice_settled(state, invoice).await
+        {
+            tracing::warn!(
+                error = %e,
+                invoice_id = %invoice.id,
+                "reconciler post-settle hook failed (non-fatal — license already exists)"
+            );
+        }
         return Ok(());
     }
     crate::api::webhook::issue_license_for_invoice(state, invoice)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // Same rationale as the early-return branch above — if the
+    // reconciler is running, the webhook may have missed; run the
+    // post-settle hook so a brand-new recurring sub also captures its
+    // Zaprite saved profile. issue_license_for_invoice already created
+    // the subscription row by this point, so on_invoice_settled can
+    // find it.
+    if let Err(e) =
+        crate::subscriptions::on_invoice_settled(state, invoice).await
+    {
+        tracing::warn!(
+            error = %e,
+            invoice_id = %invoice.id,
+            "reconciler post-settle hook failed (non-fatal — license issued ok)"
+        );
+    }
     Ok(())
 }

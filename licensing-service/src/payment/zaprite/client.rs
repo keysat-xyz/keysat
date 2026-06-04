@@ -51,6 +51,15 @@ pub struct CreateOrderBody<'a> {
     /// recurring charges. Set when the policy is recurring.
     #[serde(rename = "allowSavePaymentProfile", skip_serializing_if = "Option::is_none")]
     pub allow_save_payment_profile: Option<bool>,
+    /// Zaprite contact id to attach this order to. REQUIRED by
+    /// Zaprite when `allow_save_payment_profile` is true — without
+    /// it the create-order call returns
+    /// `400 contactId is required when allowSavePaymentProfile is true`.
+    /// Optional otherwise; passing it for one-shot purchases just
+    /// associates the order with a known contact in the operator's
+    /// Zaprite dashboard.
+    #[serde(rename = "contactId", skip_serializing_if = "Option::is_none")]
+    pub contact_id: Option<String>,
 }
 
 impl ZapriteClient {
@@ -155,6 +164,56 @@ impl ZapriteClient {
             ));
         }
         serde_json::from_str(&raw).context("parse charge response")
+    }
+
+    /// `POST /v1/contacts` — create a Zaprite contact. Required
+    /// upstream step before creating an order with
+    /// `allowSavePaymentProfile: true` (Zaprite needs to know which
+    /// contact the saved profile attaches to). Returns the full
+    /// contact JSON; the caller extracts `id` to pass as
+    /// `contactId` on the subsequent order create.
+    ///
+    /// `legal_name` is required by Zaprite's schema; we fall back to
+    /// the email itself when the buyer didn't supply a name. The
+    /// operator can rename the contact in the Zaprite dashboard if
+    /// they care about display polish.
+    ///
+    /// NOTE on duplicates: Zaprite's duplicate-email behavior on
+    /// `POST /v1/contacts` is undocumented (their llms.txt explicitly
+    /// says "Not documented"). Empirically we accept whatever Zaprite
+    /// does — if they create a duplicate, the operator's Zaprite
+    /// contact list gets a row per recurring purchase from the same
+    /// buyer. The multi-provider work (planned `:47+`) will introduce
+    /// a Keysat-side `zaprite_contacts` cache keyed on (email,
+    /// provider_id) to dedup upfront. For sandbox testing + early
+    /// production this is acceptable noise.
+    pub async fn create_contact(
+        &self,
+        email: &str,
+        name: Option<&str>,
+    ) -> Result<Value> {
+        let legal_name = name.unwrap_or(email);
+        let url = format!("{}/v1/contacts", self.base_url);
+        let body = serde_json::json!({
+            "email": email,
+            "legalName": legal_name,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.auth_headers()?)
+            .json(&body)
+            .send()
+            .await
+            .context("Zaprite create_contact request")?;
+        let status = resp.status();
+        let raw = resp.text().await.context("read create_contact body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Zaprite create_contact returned HTTP {status}: {raw}"
+            ));
+        }
+        serde_json::from_str(&raw).context("parse create_contact response")
     }
 
     /// `GET /v1/contacts/{id}` — fetch a Zaprite contact, which

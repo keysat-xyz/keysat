@@ -1082,6 +1082,13 @@ pub async fn capture_zaprite_payment_profile(
 ) -> Result<()> {
     use crate::payment::ProviderKind;
 
+    tracing::info!(
+        sub_id = %sub_id,
+        invoice_id = %invoice.id,
+        provider_invoice_id = %invoice.btcpay_invoice_id,
+        "capture_zaprite_payment_profile: starting"
+    );
+
     // Idempotency: already captured?
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT zaprite_payment_profile_id FROM subscriptions WHERE id = ?",
@@ -1092,6 +1099,7 @@ pub async fn capture_zaprite_payment_profile(
     .context("read existing zaprite_payment_profile_id")?
     .flatten();
     if existing.is_some() {
+        tracing::info!(sub_id = %sub_id, "capture: already captured, skipping");
         return Ok(());
     }
 
@@ -1099,9 +1107,19 @@ pub async fn capture_zaprite_payment_profile(
     // meaningful — `as_any` downcast keeps the trait clean.
     let provider = match state.payment_provider().await {
         Ok(p) => p,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                sub_id = %sub_id, error = %e,
+                "capture: no active payment provider — skipping"
+            );
+            return Ok(());
+        }
     };
     if provider.kind() != ProviderKind::Zaprite {
+        tracing::info!(
+            sub_id = %sub_id, kind = ?provider.kind(),
+            "capture: active provider is not Zaprite — skipping"
+        );
         return Ok(());
     }
     let zaprite = match provider
@@ -1109,7 +1127,13 @@ pub async fn capture_zaprite_payment_profile(
         .downcast_ref::<crate::payment::zaprite::ZapriteProvider>()
     {
         Some(z) => z,
-        None => return Ok(()),
+        None => {
+            tracing::warn!(
+                sub_id = %sub_id,
+                "capture: provider kind is Zaprite but downcast failed — skipping"
+            );
+            return Ok(());
+        }
     };
     let client = zaprite.client();
 
@@ -1129,9 +1153,22 @@ pub async fn capture_zaprite_payment_profile(
             // Order has no contact — buyer paid without an email /
             // Zaprite didn't materialize a contact. No profile to
             // capture; renewals fall back to manual pay.
+            tracing::warn!(
+                sub_id = %sub_id,
+                order_status = order.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                order_has_contact = order.get("contact").is_some(),
+                order_has_contactId = order.get("contactId").is_some(),
+                "capture: order has no contact.id / contactId — cannot capture profile. \
+                 Check that buyer_email was present at purchase + that :47+ contact \
+                 creation ran."
+            );
             return Ok(());
         }
     };
+    tracing::info!(
+        sub_id = %sub_id, contact_id = %contact_id,
+        "capture: resolved contact_id from order"
+    );
 
     // 2. Fetch the contact and enumerate its payment profiles.
     let contact = client
@@ -1140,8 +1177,21 @@ pub async fn capture_zaprite_payment_profile(
         .context("fetch Zaprite contact for profile capture")?;
     let profiles = match contact.get("paymentProfiles").and_then(|v| v.as_array()) {
         Some(arr) => arr,
-        None => return Ok(()), // no profiles array — nothing to capture
+        None => {
+            tracing::warn!(
+                sub_id = %sub_id, contact_id = %contact_id,
+                "capture: contact has no paymentProfiles array — likely the buyer \
+                 didn't check 'save card' at Zaprite checkout, OR profile creation \
+                 is async on Zaprite's side and not yet visible at webhook time"
+            );
+            return Ok(());
+        }
     };
+    tracing::info!(
+        sub_id = %sub_id, contact_id = %contact_id,
+        profile_count = profiles.len(),
+        "capture: enumerated contact's payment profiles"
+    );
 
     // 3. Find the profile whose sourceOrder.externalUniqId is
     //    THIS invoice. Zaprite scopes saved profiles to a contact,
@@ -1162,13 +1212,41 @@ pub async fn capture_zaprite_payment_profile(
             // (no autopay-supporting rail) OR declined the save-
             // payment-profile prompt on the card form. Both are
             // legitimate; renewals fall back to manual pay.
+            //
+            // Also possible: race condition — Zaprite's profile-save
+            // step hasn't finished by the time the order.paid webhook
+            // fires. If you see this with profile_count > 0 but no
+            // match for invoice.id, that's the race.
+            let sample = profiles.iter().take(3).map(|p| {
+                p.pointer("/sourceOrder/externalUniqId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>")
+                    .to_string()
+            }).collect::<Vec<_>>();
+            tracing::warn!(
+                sub_id = %sub_id,
+                contact_id = %contact_id,
+                invoice_id = %invoice.id,
+                profile_count = profiles.len(),
+                sample_source_external_uniq_ids = ?sample,
+                "capture: no profile matches sourceOrder.externalUniqId == invoice.id — \
+                 either the buyer declined the save-card prompt, paid via a non-saving \
+                 rail (BTC/Lightning), OR Zaprite's profile-attach is racing the \
+                 webhook delivery"
+            );
             return Ok(());
         }
     };
 
     let profile_id = match profile.get("id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return Ok(()),
+        None => {
+            tracing::warn!(
+                sub_id = %sub_id, contact_id = %contact_id,
+                "capture: matched profile has no 'id' field — skipping"
+            );
+            return Ok(());
+        }
     };
     let method = profile.get("method").and_then(|v| v.as_str()).map(|s| s.to_string());
     let expires_at = profile

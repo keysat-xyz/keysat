@@ -484,8 +484,27 @@ pub async fn start(
             if let Some(code) = &reservation {
                 let _ = repo::release_code_slot(&state.db, &code.id).await;
             }
+            // `{e:#}` (alternate format) walks the anyhow error chain so
+            // the buy page surfaces the underlying provider error directly
+            // — e.g. "Zaprite create_order returned HTTP 400: {...}" —
+            // instead of just the outermost `context()` wrapper. Without
+            // this, a failed create-invoice shows only
+            // "ZapriteProvider.create_invoice" to the operator, and the
+            // real cause (currency mismatch / missing payment rail / API-
+            // key scope / Zaprite-side validation error) is hidden. We
+            // ALSO emit an explicit tracing::error! before returning so
+            // the same chain shows up in the daemon logs — without this
+            // line, the provider's underlying error string is never
+            // logged anywhere (the trait method just RETURNS the
+            // anyhow error; only the tower trace layer fires, and it
+            // only sees the HTTP status code, not the body).
+            tracing::error!(
+                product_id = %product.id,
+                error = format!("{e:#}"),
+                "payment provider create_invoice failed"
+            );
             return Err(AppError::Upstream(format!(
-                "payment provider create-invoice failed: {e}"
+                "payment provider create-invoice failed: {e:#}"
             )));
         }
     };
