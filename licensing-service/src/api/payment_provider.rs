@@ -1,140 +1,64 @@
-//! Active-provider swap endpoint.
+//! Payment-provider status endpoint (multi-merchant-profile model).
 //!
-//! When an operator has both BTCPay AND Zaprite configured (i.e.,
-//! they ran Connect on both at some point), this lets them flip
-//! the active one without re-authorizing. The Connect flows are
-//! still where credentials live; this endpoint only changes which
-//! credentials the daemon currently routes through.
+//! Pre-:52 this module held two endpoints:
+//!   - `GET /v1/admin/payment-provider/status` — which provider was
+//!     active, plus configured flags for BTCPay + Zaprite.
+//!   - `POST /v1/admin/payment-provider/activate` — flip the singleton
+//!     active-provider preference between two configured ones.
+//!
+//! Both became meaningless in the merchant-profile model — providers
+//! aren't "active," they attach to profiles, and products pick a profile
+//! at the resolution layer. The activate endpoint is removed. The status
+//! endpoint stays as a back-compat shim so the existing admin UI's
+//! payment-providers card keeps rendering until the new Merchant
+//! Profiles UI replaces it: it now reports against the DEFAULT profile
+//! (single-profile operators see no change). Multi-profile operators
+//! should use the new `/v1/admin/merchant-profiles` endpoints to see
+//! all providers across all profiles.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::require_admin;
 use crate::api::AppState;
-use crate::error::{AppError, AppResult};
-use crate::payment::{
-    self, btcpay::BtcpayProvider, zaprite::ZapriteProvider, ProviderKind,
-};
+use crate::error::AppResult;
 use axum::{extract::State, http::HeaderMap, Json};
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
-pub struct ActivateReq {
-    /// `'btcpay'` or `'zaprite'`. Other values → 400.
-    pub provider: String,
-}
-
-/// `GET /v1/admin/payment-provider/status` — both providers'
-/// configuration state at a glance, plus the active preference.
-/// Lets the SPA render a "BTCPay [active] / Zaprite [configured,
-/// not active]" header without two separate fetches.
+/// `GET /v1/admin/payment-provider/status` — back-compat snapshot of
+/// providers attached to the default merchant profile. Returns the same
+/// shape as pre-:52 with `btcpay_configured` / `zaprite_configured` /
+/// `active` for compatibility with the existing admin UI; new code
+/// should use `/v1/admin/merchant-profiles/{id}` instead.
 pub async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let btcpay_configured = crate::btcpay::config::load(&state.db)
-        .await
-        .map(|o| o.is_some())
-        .unwrap_or(false);
-    let zaprite_configured = payment::zaprite::config::load(&state.db)
-        .await
-        .map(|o| o.is_some())
-        .unwrap_or(false);
-    let preference = payment::read_active_provider_preference(&state.db).await;
-    let active_runtime = match state.payment.read().await.as_ref() {
-        Some(p) => Some(p.kind().as_str().to_string()),
-        None => None,
+    let default = crate::merchant_profiles::get_default(&state.db).await?;
+    let providers = match &default {
+        Some(p) => crate::db::repo::list_payment_providers_for_profile(&state.db, &p.id).await?,
+        None => Vec::new(),
     };
+    let btcpay_row = providers.iter().find(|p| p.kind == "btcpay").cloned();
+    let zaprite_row = providers.iter().find(|p| p.kind == "zaprite").cloned();
+    // "active" used to mean "the singleton active-provider preference."
+    // In the new model there isn't one. For back-compat we report the
+    // FIRST provider on the default profile (which is what the legacy
+    // boot-loader semantics would have picked) so the existing admin UI
+    // shows a sensible active badge. Multi-rail operators get the full
+    // picture from the new merchant-profile endpoints.
+    let active_runtime = providers.first().map(|p| p.kind.clone());
     Ok(Json(json!({
-        "btcpay_configured": btcpay_configured,
-        "zaprite_configured": zaprite_configured,
-        "preferred": preference.map(|k| k.as_str().to_string()),
+        "btcpay_configured": btcpay_row.is_some(),
+        "zaprite_configured": zaprite_row.is_some(),
+        "preferred": active_runtime.clone(),
         "active": active_runtime,
-    })))
-}
-
-/// `POST /v1/admin/payment-provider/activate` — swap the active
-/// provider to whichever already-configured one the operator
-/// names. 400 if the named provider isn't configured (run Connect
-/// first).
-pub async fn activate(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<ActivateReq>,
-) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
-    let (ip, ua) = request_context(&headers);
-
-    let kind = match req.provider.to_lowercase().as_str() {
-        "btcpay" => ProviderKind::Btcpay,
-        "zaprite" => ProviderKind::Zaprite,
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown provider '{other}'; accepted: btcpay, zaprite"
-            )))
-        }
-    };
-
-    // Build the provider from its persisted config. Refuse if the
-    // config row isn't there — operator has to run Connect first.
-    match kind {
-        ProviderKind::Btcpay => {
-            let cfg = crate::btcpay::config::load(&state.db)
-                .await
-                .map_err(AppError::Internal)?
-                .ok_or_else(|| {
-                    AppError::BadRequest(
-                        "BTCPay not configured. Run Connect BTCPay first.".into(),
-                    )
-                })?;
-            let client = crate::btcpay::client::BtcpayClient::new(
-                &cfg.base_url,
-                &cfg.api_key,
-                &cfg.store_id,
-            );
-            let provider = Arc::new(
-                BtcpayProvider::new(client, cfg.webhook_secret)
-                    .with_public_base(state.config.btcpay_public_url.clone()),
-            );
-            state.set_payment_provider(provider).await;
-        }
-        ProviderKind::Zaprite => {
-            crate::api::tier::enforce_zaprite_feature(&state).await?;
-            let cfg = payment::zaprite::config::load(&state.db)
-                .await
-                .map_err(|e| AppError::Internal(anyhow::anyhow!("{e:#}")))?
-                .ok_or_else(|| {
-                    AppError::BadRequest(
-                        "Zaprite not configured. Run Connect Zaprite first.".into(),
-                    )
-                })?;
-            let client = payment::zaprite::ZapriteClient::new(&cfg.base_url, &cfg.api_key);
-            let provider = Arc::new(ZapriteProvider::new(client));
-            state.set_payment_provider(provider).await;
-        }
-    }
-
-    // Persist the preference so the boot-time loader picks the
-    // same one on next restart.
-    payment::write_active_provider_preference(&state.db, kind)
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("write preference: {e:#}")))?;
-
-    let _ = crate::db::repo::insert_audit(
-        &state.db,
-        "admin_api_key",
-        Some(&actor_hash),
-        "payment_provider.activate",
-        Some("payment_provider"),
-        Some(kind.as_str()),
-        ip.as_deref(),
-        ua.as_deref(),
-        &json!({ "provider": kind.as_str() }),
-    )
-    .await;
-
-    Ok(Json(json!({
-        "ok": true,
-        "active": kind.as_str(),
+        "merchant_profile_id": default.as_ref().map(|p| p.id.clone()),
+        "merchant_profile_name": default.as_ref().map(|p| p.name.clone()),
+        "providers": providers.iter().map(|p| json!({
+            "id": p.id,
+            "kind": p.kind,
+            "label": p.label,
+            "base_url": p.base_url,
+            "store_id": p.store_id,
+        })).collect::<Vec<_>>(),
     })))
 }

@@ -23,20 +23,51 @@ use crate::error::{AppError, AppResult};
 use crate::payment::ProviderWebhookEvent;
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
 
+/// Multi-provider webhook landing: `/v1/{kind}/webhook/:provider_id`.
+/// The provider id picks WHICH provider's secret validates this delivery.
+/// Without that, an operator with two BTCPay providers across two merchant
+/// profiles would have indistinguishable webhook URLs and BTCPay payloads
+/// would round-robin to whoever happened to be "the active provider" at
+/// request time. The path-param resolution ensures every delivery is
+/// validated against the secret it was created with.
+pub async fn handle_for_provider(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<StatusCode> {
+    let provider = state.payment_provider_by_id(&provider_id).await?;
+    handle_inner(state, provider, headers, body).await
+}
+
+/// Back-compat landing for the pre-:52 URL shape. Routes to whichever
+/// provider is on the default merchant profile. New webhooks registered
+/// against `:52`+ use the path-keyed shape above; this exists so any
+/// in-flight pre-:52 delivery (or operator misconfiguration) doesn't
+/// silently drop on the floor.
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<StatusCode> {
-    // Active provider validates its own webhooks (each provider has a
-    // different signature scheme — BTCPay's HMAC-SHA256 in BTCPay-Sig,
-    // Zaprite's TBD). On any verification failure we 401.
     let provider = state.payment_provider().await?;
+    handle_inner(state, provider, headers, body).await
+}
+
+async fn handle_inner(
+    state: AppState,
+    provider: std::sync::Arc<dyn crate::payment::PaymentProvider>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<StatusCode> {
+    // The resolved provider validates its own webhooks (each provider has
+    // a different signature scheme — BTCPay's HMAC-SHA256 in BTCPay-Sig,
+    // Zaprite's externalUniqId round-trip). On verification failure: 401.
     let event = provider
         .validate_webhook(&headers, &body)
         .map_err(|e| AppError::Unauthorized.tap_log(format!("webhook validation: {e:#}")))?;

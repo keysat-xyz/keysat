@@ -79,14 +79,22 @@ pub async fn save(pool: &SqlitePool, cfg: &BtcpayConfig) -> Result<()> {
     Ok(())
 }
 
-/// Record a new in-flight authorize state token. The caller has already
-/// generated a cryptographically-random token.
-pub async fn record_authorize_state(pool: &SqlitePool, token: &str) -> Result<()> {
+/// Record a new in-flight authorize state token. `merchant_profile_id`
+/// (multi-provider model, migration 0022) names which merchant profile
+/// the resulting provider row should attach to when the callback fires
+/// — None falls back to "the default profile" at consume-time.
+pub async fn record_authorize_state(
+    pool: &SqlitePool,
+    token: &str,
+    merchant_profile_id: Option<&str>,
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO btcpay_authorize_state (state_token, created_at) VALUES (?, ?)",
+        "INSERT INTO btcpay_authorize_state (state_token, merchant_profile_id, created_at) \
+         VALUES (?, ?, ?)",
     )
     .bind(token)
+    .bind(merchant_profile_id)
     .bind(&now)
     .execute(pool)
     .await
@@ -101,11 +109,17 @@ pub async fn record_authorize_state(pool: &SqlitePool, token: &str) -> Result<()
 }
 
 /// Validate that `token` was issued recently and has not been consumed.
-/// Consumes (deletes) the token on success so a replay fails.
-pub async fn consume_authorize_state(pool: &SqlitePool, token: &str) -> Result<()> {
+/// Consumes (deletes) the token on success so a replay fails, and
+/// returns the `merchant_profile_id` recorded at start-connect time so
+/// the callback knows which profile to attach the new provider to.
+pub async fn consume_authorize_state(
+    pool: &SqlitePool,
+    token: &str,
+) -> Result<Option<String>> {
+    use sqlx::Row;
     let cutoff = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
     let row = sqlx::query(
-        "SELECT state_token FROM btcpay_authorize_state \
+        "SELECT state_token, merchant_profile_id FROM btcpay_authorize_state \
          WHERE state_token = ? AND created_at >= ?",
     )
     .bind(token)
@@ -113,13 +127,14 @@ pub async fn consume_authorize_state(pool: &SqlitePool, token: &str) -> Result<(
     .fetch_optional(pool)
     .await?;
 
-    if row.is_none() {
+    let Some(row) = row else {
         return Err(anyhow!("unknown or expired authorize state token"));
-    }
+    };
+    let merchant_profile_id: Option<String> = row.try_get("merchant_profile_id").ok().flatten();
 
     sqlx::query("DELETE FROM btcpay_authorize_state WHERE state_token = ?")
         .bind(token)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(merchant_profile_id)
 }

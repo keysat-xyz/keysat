@@ -56,25 +56,57 @@ pub struct ConnectResp {
     pub authorize_url: String,
     /// CSRF state token tied to this round trip.
     pub state: String,
+    /// Merchant profile the resulting provider row will attach to.
+    pub merchant_profile_id: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StartConnectReq {
+    /// Which merchant profile to attach the BTCPay provider to. NULL =
+    /// the default profile (single-profile operators never see this).
+    #[serde(default)]
+    pub merchant_profile_id: Option<String>,
+    /// Operator-set label for the resulting payment_providers row. NULL =
+    /// auto-generated from the profile name.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// Admin endpoint: starts a connect round trip. Returns the BTCPay authorize
 /// URL for the StartOS wrapper action to open in the operator's browser.
+///
+/// Accepts an optional `merchant_profile_id` so Pro/Patron operators can
+/// connect multiple BTCPay stores onto different profiles side-by-side.
+/// Single-profile operators (Creator tier, or anyone without an explicit
+/// pick) get the default profile.
 pub async fn start_connect(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<StartConnectReq>>,
 ) -> AppResult<Json<ConnectResp>> {
     require_admin(&state, &headers)?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Idempotency: if BTCPay is already connected, refuse to issue a new
-    // authorize URL. Re-clicking Connect today produces a duplicate
-    // webhook subscription on BTCPay, which results in every payment
-    // event being delivered to Keysat twice. Make the operator go
-    // through Disconnect first if they really want to re-authorize.
-    if let Ok(Some(existing)) = btcpay_cfg::load(&state.db).await {
+    // Resolve the target merchant profile (defaulting to the default).
+    let profile = match req.merchant_profile_id.as_deref() {
+        Some(id) => crate::merchant_profiles::get(&state.db, id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest(format!("merchant profile {id} not found")))?,
+        None => crate::merchant_profiles::require_default(&state.db).await?,
+    };
+
+    // Idempotency: refuse to issue a new authorize URL if the same
+    // profile already has a BTCPay provider attached. Re-clicking
+    // Connect would otherwise INSERT-conflict at callback time (unique
+    // index on (merchant_profile_id, kind)) AND register a duplicate
+    // BTCPay webhook, producing duplicate-deliveries on every settle.
+    let existing = crate::db::repo::list_payment_providers_for_profile(&state.db, &profile.id)
+        .await?;
+    if existing.iter().any(|p| p.kind == "btcpay") {
         return Err(AppError::Conflict(format!(
-            "BTCPay is already connected (store {}). Run 'Disconnect BTCPay' first if you need to re-authorize.",
-            existing.store_id,
+            "merchant profile '{}' already has a BTCPay provider attached. \
+             Disconnect it first if you want to re-authorize, or pick a different profile.",
+            profile.name
         )));
     }
 
@@ -83,7 +115,7 @@ pub async fn start_connect(
     rand::thread_rng().fill_bytes(&mut raw);
     let state_token = BASE32_NOPAD.encode(&raw);
 
-    btcpay_cfg::record_authorize_state(&state.db, &state_token)
+    btcpay_cfg::record_authorize_state(&state.db, &state_token, Some(&profile.id))
         .await
         .map_err(AppError::Internal)?;
 
@@ -124,9 +156,11 @@ pub async fn start_connect(
         urlencoding::encode(&redirect),
     );
 
+    let _ = req.label; // captured but not yet used — see finish_connect TODO for the future round-trip
     Ok(Json(ConnectResp {
         authorize_url,
         state: state_token,
+        merchant_profile_id: profile.id,
     }))
 }
 
@@ -201,47 +235,63 @@ pub async fn callback_get(
 }
 
 /// Admin endpoint: list payment methods configured on the connected
-/// BTCPay store. Proxies to BTCPay's `/api/v1/stores/{id}/payment-methods`.
-/// Used by the wrapper / future web UI to surface a "no wallet
-/// configured" state.
+/// BTCPay store. Defaults to the default-profile's BTCPay provider for
+/// back-compat with the existing admin UI; the new merchant-profile
+/// admin endpoint passes an explicit `provider_id` query param when
+/// multiple BTCPay providers exist.
 pub async fn payment_methods(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_admin(&state, &headers)?;
-    let cfg = btcpay_cfg::load(&state.db)
-        .await
-        .map_err(AppError::Internal)?
+    let default = crate::merchant_profiles::require_default(&state.db).await?;
+    let rows = crate::db::repo::list_payment_providers_for_profile(&state.db, &default.id)
+        .await?;
+    let row = rows
+        .into_iter()
+        .find(|p| p.kind == "btcpay")
         .ok_or(AppError::BtcpayNotConfigured)?;
-    let methods = btcpay_client::list_payment_methods(&cfg.base_url, &cfg.api_key, &cfg.store_id)
+    let store_id = row.store_id.as_deref().unwrap_or("");
+    let methods = btcpay_client::list_payment_methods(&row.base_url, &row.api_key, store_id)
         .await
-        .map_err(|e| AppError::Upstream(format!("BTCPay list-payment-methods: {e}")))?;
-
-    // Return both the raw array for callers that want detail, and a
-    // boolean summary for the common "is anything configured?" check.
+        .map_err(|e| AppError::Upstream(format!("BTCPay list-payment-methods: {e:#}")))?;
     let count = methods.len();
     Ok(Json(json!({
-        "store_id": cfg.store_id,
+        "store_id": store_id,
         "count": count,
         "methods": methods,
     })))
 }
 
-/// Admin endpoint: report current BTCPay connection status.
+/// Admin endpoint: report BTCPay connection status for the default
+/// profile (back-compat with the existing admin UI's payment-providers
+/// card). Multi-profile operators use `/v1/admin/merchant-profiles` to
+/// see all attached providers.
 pub async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_admin(&state, &headers)?;
-
-    let cfg = btcpay_cfg::load(&state.db).await.map_err(AppError::Internal)?;
-    Ok(Json(match cfg {
+    let default = crate::merchant_profiles::get_default(&state.db).await?;
+    let row = match &default {
+        Some(profile) => {
+            let rows = crate::db::repo::list_payment_providers_for_profile(&state.db, &profile.id)
+                .await?;
+            rows.into_iter().find(|p| p.kind == "btcpay")
+        }
+        None => None,
+    };
+    Ok(Json(match row {
         None => json!({ "connected": false }),
-        Some(c) => json!({
+        Some(p) => json!({
             "connected": true,
-            "store_id": c.store_id,
-            "webhook_id": c.webhook_id,
-            "base_url": c.base_url,
+            "provider_id": p.id,
+            "store_id": p.store_id,
+            "webhook_id": p.webhook_id,
+            "base_url": p.base_url,
+            "label": p.label,
+            "merchant_profile_id": default.as_ref().map(|d| d.id.clone()),
+            "merchant_profile_name": default.as_ref().map(|d| d.name.clone()),
         }),
     }))
 }
@@ -249,9 +299,22 @@ pub async fn status(
 // --- internals ---
 
 async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> AppResult<()> {
-    btcpay_cfg::consume_authorize_state(&state.db, state_token)
+    // Recovers the `merchant_profile_id` recorded when the operator
+    // kicked off the connect flow. NULL falls back to the default
+    // profile (back-compat for state tokens from pre-0022 runs).
+    let recorded_profile_id = btcpay_cfg::consume_authorize_state(&state.db, state_token)
         .await
         .map_err(|_| AppError::Unauthorized)?;
+    let profile = match recorded_profile_id.as_deref() {
+        Some(id) => crate::merchant_profiles::get(&state.db, id)
+            .await?
+            .ok_or_else(|| AppError::BadRequest(format!(
+                "merchant profile {id} no longer exists — the operator may have \
+                 deleted it during the authorize round-trip. Reconnect from a \
+                 valid profile."
+            )))?,
+        None => crate::merchant_profiles::require_default(&state.db).await?,
+    };
 
     let base_url = &state.config.btcpay_url;
 
@@ -260,7 +323,7 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
     // first one that the key can see.
     let stores = btcpay_client::list_stores(base_url, api_key)
         .await
-        .map_err(|e| AppError::Upstream(format!("BTCPay list-stores: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("BTCPay list-stores: {e:#}")))?;
     let store = stores
         .into_iter()
         .next()
@@ -273,7 +336,14 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
     rand::thread_rng().fill_bytes(&mut raw_secret);
     let webhook_secret = BASE32_NOPAD.encode(&raw_secret);
 
-    let callback_url = format!("{}/v1/btcpay/webhook", state.config.public_base_url);
+    // Pre-generate the provider id so we can bake it into the webhook
+    // URL we register with BTCPay. The webhook router routes by this
+    // path-param id, isolating deliveries per-provider per-profile.
+    let provider_id = uuid::Uuid::new_v4().to_string();
+    let callback_url = format!(
+        "{}/v1/btcpay/webhook/{}",
+        state.config.public_base_url, provider_id
+    );
 
     let created_webhook = btcpay_client::create_webhook(
         base_url,
@@ -283,46 +353,43 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
         &webhook_secret,
     )
     .await
-    .map_err(|e| AppError::Upstream(format!("BTCPay create-webhook: {e}")))?;
+    .map_err(|e| AppError::Upstream(format!("BTCPay create-webhook: {e:#}")))?;
 
-    // Persist.
-    let cfg = btcpay_cfg::BtcpayConfig {
-        base_url: base_url.clone(),
-        api_key: api_key.to_string(),
-        store_id: store.id.clone(),
-        webhook_id: Some(created_webhook.id.clone()),
-        webhook_secret: webhook_secret.clone(),
-    };
-    btcpay_cfg::save(&state.db, &cfg)
-        .await
-        .map_err(AppError::Internal)?;
-
-    // Swap runtime — wrap a fresh BtcpayProvider into the
-    // PaymentProvider trait object held by AppState. Pass the
-    // public-facing BTCPay URL too so that checkout URLs returned to
-    // buyers get rewritten from the internal Docker hostname to a
-    // browser-reachable host.
-    let client = BtcpayClient::new(base_url, api_key, &store.id);
-    let provider = Arc::new(
-        BtcpayProvider::new(client, webhook_secret)
-            .with_public_base(state.config.btcpay_public_url.clone()),
-    );
-    state.set_payment_provider(provider).await;
-    // Persist active-provider preference so the boot-time loader
-    // picks BTCPay on next restart even if Zaprite's config row
-    // is also still in the DB. Failure here is non-fatal (BTCPay
-    // is the historical default, so the fallback loader picks it
-    // anyway) but logged.
-    if let Err(e) = crate::payment::write_active_provider_preference(
+    // Persist as a payment_providers row attached to the chosen profile.
+    let label = format!("BTCPay — {}", profile.name);
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::db::repo::create_payment_provider(
         &state.db,
-        crate::payment::ProviderKind::Btcpay,
+        &provider_id,
+        &profile.id,
+        "btcpay",
+        &label,
+        api_key,
+        base_url,
+        Some(&created_webhook.id),
+        Some(&webhook_secret),
+        Some(&store.id),
+        &now,
     )
-    .await
-    {
-        tracing::warn!(error = %e, "failed to record BTCPay as active payment provider");
+    .await?;
+
+    // If this is the first provider on the default profile, also
+    // populate the back-compat singleton so the few remaining
+    // state.payment_provider() callers work without a daemon restart.
+    let existing = crate::db::repo::list_payment_providers_for_profile(&state.db, &profile.id)
+        .await?;
+    if profile.is_default && existing.len() == 1 {
+        let client = BtcpayClient::new(base_url, api_key, &store.id);
+        let provider = Arc::new(
+            BtcpayProvider::new(client, webhook_secret.clone())
+                .with_public_base(state.config.btcpay_public_url.clone()),
+        );
+        state.set_payment_provider(provider).await;
     }
 
     tracing::info!(
+        provider_id = %provider_id,
+        merchant_profile_id = %profile.id,
         store = %store.id,
         store_name = %store.name,
         webhook_id = %created_webhook.id,
@@ -342,31 +409,52 @@ h2{{color:#0a7}}</style></head>
     (StatusCode::OK, Html(body)).into_response()
 }
 
-/// Admin endpoint: disconnect BTCPay. Best-effort revocation of the
-/// webhook + API key on BTCPay's side, then unconditional clear of the
-/// local config row. If BTCPay is unreachable, the local state is still
-/// cleared and the operator gets a warning to clean up BTCPay manually.
+#[derive(Debug, Deserialize, Default)]
+pub struct DisconnectReq {
+    /// Which provider row to disconnect. NULL = the BTCPay provider on
+    /// the default merchant profile (back-compat for the existing admin
+    /// UI's single-button Disconnect).
+    #[serde(default)]
+    pub provider_id: Option<String>,
+}
+
+/// Admin endpoint: disconnect a BTCPay provider. Best-effort revocation
+/// of the webhook + API key on BTCPay's side, then unconditional delete
+/// of the local payment_providers row. If BTCPay is unreachable, the
+/// local state is still cleared and the operator gets a warning to
+/// clean up BTCPay manually.
 pub async fn disconnect(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<DisconnectReq>>,
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_admin(&state, &headers)?;
     let (ip, ua) = crate::api::admin::request_context(&headers);
+    let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    let cfg = btcpay_cfg::load(&state.db)
-        .await
-        .map_err(AppError::Internal)?;
-    let Some(cfg) = cfg else {
+    let provider_row = match req.provider_id.as_deref() {
+        Some(pid) => crate::db::repo::get_payment_provider_by_id(&state.db, pid)
+            .await?
+            .filter(|p| p.kind == "btcpay"),
+        None => {
+            // Default-profile fallback for the existing admin UI.
+            let default = crate::merchant_profiles::require_default(&state.db).await?;
+            let rows = crate::db::repo::list_payment_providers_for_profile(&state.db, &default.id)
+                .await?;
+            rows.into_iter().find(|p| p.kind == "btcpay")
+        }
+    };
+    let Some(provider_row) = provider_row else {
         return Ok(Json(json!({
             "ok": true,
             "noop": true,
-            "message": "BTCPay was not connected; nothing to do.",
+            "message": "no BTCPay provider connected on the named profile",
         })));
     };
 
-    // Capture metadata for the response BEFORE we clear local state.
-    let store_id = cfg.store_id.clone();
-    let webhook_id = cfg.webhook_id.clone();
+    let provider_id = provider_row.id.clone();
+    let store_id = provider_row.store_id.clone().unwrap_or_default();
+    let webhook_id = provider_row.webhook_id.clone();
 
     // Best-effort remote cleanup. We DON'T short-circuit if either of
     // these calls fails — the operator's intent is to disconnect, and
@@ -377,9 +465,9 @@ pub async fn disconnect(
     let mut warnings: Vec<String> = Vec::new();
     if let Some(webhook_id) = webhook_id.as_deref() {
         if let Err(e) = btcpay_client::delete_webhook(
-            &cfg.base_url,
-            &cfg.api_key,
-            &cfg.store_id,
+            &provider_row.base_url,
+            &provider_row.api_key,
+            &store_id,
             webhook_id,
         )
         .await
@@ -390,52 +478,35 @@ pub async fn disconnect(
             ));
         }
     }
-    if let Err(e) = btcpay_client::revoke_api_key(&cfg.base_url, &cfg.api_key).await {
+    if let Err(e) = btcpay_client::revoke_api_key(&provider_row.base_url, &provider_row.api_key).await {
         warnings.push(format!(
             "Could not revoke BTCPay API key: {e}. \
              You may want to manually revoke it in BTCPay's account API-keys page."
         ));
     }
 
-    btcpay_cfg::clear(&state.db)
-        .await
-        .map_err(AppError::Internal)?;
+    crate::db::repo::delete_payment_provider(&state.db, &provider_id).await?;
 
-    // Replace the runtime payment provider so subsequent purchase
-    // attempts return BtcpayNotConfigured cleanly.
+    // Clear the back-compat singleton if it was holding this one.
     state.clear_payment_provider().await;
-
-    // If BTCPay was the recorded active-provider preference, clear
-    // it. Don't blindly clear if it was Zaprite — different operator
-    // intent.
-    if matches!(
-        crate::payment::read_active_provider_preference(&state.db).await,
-        Some(crate::payment::ProviderKind::Btcpay)
-    ) {
-        let _ = crate::db::repo::settings_set(
-            &state.db,
-            crate::payment::SETTING_ACTIVE_PROVIDER,
-            None,
-        )
-        .await;
-    }
 
     let _ = crate::db::repo::insert_audit(
         &state.db,
         "admin_api_key",
         Some(&actor_hash),
-        "btcpay.disconnect",
-        Some("btcpay_config"),
-        None,
+        "payment_provider.disconnect",
+        Some("payment_provider"),
+        Some(&provider_id),
         ip.as_deref(),
         ua.as_deref(),
-        &json!({ "store_id": store_id, "webhook_id": webhook_id }),
+        &json!({ "kind": "btcpay", "store_id": store_id, "webhook_id": webhook_id }),
     )
     .await;
 
     Ok(Json(json!({
         "ok": true,
         "noop": false,
+        "provider_id": provider_id,
         "store_id": store_id,
         "webhook_id": webhook_id,
         "warnings": warnings,

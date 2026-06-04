@@ -352,6 +352,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/machines/heartbeat", post(machines::heartbeat))
         .route("/v1/machines/deactivate", post(machines::deactivate))
         .route("/v1/btcpay/webhook", post(webhook::handle))
+        .route("/v1/btcpay/webhook/:provider_id", post(webhook::handle_for_provider))
         .route(
             "/v1/admin/btcpay/connect",
             post(btcpay_authorize::start_connect),
@@ -389,15 +390,15 @@ pub fn router(state: AppState) -> Router {
             get(zaprite_authorize::status),
         )
         // Provider-agnostic active-payment-provider control.
-        // Operators with both BTCPay and Zaprite configured can flip
-        // the active one without re-running Connect.
+        // Back-compat snapshot of the default profile's providers. The
+        // legacy `activate` endpoint is removed — in the merchant-profile
+        // model providers attach to profiles and products pick a profile
+        // at resolution time; there's no singleton "active" preference to
+        // flip. Multi-profile operators should use the new
+        // /v1/admin/merchant-profiles endpoints instead.
         .route(
             "/v1/admin/payment-provider/status",
             get(payment_provider::status),
-        )
-        .route(
-            "/v1/admin/payment-provider/activate",
-            post(payment_provider::activate),
         )
         // Zaprite webhook landing — operator points Zaprite's
         // webhook setting at this URL. Same handler as
@@ -405,6 +406,7 @@ pub fn router(state: AppState) -> Router {
         // is on the trait surface and the active provider self-
         // identifies its event shape.
         .route("/v1/zaprite/webhook", post(webhook::handle))
+        .route("/v1/zaprite/webhook/:provider_id", post(webhook::handle_for_provider))
         .route("/v1/admin/products", post(admin::create_product))
         .route(
             "/v1/admin/products/:id",
@@ -713,17 +715,51 @@ async fn thank_you(
 
     // Provider-aware confirmation copy. BTCPay is Bitcoin-only (Lightning
     // + on-chain); Zaprite brokers card payments too (Stripe / etc.) plus
-    // Bitcoin. The lede and the polling-status copy should reflect which
-    // payment rails are actually in play so a buyer who paid by card
-    // doesn't see "your Bitcoin payment was received" while their Stripe
-    // transaction shows up in the operator's dashboard.
+    // Bitcoin. The lede and the polling-status copy reflect which payment
+    // rails actually settled THIS invoice, not "the currently active
+    // provider" (which is meaningless in the multi-provider model).
     //
-    // Today this reads `SETTING_ACTIVE_PROVIDER` (the singleton model).
-    // When the multi-provider work lands, swap this for a lookup of the
-    // invoice's own `payment_provider_id` so the copy matches the rail
-    // that actually settled THIS purchase, not whatever's currently
-    // active on the daemon.
-    let provider_kind = crate::payment::read_active_provider_preference(&state.db).await;
+    // Look up the invoice's own `payment_provider_id` (recorded by
+    // migration 0021) → resolve to its kind via payment_providers. Falls
+    // back to whichever provider is attached to the default profile if
+    // the invoice predates 0021, then to BTCPay if even THAT can't be
+    // resolved (operator visited /thank-you with no providers connected
+    // at all — rare).
+    let invoice_provider_kind: Option<crate::payment::ProviderKind> = if !invoice_id.is_empty() {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT i.payment_provider_id FROM invoices i WHERE i.id = ? LIMIT 1",
+        )
+        .bind(&invoice_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        match row.and_then(|(pid,)| pid) {
+            Some(pid) => crate::db::repo::get_payment_provider_by_id(&state.db, &pid)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|p| crate::payment::ProviderKind::parse(&p.kind)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let provider_kind = match invoice_provider_kind {
+        Some(k) => Some(k),
+        None => {
+            // Fall back to the default profile's first provider.
+            let default = crate::merchant_profiles::get_default(&state.db).await.ok().flatten();
+            match default {
+                Some(p) => crate::db::repo::list_payment_providers_for_profile(&state.db, &p.id)
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.into_iter().next())
+                    .and_then(|row| crate::payment::ProviderKind::parse(&row.kind)),
+                None => None,
+            }
+        }
+    };
     let (lede_text, provider_kind_str) = match provider_kind {
         Some(crate::payment::ProviderKind::Zaprite) => (
             "Your payment was received. We\u{2019}re waiting for it to settle and \
