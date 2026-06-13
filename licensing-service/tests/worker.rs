@@ -65,6 +65,7 @@ async fn make_state() -> (AppState, NamedTempFile) {
         db: pool,
         keypair: Arc::new(keypair),
         payment: Arc::new(RwLock::new(None)),
+        provider_override: None,
         config: Arc::new(cfg),
         self_tier: Arc::new(RwLock::new(Tier::Unlicensed {
             reason: "test".into(),

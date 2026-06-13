@@ -108,6 +108,15 @@ pub struct AppState {
     /// `Arc<dyn ...>` so call sites get cheap clones; swapped under a
     /// write lock when the operator runs Connect / Disconnect.
     pub payment: Arc<RwLock<Option<Arc<dyn crate::payment::PaymentProvider>>>>,
+    /// Test-only injection seam. When `Some`, the merchant-profile
+    /// resolver (`resolve_provider_for_profile_rail`, `payment_provider_by_id`)
+    /// returns THIS provider instead of constructing a real BTCPay/Zaprite
+    /// client from the DB row via `payment::build_provider`. The DB still
+    /// drives profile/rail/row resolution, so that logic is exercised for
+    /// real — only the network-talking impl is swapped. Always `None` in
+    /// production (`main.rs`); set by integration tests so they can drive
+    /// the real purchase/settle path with a `MockPaymentProvider`.
+    pub provider_override: Option<Arc<dyn crate::payment::PaymentProvider>>,
     pub config: Arc<Config>,
     /// Keysat-licenses-Keysat tier. Read at boot, swapped when the
     /// operator activates a fresh license via the admin endpoint.
@@ -199,7 +208,20 @@ impl AppState {
             .ok_or_else(|| {
                 AppError::NotFound(format!("payment provider {provider_id}"))
             })?;
-        crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
+        self.provider_from_row(&row)
+    }
+
+    /// Instantiate a `PaymentProvider` from a resolved DB row, honoring the
+    /// test-only `provider_override` seam. In production `provider_override`
+    /// is always `None`, so this just delegates to `payment::build_provider`.
+    fn provider_from_row(
+        &self,
+        row: &crate::db::repo::PaymentProviderRow,
+    ) -> AppResult<Arc<dyn crate::payment::PaymentProvider>> {
+        if let Some(p) = &self.provider_override {
+            return Ok(p.clone());
+        }
+        crate::payment::build_provider(row, self.config.btcpay_public_url.as_deref())
             .map_err(AppError::Internal)
     }
 
@@ -241,9 +263,7 @@ impl AppState {
                         pref.payment_provider_id
                     ))
                 })?;
-            let provider =
-                crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
-                    .map_err(AppError::Internal)?;
+            let provider = self.provider_from_row(&row)?;
             return Ok((row, provider));
         }
 
@@ -271,9 +291,7 @@ impl AppState {
             ))),
             [only] => {
                 let row = (*only).clone();
-                let provider =
-                    crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
-                        .map_err(AppError::Internal)?;
+                let provider = self.provider_from_row(&row)?;
                 Ok((row, provider))
             }
             [first, ..] => {
@@ -287,9 +305,7 @@ impl AppState {
                      this warning."
                 );
                 let row = (*first).clone();
-                let provider =
-                    crate::payment::build_provider(&row, self.config.btcpay_public_url.as_deref())
-                        .map_err(AppError::Internal)?;
+                let provider = self.provider_from_row(&row)?;
                 Ok((row, provider))
             }
         }

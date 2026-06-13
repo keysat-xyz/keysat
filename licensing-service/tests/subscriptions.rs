@@ -85,6 +85,7 @@ async fn make_state() -> (AppState, NamedTempFile, Arc<MockProvider>) {
         payment: Arc::new(RwLock::new(Some(
             mock.clone() as Arc<dyn PaymentProvider>,
         ))),
+        provider_override: None,
         config: Arc::new(cfg),
         self_tier: Arc::new(RwLock::new(Tier::Unlicensed {
             reason: "test".into(),

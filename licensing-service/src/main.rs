@@ -128,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         db: pool,
         keypair: Arc::new(keypair),
         payment: Arc::new(tokio::sync::RwLock::new(provider)),
+        provider_override: None,
         config: Arc::new(cfg.clone()),
         self_tier,
         rates: keysat::rates::RateCache::new(),

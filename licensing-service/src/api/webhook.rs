@@ -117,6 +117,50 @@ async fn handle_inner(
         "webhook event applied"
     );
 
+    // Anti-forgery: never settle on the webhook body's claim alone. Re-fetch
+    // the authoritative status from the provider's own API and require it to
+    // actually be Settled before we mark the invoice paid or take ANY
+    // settle-derived action. This guard runs ahead of every downstream effect
+    // — status persistence, tier-change application, subscription renewal, and
+    // license issuance — so confirming once here gates all of them.
+    // This is load-bearing for providers without webhook signatures: Zaprite
+    // webhooks carry no HMAC, so a forged `order.change`/`status=PAID` POST
+    // with a buyer-visible order id would otherwise mint a free license. The
+    // re-fetch also defeats replay of a stale settled body against an invoice
+    // that has since expired/refunded (the provider reports the current state,
+    // not the replayed one). BTCPay is HMAC-verified upstream and is settled
+    // already, so this is cheap belt-and-suspenders there. On a provider
+    // error we fail closed — the reconcile loop re-confirms on its next tick.
+    if new_status == "settled" {
+        match provider.get_invoice_status(&provider_invoice_id).await {
+            Ok(crate::payment::ProviderInvoiceStatus::Settled) => {}
+            Ok(other) => {
+                tracing::warn!(
+                    provider = provider.kind().as_str(),
+                    provider_invoice_id = %provider_invoice_id,
+                    provider_status = ?other,
+                    "settle webhook NOT confirmed by provider API; refusing to settle/issue"
+                );
+                return Ok(StatusCode::OK);
+            }
+            Err(e) => {
+                // Ack 200 rather than erroring: a non-2xx makes BTCPay/Zaprite
+                // re-deliver aggressively, so a transient provider-API outage
+                // would turn every in-flight webhook into a retry storm. We
+                // simply don't issue now — the reconcile loop re-fetches the
+                // status on its next tick and issues then, so issuance is still
+                // "fail closed" without depending on this delivery.
+                tracing::warn!(
+                    provider = provider.kind().as_str(),
+                    provider_invoice_id = %provider_invoice_id,
+                    error = format!("{e:#}"),
+                    "could not reach provider to confirm settle; not issuing now, deferring to reconciler"
+                );
+                return Ok(StatusCode::OK);
+            }
+        }
+    }
+
     // Persist status.
     repo::update_invoice_status(&state.db, &provider_invoice_id, new_status).await?;
 

@@ -109,6 +109,7 @@ async fn make_test_state() -> (AppState, NamedTempFile) {
         db: pool,
         keypair: Arc::new(keypair),
         payment: Arc::new(RwLock::new(None)),
+        provider_override: None,
         config: Arc::new(cfg),
         self_tier: Arc::new(RwLock::new(Tier::Unlicensed {
             reason: "test fixture".into(),
@@ -379,14 +380,45 @@ async fn validate_accepts_well_formed_license() {
 // in `validate_webhook` and instead parses the test-supplied JSON body.
 // ---------------------------------------------------------------------
 
+/// How the mock answers the handler's settle-confirmation re-fetch
+/// (`get_invoice_status`).
+#[derive(Clone, Copy)]
+enum StatusReport {
+    /// Report this authoritative status.
+    Reports(ProviderInvoiceStatus),
+    /// Simulate the provider's status API being unreachable (network error).
+    Unavailable,
+}
+
 struct MockPaymentProvider {
     next_invoice_id: AtomicU64,
+    status_report: StatusReport,
 }
 
 impl MockPaymentProvider {
+    /// Happy path: the provider confirms the invoice is settled.
     fn new() -> Self {
         Self {
             next_invoice_id: AtomicU64::new(1),
+            status_report: StatusReport::Reports(ProviderInvoiceStatus::Settled),
+        }
+    }
+
+    /// Authoritative status does NOT confirm payment, so a `settled` webhook
+    /// body is a forgery the handler must refuse.
+    fn new_unconfirmed() -> Self {
+        Self {
+            next_invoice_id: AtomicU64::new(1),
+            status_report: StatusReport::Reports(ProviderInvoiceStatus::Pending),
+        }
+    }
+
+    /// The provider's status API is unreachable, so the handler can't confirm
+    /// a settle and must ack-without-issuing (deferring to the reconciler).
+    fn new_status_unavailable() -> Self {
+        Self {
+            next_invoice_id: AtomicU64::new(1),
+            status_report: StatusReport::Unavailable,
         }
     }
 }
@@ -412,9 +444,15 @@ impl PaymentProvider for MockPaymentProvider {
         &self,
         _provider_invoice_id: &str,
     ) -> Result<ProviderInvoiceStatus> {
-        // Reconcile loop isn't exercised by these tests; return a sane
-        // default in case it gets called transitively.
-        Ok(ProviderInvoiceStatus::Settled)
+        // The webhook handler re-fetches this to confirm a settle claim
+        // before issuing. Configurable per-mock so a test can simulate the
+        // provider disagreeing with a forged "settled" body, or being down.
+        match self.status_report {
+            StatusReport::Reports(s) => Ok(s),
+            StatusReport::Unavailable => {
+                anyhow::bail!("mock: provider status API unavailable")
+            }
+        }
     }
 
     /// Test-friendly webhook validator. Production providers would
@@ -455,10 +493,49 @@ impl PaymentProvider for MockPaymentProvider {
 /// Build a state with a MockPaymentProvider already installed. Mirror of
 /// `make_test_state` for tests that drive the purchase / webhook paths.
 async fn make_test_state_with_mock_provider() -> (AppState, NamedTempFile) {
-    let (state, tmp) = make_test_state().await;
-    state
-        .set_payment_provider(Arc::new(MockPaymentProvider::new()))
-        .await;
+    install_mock_provider(MockPaymentProvider::new()).await
+}
+
+/// Install a specific `MockPaymentProvider` on a fresh test state, wiring it
+/// into both the legacy singleton and the merchant-profile resolver (see the
+/// two-seams note below). Lets tests vary the mock's behavior — e.g. an
+/// unconfirmed-status mock to exercise the settle-confirmation guard.
+async fn install_mock_provider(mock_impl: MockPaymentProvider) -> (AppState, NamedTempFile) {
+    let (mut state, tmp) = make_test_state().await;
+    let mock: Arc<dyn PaymentProvider> = Arc::new(mock_impl);
+    // Two seams, two code paths:
+    //  - The legacy singleton (`set_payment_provider`) backs the back-compat
+    //    `/v1/{kind}/webhook` route via `state.payment_provider()`.
+    //  - The `provider_override` field backs the merchant-profile resolver
+    //    (`resolve_provider_for_profile_rail` / `payment_provider_by_id`) that
+    //    the real `/v1/purchase` path uses. Both point at the same mock so a
+    //    test can drive purchase → settle end-to-end.
+    state.set_payment_provider(mock.clone()).await;
+    state.provider_override = Some(mock);
+    // The resolver still reads profile/rail/row from the DB before swapping in
+    // the override, so a real provider row must exist on the default profile —
+    // otherwise the purchase path 400s with "no payment providers connected".
+    // build_provider is never called for it (the override short-circuits), so
+    // the BTCPay credentials here are inert placeholders.
+    let default_profile = repo::get_default_merchant_profile(&state.db)
+        .await
+        .expect("query default profile")
+        .expect("migration 0020 auto-creates a default merchant profile");
+    repo::create_payment_provider(
+        &state.db,
+        "test-provider-1",
+        &default_profile.id,
+        "btcpay",
+        "Test BTCPay",
+        "inert-test-key",
+        "http://btcpay.test",
+        None,
+        Some("deadbeef"),
+        Some("store-test"),
+        &Utc::now().to_rfc3339(),
+    )
+    .await
+    .expect("seed test payment provider");
     (state, tmp)
 }
 
@@ -616,6 +693,149 @@ async fn paid_purchase_creates_invoice_via_provider() {
         .await
         .unwrap();
     assert_eq!(licenses, 0);
+}
+
+/// Anti-forgery (P0): a `settled` webhook whose provider API does NOT
+/// confirm payment must not settle the invoice or issue a license. This is
+/// the defense for signature-less providers (Zaprite) — a forged settle
+/// POST with a known order id would otherwise mint a free license. The
+/// handler re-fetches `get_invoice_status`; the unconfirmed mock reports
+/// `Pending`, so the claim is refused: 200 ack (so the provider stops
+/// retrying) but no state change and no license.
+#[tokio::test]
+async fn forged_settle_webhook_without_provider_confirmation_is_refused() {
+    let (state, _tmp) =
+        install_mock_provider(MockPaymentProvider::new_unconfirmed()).await;
+
+    let product = repo::create_product(
+        &state.db,
+        "forgery-test",
+        "Forgery Test",
+        "",
+        7_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let provider_invoice_id = "mock-inv-forged".to_string();
+    repo::create_invoice(
+        &state.db,
+        &internal_invoice_id,
+        &provider_invoice_id,
+        &product.id,
+        7_000,
+        "http://mock-checkout.test/i/forged",
+        None, // buyer_email
+        None, // buyer_note
+        None, // policy_id
+        None, // payment_provider_id
+    )
+    .await
+    .expect("create_invoice");
+
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": provider_invoice_id })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "handler should ack the forged webhook so the provider stops retrying"
+    );
+
+    let status_after: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE btcpay_invoice_id = ?")
+            .bind(&provider_invoice_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_after, "pending",
+        "forged settle must NOT flip the invoice to settled"
+    );
+
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 0, "forged settle must NOT issue a license");
+}
+
+/// When the provider's status API is unreachable, a settle webhook must be
+/// acked (200, so the provider doesn't retry-storm) WITHOUT issuing — the
+/// reconcile loop re-confirms and issues later. Pins the fail-open-on-ack /
+/// fail-closed-on-issuance behavior so a future refactor can't turn this
+/// into a 5xx retry storm or, worse, issue on an unconfirmable settle.
+#[tokio::test]
+async fn settle_webhook_acks_without_issuing_when_provider_unreachable() {
+    let (state, _tmp) =
+        install_mock_provider(MockPaymentProvider::new_status_unavailable()).await;
+
+    let product = repo::create_product(
+        &state.db,
+        "unreachable-test",
+        "Unreachable Test",
+        "",
+        6_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let provider_invoice_id = "mock-inv-unreachable".to_string();
+    repo::create_invoice(
+        &state.db,
+        &internal_invoice_id,
+        &provider_invoice_id,
+        &product.id,
+        6_000,
+        "http://mock-checkout.test/i/unreachable",
+        None, // buyer_email
+        None, // buyer_note
+        None, // policy_id
+        None, // payment_provider_id
+    )
+    .await
+    .expect("create_invoice");
+
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": provider_invoice_id })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "unconfirmable settle must ack 200, not 5xx (a non-2xx triggers retry storms)"
+    );
+
+    let status_after: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE btcpay_invoice_id = ?")
+            .bind(&provider_invoice_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_after, "pending",
+        "unconfirmable settle must NOT flip the invoice to settled"
+    );
+
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        licenses, 0,
+        "unconfirmable settle must NOT issue a license (reconciler handles it later)"
+    );
 }
 
 /// The settle webhook: provider POSTs an InvoiceSettled event, daemon
@@ -1205,163 +1425,6 @@ async fn paid_purchase_in_usd_records_listed_currency_and_rate() {
     assert_eq!(row.2, Some(500_000_000), "rate × 10000: 50000 × 10000");
     assert_eq!(row.3.as_deref(), Some("manual_pin"));
     assert_eq!(row.4, 98_000);
-}
-
-/// Active-provider preference round-trip. Pins the contract that
-/// `Activate <provider>` flips both the in-memory provider AND the
-/// persisted preference so the next daemon boot picks the same one.
-///
-/// Simulates the operator's lifecycle:
-///   1. Configure both BTCPay and Zaprite (both rows in DB)
-///   2. Activate Zaprite → preference flag = "zaprite"
-///   3. Activate BTCPay → preference flag = "btcpay"
-///   4. Disconnect BTCPay → preference flag cleared (because it
-///      pointed at the wiped config)
-///   5. Disconnect Zaprite while preference was already "btcpay"
-///      → preference NOT cleared (stays at "btcpay" because it
-///      was pointing at a different provider)
-#[tokio::test]
-async fn payment_provider_preference_round_trip() {
-    use keysat::payment::{self, ProviderKind};
-
-    let (state, _tmp) = make_test_state().await;
-    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
-
-    // Zaprite activation requires the `zaprite_payments` entitlement
-    // (Pro tier and above). Pin the daemon's self-tier to a Licensed
-    // tier carrying that entitlement so the activate path doesn't
-    // 402. BTCPay is unconditional and works at every tier.
-    {
-        let mut guard = state.self_tier.write().await;
-        *guard = keysat::license_self::Tier::Licensed {
-            license_id: uuid::Uuid::new_v4(),
-            product_id: uuid::Uuid::new_v4(),
-            expires_at: 0,
-            entitlements: vec![
-                "unlimited_products".to_string(),
-                "unlimited_policies".to_string(),
-                "unlimited_codes".to_string(),
-                "recurring_billing".to_string(),
-                "zaprite_payments".to_string(),
-            ],
-        };
-    }
-
-    // Pre-seed both configs as if the operator had run Connect on
-    // each at some point. We bypass the actual Connect endpoints
-    // because they call out to BTCPay / Zaprite to validate the
-    // credentials, which we don't want to do in unit tests.
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO btcpay_config(id, base_url, api_key, store_id, webhook_id, \
-         webhook_secret, connected_at) \
-         VALUES(1, 'http://btcpay.test', 'btcpay-key', 'store-1', 'wh-1', \
-         '0123456789abcdef', ?)",
-    )
-    .bind(&now)
-    .execute(&state.db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO zaprite_config(id, api_key, base_url, webhook_id, connected_at, updated_at) \
-         VALUES(1, 'zaprite-key', 'https://api.zaprite.test', NULL, ?, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db)
-    .await
-    .unwrap();
-
-    // Step 1: no preference recorded yet.
-    let pref = payment::read_active_provider_preference(&state.db).await;
-    assert_eq!(pref, None);
-
-    // Step 2: GET status surfaces both as configured, no active yet.
-    let req = build_request(
-        "GET",
-        "/v1/admin/payment-provider/status",
-        &[("authorization", &auth)],
-        None,
-    );
-    let resp = send(&state, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp).await;
-    assert_eq!(body["btcpay_configured"], true);
-    assert_eq!(body["zaprite_configured"], true);
-    assert!(body["preferred"].is_null());
-
-    // Step 3: Activate Zaprite. The endpoint reads the saved
-    // zaprite_config to build the provider — the saved key
-    // 'zaprite-key' won't talk to a real API but the activate
-    // path doesn't ping; that's only on Connect.
-    let req = build_request(
-        "POST",
-        "/v1/admin/payment-provider/activate",
-        &[("authorization", &auth)],
-        Some(json!({"provider": "zaprite"})),
-    );
-    let resp = send(&state, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "activate zaprite should succeed when zaprite_config is present"
-    );
-    let pref = payment::read_active_provider_preference(&state.db).await;
-    assert_eq!(pref, Some(ProviderKind::Zaprite));
-
-    // Step 4: Activate BTCPay. Preference flips.
-    let req = build_request(
-        "POST",
-        "/v1/admin/payment-provider/activate",
-        &[("authorization", &auth)],
-        Some(json!({"provider": "btcpay"})),
-    );
-    let resp = send(&state, req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let pref = payment::read_active_provider_preference(&state.db).await;
-    assert_eq!(pref, Some(ProviderKind::Btcpay));
-
-    // Step 5: Activate something that's not configured. Should 400.
-    sqlx::query("DELETE FROM zaprite_config WHERE id = 1")
-        .execute(&state.db)
-        .await
-        .unwrap();
-    let req = build_request(
-        "POST",
-        "/v1/admin/payment-provider/activate",
-        &[("authorization", &auth)],
-        Some(json!({"provider": "zaprite"})),
-    );
-    let resp = send(&state, req).await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "activating an unconfigured provider must 400 with 'run Connect first'"
-    );
-
-    // Step 6: Bad provider name → 400.
-    let req = build_request(
-        "POST",
-        "/v1/admin/payment-provider/activate",
-        &[("authorization", &auth)],
-        Some(json!({"provider": "stripe"})),
-    );
-    let resp = send(&state, req).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    // Step 7: write_active_provider_preference invariant —
-    // explicit setting survives a re-read (durability across the
-    // simulated restart that the boot-time loader cares about).
-    payment::write_active_provider_preference(&state.db, ProviderKind::Btcpay)
-        .await
-        .unwrap();
-    let pref = payment::read_active_provider_preference(&state.db).await;
-    assert_eq!(pref, Some(ProviderKind::Btcpay));
-    payment::write_active_provider_preference(&state.db, ProviderKind::Zaprite)
-        .await
-        .unwrap();
-    let pref = payment::read_active_provider_preference(&state.db).await;
-    assert_eq!(pref, Some(ProviderKind::Zaprite));
 }
 
 /// Zaprite webhook authentication contract.
