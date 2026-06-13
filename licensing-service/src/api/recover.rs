@@ -24,7 +24,7 @@ use crate::error::{AppError, AppResult};
 use axum::{
     extract::State,
     http::HeaderMap,
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse},
     Json,
 };
 use chrono::DateTime;

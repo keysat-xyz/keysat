@@ -3003,10 +3003,15 @@ pub async fn get_merchant_profile_for_product(
     pool: &SqlitePool,
     product_id: &str,
 ) -> AppResult<Option<crate::merchant_profiles::MerchantProfile>> {
+    // Subquery rather than a JOIN: `MERCHANT_PROFILE_COLS` is a bare
+    // column list (`id, name, …`) shared with the non-JOIN profile
+    // queries, and `products` also has an `id`, so a JOIN here makes the
+    // SELECT list's `id` ambiguous. The subquery keeps `merchant_profiles`
+    // the only table in FROM. A product with a NULL `merchant_profile_id`
+    // yields no match (subquery → NULL), so callers fall back to default.
     let row = sqlx::query(&format!(
-        "SELECT {MERCHANT_PROFILE_COLS} FROM merchant_profiles mp \
-         JOIN products p ON p.merchant_profile_id = mp.id \
-         WHERE p.id = ? LIMIT 1"
+        "SELECT {MERCHANT_PROFILE_COLS} FROM merchant_profiles \
+         WHERE id = (SELECT merchant_profile_id FROM products WHERE id = ?) LIMIT 1"
     ))
     .bind(product_id)
     .fetch_optional(pool)

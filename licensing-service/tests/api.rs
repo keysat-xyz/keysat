@@ -580,13 +580,14 @@ async fn paid_purchase_creates_invoice_via_provider() {
         Some(json!({"product": "paid-test"})),
     );
     let resp = send(&state, req).await;
+    let status = resp.status();
+    let body = body_json(resp).await;
     assert_eq!(
-        resp.status(),
+        status,
         StatusCode::OK,
-        "paid purchase should succeed against the mock provider"
+        "paid purchase should succeed against the mock provider; body={body:?}"
     );
 
-    let body = body_json(resp).await;
     assert_eq!(body["amount_sats"], 10_000);
     assert_eq!(body["btcpay_invoice_id"], "mock-inv-1");
     assert!(
@@ -656,6 +657,7 @@ async fn webhook_settles_invoice_and_issues_license_idempotently() {
         None, // buyer_email
         None, // buyer_note
         None, // policy_id
+        None, // payment_provider_id
     )
     .await
     .expect("create_invoice");
@@ -1031,6 +1033,7 @@ async fn recover_returns_license_key_for_matching_pair() {
         Some("Buyer@Example.COM"), // mixed case to verify lowercasing
         None,
         None,
+        None, // payment_provider_id
     )
     .await
     .expect("create_invoice");
@@ -2214,6 +2217,8 @@ async fn seed_subscription(state: &AppState) -> (String, String, String) {
         "SAT",
         25_000,
         &invoice_id,
+        None, // merchant_profile_id
+        None, // payment_provider_id
     )
     .await
     .expect("create_subscription");
@@ -3163,5 +3168,92 @@ async fn product_entitlements_catalog_round_trips_through_list_endpoint() {
     assert_eq!(catalog.len(), 2, "both catalog entries should round-trip");
     assert_eq!(catalog[0]["slug"], "self_host");
     assert_eq!(catalog[1]["slug"], "unlimited_products");
+}
+
+/// Audit coverage for the `:52` merchant-profile / payment-provider model.
+/// These queries are runtime-prepared (`sqlx::query(&format!(...))`), so column
+/// errors only surface when executed — and the resolution path had no passing
+/// test, which let an ambiguous-column bug ship in `get_merchant_profile_for_product`.
+/// This drives the write + preference + resolution queries end to end so the
+/// whole `:52` SQL surface is exercised by at least one green test.
+#[tokio::test]
+async fn merchant_profile_provider_resolution_queries_round_trip() {
+    let (state, _tmp) = make_test_state().await;
+    let now = "2026-06-12T00:00:00Z";
+
+    // Default profile is created by migration 0020.
+    let default = repo::get_default_merchant_profile(&state.db)
+        .await
+        .expect("get_default_merchant_profile")
+        .expect("a default profile exists post-migration");
+
+    // Profile CRUD reads/writes.
+    let p2 = Uuid::new_v4().to_string();
+    repo::create_merchant_profile(
+        &state.db, &p2, "Recaps", None, None, None, None, None, false, now,
+    )
+    .await
+    .expect("create_merchant_profile");
+    repo::get_merchant_profile_by_id(&state.db, &p2)
+        .await
+        .expect("get_merchant_profile_by_id")
+        .expect("created profile exists");
+    assert!(
+        repo::list_merchant_profiles(&state.db)
+            .await
+            .expect("list_merchant_profiles")
+            .len()
+            >= 2
+    );
+
+    // Attach a BTCPay provider to the default profile (store_id present so
+    // build_provider can construct a client without a network call).
+    let prov = Uuid::new_v4().to_string();
+    repo::create_payment_provider(
+        &state.db, &prov, &default.id, "btcpay", "Test BTCPay",
+        "api-key", "http://btcpay.test", Some("wh-1"), Some("secret"), Some("store-1"), now,
+    )
+    .await
+    .expect("create_payment_provider");
+    repo::get_payment_provider_by_id(&state.db, &prov)
+        .await
+        .expect("get_payment_provider_by_id")
+        .expect("created provider exists");
+    assert_eq!(
+        repo::list_payment_providers_for_profile(&state.db, &default.id)
+            .await
+            .expect("list_payment_providers_for_profile")
+            .len(),
+        1
+    );
+    repo::list_all_payment_providers(&state.db)
+        .await
+        .expect("list_all_payment_providers");
+
+    // Rail preference write + read.
+    repo::set_rail_preference(&state.db, &default.id, "lightning", &prov)
+        .await
+        .expect("set_rail_preference");
+    assert_eq!(
+        repo::list_rail_preferences_for_profile(&state.db, &default.id)
+            .await
+            .expect("list_rail_preferences_for_profile")
+            .len(),
+        1
+    );
+
+    // The production purchase path's resolution, both branches:
+    //   - Lightning resolves via the explicit preference just set.
+    //   - OnChain has no preference but BTCPay serves it → served-rail fallback.
+    let (row_pref, _p) = state
+        .resolve_provider_for_profile_rail(&default.id, keysat::payment::Rail::Lightning)
+        .await
+        .expect("resolve lightning via explicit preference");
+    assert_eq!(row_pref.id, prov);
+    let (row_fallback, _p) = state
+        .resolve_provider_for_profile_rail(&default.id, keysat::payment::Rail::Onchain)
+        .await
+        .expect("resolve onchain via served-rail fallback");
+    assert_eq!(row_fallback.id, prov);
 }
 
