@@ -5,20 +5,29 @@
 //! script a credential that does only what it needs to. Operator-friendly
 //! flow:
 //!
-//!   1. Operator generates a new key in Settings → API keys, picks a role
+//!   1. Operator mints a new key via `POST /v1/admin/api-keys`, picking a role
 //!      from a fixed list (Read-only / License issuer / Support / Full admin).
-//!   2. UI returns the raw token ONCE. The token never appears in any
-//!      response afterward — only its sha256 hash is stored.
-//!   3. Agent uses `Authorization: Bearer <token>` like the master key.
-//!      Endpoints that have been scope-wired check the agent's role
-//!      grants the required scope; if not, 403.
-//!   4. Operator can revoke any key from the same UI; revoked tokens
-//!      stop working immediately.
+//!      (A clickable Settings → API keys panel in the admin SPA is planned;
+//!      until then keys are minted through the API.)
+//!   2. The create response returns the raw token ONCE. The token never
+//!      appears in any response afterward — only its sha256 hash is stored.
+//!   3. Agent uses `Authorization: Bearer <token>` like the master key. Each
+//!      scope-gated endpoint checks the agent's role grants the required
+//!      scope; if not, 403.
+//!   4. Operator can revoke any key (`DELETE /v1/admin/api-keys/:id`); revoked
+//!      tokens stop working immediately.
 //!
-//! The master `admin_api_key` always works on every endpoint. Scoped keys
-//! work only on endpoints that have been migrated to call `require_scope`
-//! instead of `require_admin`. Endpoints not yet migrated reject scoped
-//! keys with 403 — secure-by-default.
+//! The master `admin_api_key` always works on every endpoint. Scoped keys are
+//! honored across the catalog/license/support surface: every read endpoint
+//! (`<resource>:read`), license writes (`licenses:write`), and the support
+//! writes (`subscriptions:write`, `machines:write`). A deliberate set of
+//! sensitive endpoints stays master-key-only — even a `full-admin` scoped key
+//! gets 403 on them: rotating the issuer signing key, connecting/disconnecting
+//! payment providers, setting the web-admin password, managing API keys
+//! themselves, changing server settings or license tiers, and DB
+//! introspection. When adding a new admin route, gate it with
+//! `require_scope(state, headers, "<resource>:<read|write>")` unless it belongs
+//! in that master-only set, in which case use `require_admin`.
 
 use crate::api::admin::{request_context, require_admin};
 use crate::api::AppState;

@@ -19,7 +19,7 @@
 //! Admin endpoints let operators look at who's using what and force-kick a
 //! machine off a license.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::crypto;
 use crate::db::repo;
@@ -261,7 +261,7 @@ pub async fn admin_list(
     headers: HeaderMap,
     Query(q): Query<AdminListQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "machines:read").await?;
 
     // Resolve product_slug → product_id if the caller passed the slug
     // form. Either works; product_id takes precedence on conflict.
@@ -299,7 +299,7 @@ pub async fn admin_deactivate(
     Path(id): Path<String>,
     Json(req): Json<AdminDeactivateReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "machines:write").await?;
     let (ip, ua) = request_context(&headers);
     let reason = if req.reason.is_empty() {
         "admin deactivate".to_string()

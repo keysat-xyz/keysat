@@ -19,7 +19,7 @@
 use crate::analytics::{
     self, SETTING_COLLECTOR_URL, SETTING_ENABLED, SETTING_INSTALL_UUID,
 };
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::db::repo;
 use crate::error::{AppError, AppResult};
@@ -31,7 +31,7 @@ pub async fn get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "community:read").await?;
     let enabled = analytics::is_enabled(&state).await;
     let collector_url = repo::settings_get(&state.db, SETTING_COLLECTOR_URL).await?;
     let install_uuid = repo::settings_get(&state.db, SETTING_INSTALL_UUID).await?;
@@ -84,7 +84,7 @@ pub async fn set(
     headers: HeaderMap,
     Json(req): Json<SetReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "community:write").await?;
     let (ip, ua) = request_context(&headers);
 
     // Validate URL shape if one was supplied. We don't try to reach
@@ -154,7 +154,7 @@ pub async fn reset(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "community:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::settings_set(&state.db, SETTING_INSTALL_UUID, None).await?;
     let _ = repo::insert_audit(

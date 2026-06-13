@@ -16,7 +16,7 @@
 //! should use the new `/v1/admin/merchant-profiles` endpoints to see
 //! all providers across all profiles.
 
-use crate::api::admin::require_admin;
+use crate::api::admin::require_scope;
 use crate::api::AppState;
 use crate::error::AppResult;
 use axum::{extract::State, http::HeaderMap, Json};
@@ -31,7 +31,7 @@ pub async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "payment_providers:read").await?;
     let default = crate::merchant_profiles::get_default(&state.db).await?;
     let providers = match &default {
         Some(p) => crate::db::repo::list_payment_providers_for_profile(&state.db, &p.id).await?,

@@ -8,7 +8,7 @@
 
 use super::{
     CreateInvoiceParams, CreatedInvoiceHandle, Money, PaymentProvider, PaymentReceipt,
-    ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
+    ProviderInvoiceSnapshot, ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
 };
 use crate::btcpay::client::BtcpayClient;
 use crate::btcpay::webhook::{verify_signature, WebhookEvent as BtcpayWebhookEvent};
@@ -155,17 +155,13 @@ impl PaymentProvider for BtcpayProvider {
     async fn get_invoice_status(
         &self,
         provider_invoice_id: &str,
-    ) -> Result<ProviderInvoiceStatus> {
+    ) -> Result<ProviderInvoiceSnapshot> {
         let raw = self
             .client
             .get_invoice(provider_invoice_id)
             .await
             .context("BTCPay get-invoice")?;
-        let status = raw
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Pending");
-        Ok(match status {
+        let status = match raw.get("status").and_then(|v| v.as_str()).unwrap_or("Pending") {
             "Settled" | "Complete" => ProviderInvoiceStatus::Settled,
             "Expired" => ProviderInvoiceStatus::Expired,
             "Invalid" => ProviderInvoiceStatus::Invalid,
@@ -173,7 +169,36 @@ impl PaymentProvider for BtcpayProvider {
             // reports it via metadata we'd handle here. For now it falls
             // through to Pending.
             _ => ProviderInvoiceStatus::Pending,
-        })
+        };
+        // The amount the invoice is denominated for, for the advisory
+        // settle-amount tripwire (see docs/guides/payments.md). We price
+        // BTCPay invoices in "BTC" with a decimal amount = sats / 1e8 (see
+        // btcpay/client.rs::create_invoice), so convert that back to sats —
+        // f64 is exact for sat-magnitude integers and mirrors the inverse
+        // conversion already used in the client. Any other currency
+        // shouldn't occur in our flow; pass it through verbatim so the
+        // tripwire downstream flags the unexpected currency. Absent or
+        // unparseable amount → None ("no opinion"; tripwire skips it).
+        let amount = match (
+            raw.get("currency").and_then(|v| v.as_str()),
+            raw.get("amount").and_then(|v| v.as_str()),
+        ) {
+            (Some("BTC"), Some(amt)) => amt
+                .parse::<f64>()
+                .ok()
+                .map(|btc| (btc * 100_000_000.0).round() as i64)
+                // Guard against garbage from the provider (negative/zero/NaN
+                // → 0): a real invoice amount is positive. Non-positive → None
+                // ("no opinion"), so the advisory tripwire skips it.
+                .filter(|&sats| sats > 0)
+                .map(Money::sats),
+            (Some(cur), Some(amt)) => amt.parse::<i64>().ok().map(|v| Money {
+                currency: cur.to_string(),
+                amount: v,
+            }),
+            _ => None,
+        };
+        Ok(ProviderInvoiceSnapshot { status, amount })
     }
 
     fn validate_webhook(

@@ -734,8 +734,8 @@ async fn apply_tier_change_mutates_license_and_subscription() {
 #[tokio::test]
 async fn renewal_worker_applies_pending_tier_change_before_billing() {
     use keysat::payment::{
-        CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceStatus,
-        ProviderKind, ProviderWebhookEvent,
+        CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceSnapshot,
+        ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
     };
     use std::any::Any;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -765,8 +765,11 @@ async fn renewal_worker_applies_pending_tier_change_before_billing() {
                 checkout_url: format!("http://cap/{n}"),
             })
         }
-        async fn get_invoice_status(&self, _id: &str) -> anyhow::Result<ProviderInvoiceStatus> {
-            Ok(ProviderInvoiceStatus::Pending)
+        async fn get_invoice_status(&self, _id: &str) -> anyhow::Result<ProviderInvoiceSnapshot> {
+            Ok(ProviderInvoiceSnapshot {
+                status: ProviderInvoiceStatus::Pending,
+                amount: None,
+            })
         }
         fn validate_webhook(
             &self,

@@ -14,7 +14,7 @@
 //! that was down for >6h during a license-issuance burst would
 //! silently lose those events forever.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::db::repo::{self, DeliveryStatusFilter};
 use crate::error::{AppError, AppResult};
@@ -46,7 +46,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(q): Query<ListDeliveriesQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "webhooks:read").await?;
     let status = match q.status.as_deref() {
         Some(s) => DeliveryStatusFilter::parse(s).ok_or_else(|| {
             AppError::BadRequest(format!(
@@ -80,7 +80,7 @@ pub async fn retry(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "webhooks:write").await?;
     let (ip, ua) = request_context(&headers);
     let delivery = repo::requeue_delivery(&state.db, &id)
         .await?

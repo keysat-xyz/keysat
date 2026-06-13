@@ -22,8 +22,8 @@ use keysat::crypto::{self, LicensePayload};
 use keysat::db::repo;
 use keysat::license_self::Tier;
 use keysat::payment::{
-    CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceStatus,
-    ProviderKind, ProviderWebhookEvent,
+    CreateInvoiceParams, CreatedInvoiceHandle, Money, PaymentProvider, ProviderInvoiceSnapshot,
+    ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
 };
 use serde_json::{json, Value};
 use sqlx::sqlite::{
@@ -393,6 +393,10 @@ enum StatusReport {
 struct MockPaymentProvider {
     next_invoice_id: AtomicU64,
     status_report: StatusReport,
+    /// Amount `get_invoice_status` reports the invoice is denominated for.
+    /// `None` (the default) = "no opinion", which disables the advisory
+    /// settle-amount tripwire; `Some` lets a test drive an amount mismatch.
+    settled_amount: Option<Money>,
 }
 
 impl MockPaymentProvider {
@@ -401,6 +405,7 @@ impl MockPaymentProvider {
         Self {
             next_invoice_id: AtomicU64::new(1),
             status_report: StatusReport::Reports(ProviderInvoiceStatus::Settled),
+            settled_amount: None,
         }
     }
 
@@ -410,6 +415,7 @@ impl MockPaymentProvider {
         Self {
             next_invoice_id: AtomicU64::new(1),
             status_report: StatusReport::Reports(ProviderInvoiceStatus::Pending),
+            settled_amount: None,
         }
     }
 
@@ -419,6 +425,18 @@ impl MockPaymentProvider {
         Self {
             next_invoice_id: AtomicU64::new(1),
             status_report: StatusReport::Unavailable,
+            settled_amount: None,
+        }
+    }
+
+    /// Confirms `Settled` but reports a specific denominated amount, so a test
+    /// can exercise the advisory settle-amount tripwire (mismatch → still
+    /// issues, but audits).
+    fn new_settled_with_amount(amount: Money) -> Self {
+        Self {
+            next_invoice_id: AtomicU64::new(1),
+            status_report: StatusReport::Reports(ProviderInvoiceStatus::Settled),
+            settled_amount: Some(amount),
         }
     }
 }
@@ -443,12 +461,15 @@ impl PaymentProvider for MockPaymentProvider {
     async fn get_invoice_status(
         &self,
         _provider_invoice_id: &str,
-    ) -> Result<ProviderInvoiceStatus> {
+    ) -> Result<ProviderInvoiceSnapshot> {
         // The webhook handler re-fetches this to confirm a settle claim
         // before issuing. Configurable per-mock so a test can simulate the
         // provider disagreeing with a forged "settled" body, or being down.
         match self.status_report {
-            StatusReport::Reports(s) => Ok(s),
+            StatusReport::Reports(s) => Ok(ProviderInvoiceSnapshot {
+                status: s,
+                amount: self.settled_amount.clone(),
+            }),
             StatusReport::Unavailable => {
                 anyhow::bail!("mock: provider status API unavailable")
             }
@@ -836,6 +857,196 @@ async fn settle_webhook_acks_without_issuing_when_provider_unreachable() {
         licenses, 0,
         "unconfirmable settle must NOT issue a license (reconciler handles it later)"
     );
+}
+
+/// Advisory settle-amount tripwire (P1): when the provider confirms `Settled`
+/// but reports a different amount than we charged, the handler STILL issues
+/// the license — the amount check is advisory, NOT a gate — and records an
+/// `invoice.amount_mismatch` audit row so the drift is observable. This pins
+/// the deliberate non-blocking behavior: a hard gate would false-reject
+/// operators running a BTCPay payment tolerance. See docs/guides/payments.md.
+#[tokio::test]
+async fn settled_amount_mismatch_issues_license_but_audits() {
+    let (state, _tmp) =
+        install_mock_provider(MockPaymentProvider::new_settled_with_amount(Money::sats(1))).await;
+
+    let product = repo::create_product(
+        &state.db,
+        "amount-mismatch-test",
+        "Amount Mismatch Test",
+        "",
+        7_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let provider_invoice_id = "mock-inv-mismatch".to_string();
+    repo::create_invoice(
+        &state.db,
+        &internal_invoice_id,
+        &provider_invoice_id,
+        &product.id,
+        7_000,
+        "http://mock-checkout.test/i/mismatch",
+        None, // buyer_email
+        None, // buyer_note
+        None, // policy_id
+        None, // payment_provider_id
+    )
+    .await
+    .expect("create_invoice");
+
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": provider_invoice_id })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The settle is confirmed (status Settled), so issuance proceeds despite
+    // the amount mismatch — the tripwire is advisory.
+    let status_after: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE btcpay_invoice_id = ?")
+            .bind(&provider_invoice_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(status_after, "settled");
+
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 1, "advisory amount mismatch must NOT block issuance");
+
+    // ...but the drift is recorded for the operator to investigate.
+    let mismatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'invoice.amount_mismatch'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        mismatches, 1,
+        "amount/currency drift must be recorded in the audit log"
+    );
+}
+
+/// Fiat-denominated settles have no clean SAT comparison basis, so the advisory
+/// tripwire SKIPS them — issues, no audit row. This is the case of a USD
+/// subscription renewal, where the provider charges in the listed fiat currency
+/// (not sats) and `amount_sats` is not the charged amount. Regression guard for
+/// the false-positive a naive SAT comparison would emit on every fiat renewal.
+#[tokio::test]
+async fn settled_non_sat_settle_skips_amount_tripwire() {
+    let (state, _tmp) = install_mock_provider(MockPaymentProvider::new_settled_with_amount(
+        Money {
+            currency: "USD".to_string(),
+            amount: 999,
+        },
+    ))
+    .await;
+
+    let product =
+        repo::create_product(&state.db, "non-sat-test", "Non-SAT Test", "", 7_000, &json!({}))
+            .await
+            .expect("create_product");
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let provider_invoice_id = "mock-inv-nonsat".to_string();
+    repo::create_invoice(
+        &state.db,
+        &internal_invoice_id,
+        &provider_invoice_id,
+        &product.id,
+        7_000,
+        "http://mock-checkout.test/i/nonsat",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create_invoice");
+
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": provider_invoice_id })),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::OK);
+
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 1, "non-SAT settle must still issue the license");
+    let mismatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'invoice.amount_mismatch'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        mismatches, 0,
+        "non-SAT settle has no SAT comparison basis — skip, do NOT audit as a mismatch"
+    );
+}
+
+/// When the provider reports no parseable amount (`None`), the tripwire has no
+/// opinion and is skipped: the license issues and no `invoice.amount_mismatch`
+/// row is written. Pins the "None = skip, not mismatch" contract.
+#[tokio::test]
+async fn settled_without_provider_amount_skips_tripwire() {
+    // make_test_state_with_mock_provider uses MockPaymentProvider::new() —
+    // confirms Settled but reports no amount (settled_amount = None).
+    let (state, _tmp) = make_test_state_with_mock_provider().await;
+
+    let product =
+        repo::create_product(&state.db, "none-amt-test", "None Amt", "", 5_000, &json!({}))
+            .await
+            .expect("create_product");
+    let internal_invoice_id = Uuid::new_v4().to_string();
+    let provider_invoice_id = "mock-inv-noneamt".to_string();
+    repo::create_invoice(
+        &state.db,
+        &internal_invoice_id,
+        &provider_invoice_id,
+        &product.id,
+        5_000,
+        "http://mock-checkout.test/i/noneamt",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create_invoice");
+
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook",
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": provider_invoice_id })),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::OK);
+
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 1);
+    let mismatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'invoice.amount_mismatch'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(mismatches, 0, "no provider amount → tripwire skipped, no audit row");
 }
 
 /// The settle webhook: provider POSTs an InvoiceSettled event, daemon
@@ -3081,6 +3292,160 @@ async fn scoped_api_key_management_rejects_scoped_full_admin() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "scoped keys (even full-admin) must NOT manage other keys"
+    );
+}
+
+/// Mint a scoped API key of `role` via the master-authed create endpoint and
+/// return its raw bearer token. Exercises the real issue path the same way an
+/// operator would.
+async fn mint_scoped_key(state: &AppState, role: &str) -> String {
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({ "label": format!("{role} key"), "role": role })),
+    );
+    let resp = send(state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "minting a {role} key should succeed");
+    body_json(resp)
+        .await
+        .get("token")
+        .and_then(|t| t.as_str())
+        .expect("create returns the raw token once")
+        .to_string()
+}
+
+/// Read-only scoped keys can hit read endpoints but are 403 on writes, and are
+/// still denied the endpoints we deliberately keep master-only (db-info).
+#[tokio::test]
+async fn scoped_read_only_key_reads_but_cannot_write() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", mint_scoped_key(&state, "read-only").await);
+
+    // Read endpoint — allowed (every role grants `:read`). Use a param-free
+    // getter so the only gate exercised is the scope check (GET
+    // /v1/admin/licenses requires a product_id query param that 400s at the
+    // extractor before auth even runs).
+    let req = build_request(
+        "GET",
+        "/v1/admin/settings/operator-name",
+        &[("authorization", &auth)],
+        None,
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::OK);
+
+    // db-info stays master-only even for reads.
+    let req = build_request("GET", "/v1/admin/db-info", &[("authorization", &auth)], None);
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "db-info is master-only; a read-only scoped key must be denied"
+    );
+
+    // Write endpoint — denied (products:write is full-admin only).
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({ "slug": "ro-denied", "name": "Nope", "price_sats": 1000 })),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::FORBIDDEN);
+}
+
+/// License-issuer scoped keys can issue licenses (licenses:write) but cannot
+/// manage the catalog (products:write is full-admin only).
+#[tokio::test]
+async fn scoped_license_issuer_key_issues_but_cannot_manage_catalog() {
+    let (state, _tmp) = make_test_state().await;
+    let master = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Master seeds a product to issue against.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &master)],
+        Some(json!({ "slug": "issuer-prod", "name": "Issuer Prod", "price_sats": 1000 })),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::OK);
+
+    let auth = format!("Bearer {}", mint_scoped_key(&state, "license-issuer").await);
+
+    // Issue a license — allowed.
+    let req = build_request(
+        "POST",
+        "/v1/admin/licenses",
+        &[("authorization", &auth)],
+        Some(json!({ "product_slug": "issuer-prod" })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::OK,
+        "license-issuer must be able to issue licenses"
+    );
+
+    // Create a product — denied.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({ "slug": "issuer-cant", "name": "Nope", "price_sats": 1000 })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "license-issuer must NOT manage the catalog"
+    );
+}
+
+/// Support scoped keys are granted subscription/machine writes but not catalog
+/// writes. The cancel of a nonexistent subscription is expected to fail
+/// downstream (not found) — what matters is that authorization PASSED (not
+/// 401/403), which isolates the scope grant from the business logic.
+#[tokio::test]
+async fn scoped_support_key_allowed_support_writes_not_catalog() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", mint_scoped_key(&state, "support").await);
+
+    // subscriptions:write — auth passes; missing sub yields a non-403/401 status.
+    let req = build_request(
+        "POST",
+        "/v1/admin/subscriptions/does-not-exist/cancel",
+        &[("authorization", &auth)],
+        None,
+    );
+    let status = send(&state, req).await.status();
+    assert_ne!(status, StatusCode::FORBIDDEN, "support is granted subscriptions:write");
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+
+    // Catalog write — denied.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({ "slug": "sup-cant", "name": "Nope", "price_sats": 1000 })),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::FORBIDDEN);
+}
+
+/// Full-admin scoped keys CAN manage the catalog (products:write). The
+/// master-only denial (minting other keys, etc.) is covered by
+/// `scoped_api_key_management_rejects_scoped_full_admin`.
+#[tokio::test]
+async fn scoped_full_admin_key_manages_catalog() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", mint_scoped_key(&state, "full-admin").await);
+
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({ "slug": "fa-prod", "name": "FA Prod", "price_sats": 1000 })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::OK,
+        "full-admin must be able to manage the catalog"
     );
 }
 

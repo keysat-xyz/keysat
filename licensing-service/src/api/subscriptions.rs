@@ -26,7 +26,7 @@
 //! convention (Stripe, Zaprite, etc.) and avoids a UX where the
 //! buyer cancels mid-month and immediately loses what they paid for.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use axum::{
@@ -58,7 +58,7 @@ pub async fn admin_list(
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "subscriptions:read").await?;
     if let Some(s) = q.status.as_deref() {
         if !["active", "past_due", "cancelled", "lapsed"].contains(&s) {
             return Err(AppError::BadRequest(format!(
@@ -115,7 +115,7 @@ pub async fn admin_cancel(
     Path(id): Path<String>,
     body: Option<Json<CancelReq>>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "subscriptions:write").await?;
     let (ip, ua) = request_context(&headers);
     let reason = body.and_then(|Json(b)| b.reason).filter(|s| !s.trim().is_empty());
 

@@ -12,7 +12,7 @@
 //!                                        outage to confirm the
 //!                                        chain works end-to-end.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::rates;
@@ -24,7 +24,7 @@ pub async fn get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "rates:read").await?;
     let snapshot = state.rates.snapshot().await;
     let rates_json: Vec<Value> = snapshot
         .into_iter()
@@ -52,7 +52,7 @@ pub async fn refresh(
     headers: HeaderMap,
     Json(req): Json<RefreshReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "rates:write").await?;
     let (ip, ua) = request_context(&headers);
     let currency = req.currency.to_uppercase();
 

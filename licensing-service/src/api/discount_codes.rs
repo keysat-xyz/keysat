@@ -4,7 +4,7 @@
 //! The public purchase flow consumes codes via the `code` field on
 //! `POST /v1/purchase`; that path is handled in `crate::api::purchase`.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::db::repo;
 use crate::error::{AppError, AppResult};
@@ -67,7 +67,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(req): Json<CreateDiscountCodeReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "discount_codes:write").await?;
     let (ip, ua) = request_context(&headers);
 
     // Tier-cap gate: Creator caps at 5 active discount codes.
@@ -200,7 +200,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "discount_codes:read").await?;
     let codes = repo::list_discount_codes(&state.db, !q.include_inactive).await?;
     Ok(Json(json!({ "codes": codes })))
 }
@@ -210,7 +210,7 @@ pub async fn get_one(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "discount_codes:read").await?;
     let code = repo::get_discount_code_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("discount code {id}")))?;
@@ -271,7 +271,7 @@ pub async fn update(
     Path(id): Path<String>,
     Json(req): Json<UpdateDiscountCodeReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "discount_codes:write").await?;
     let (ip, ua) = request_context(&headers);
 
     // Resolve policy_slugs → policy ids using the code's EXISTING product
@@ -360,7 +360,7 @@ pub async fn set_active(
     Path(id): Path<String>,
     Json(req): Json<SetActiveReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "discount_codes:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::set_discount_code_active(&state.db, &id, req.active).await?;
     let action = if req.active {
@@ -392,7 +392,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "discount_codes:write").await?;
     let (ip, ua) = request_context(&headers);
 
     // Look up the code so we can audit-log meaningful detail.

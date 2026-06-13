@@ -16,6 +16,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+// The scoped-API-key gate lives in `api_keys` (next to the Role/scope logic),
+// but endpoint modules import both auth gates from here so there's one obvious
+// place to reach for when wiring an admin route. `require_admin` = master key
+// only; `require_scope` = master key OR a scoped key whose role grants the
+// named scope.
+pub use crate::api::api_keys::require_scope;
+
 /// Guards every admin handler: pulls the bearer token out of the header and
 /// compares constant-time against the configured admin key. Returns the
 /// SHA-256 hex of the token on success so handlers can write an audit row
@@ -169,7 +176,7 @@ pub async fn create_product(
     headers: HeaderMap,
     Json(req): Json<CreateProductReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "products:write").await?;
     let (ip, ua) = request_context(&headers);
     // Tier-cap gate: Creator caps at 5 products. 402 if over.
     crate::api::tier::enforce_product_cap(&state).await?;
@@ -260,7 +267,7 @@ pub async fn delete_product(
     Path(id): Path<String>,
     Query(opts): Query<DeleteOpts>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "products:write").await?;
     let (ip, ua) = request_context(&headers);
 
     let product = repo::get_product_by_id(&state.db, &id)
@@ -451,7 +458,7 @@ pub async fn update_product(
     Path(id): Path<String>,
     Json(req): Json<UpdateProductReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "products:write").await?;
     let (ip, ua) = request_context(&headers);
 
     // Resolve the pricing patch into (currency, value, sats) tuple
@@ -551,7 +558,7 @@ pub async fn set_product_active(
     Path(id): Path<String>,
     Json(req): Json<SetActiveReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "products:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::set_product_active(&state.db, &id, req.active).await?;
     let _ = repo::insert_audit(
@@ -581,7 +588,7 @@ pub async fn list_licenses(
     headers: HeaderMap,
     Query(q): Query<ListLicensesQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "licenses:read").await?;
     let licenses = repo::list_licenses_by_product(&state.db, &q.product_id).await?;
     Ok(Json(json!({ "licenses": licenses })))
 }
@@ -605,7 +612,7 @@ pub async fn search_licenses(
     headers: HeaderMap,
     Query(q): Query<SearchLicensesQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "licenses:read").await?;
     let licenses = repo::search_licenses(
         &state.db,
         q.buyer_email.as_deref(),
@@ -685,7 +692,7 @@ pub async fn revenue_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "licenses:read").await?;
     let total: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(amount_sats), 0) FROM invoices WHERE status = 'settled'",
     )
@@ -730,7 +737,7 @@ pub async fn license_counts(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "licenses:read").await?;
     let by_product: Vec<(String, i64)> = sqlx::query_as(
         "SELECT product_id, COUNT(*) FROM licenses GROUP BY product_id",
     )
@@ -762,7 +769,7 @@ pub async fn licenses_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "licenses:read").await?;
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
         .fetch_one(&state.db)
         .await?;
@@ -845,7 +852,7 @@ pub async fn issue_license(
     headers: HeaderMap,
     Json(req): Json<IssueLicenseReq>,
 ) -> AppResult<Json<IssueLicenseResp>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "licenses:write").await?;
     let (ip, ua) = request_context(&headers);
 
     let product = repo::get_product_by_slug(&state.db, &req.product_slug)
@@ -997,7 +1004,7 @@ pub async fn revoke_license(
     Path(license_id): Path<String>,
     Json(req): Json<RevokeReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "licenses:write").await?;
     let (ip, ua) = request_context(&headers);
     let reason = if req.reason.is_empty() {
         "admin revoke".to_string()
@@ -1040,7 +1047,7 @@ pub async fn suspend_license(
     Path(license_id): Path<String>,
     Json(req): Json<SuspendReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "licenses:write").await?;
     let (ip, ua) = request_context(&headers);
     let reason = if req.reason.is_empty() {
         "admin suspend".to_string()
@@ -1074,7 +1081,7 @@ pub async fn unsuspend_license(
     headers: HeaderMap,
     Path(license_id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "licenses:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::unsuspend_license(&state.db, &license_id).await?;
     let _ = repo::insert_audit(
@@ -1116,7 +1123,7 @@ pub async fn list_audit(
     headers: HeaderMap,
     Query(q): Query<ListAuditQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "audit:read").await?;
     let rows = repo::list_audit(&state.db, q.limit.min(1000).max(1), q.action.as_deref()).await?;
     Ok(Json(json!({ "entries": rows })))
 }
@@ -1164,7 +1171,7 @@ pub async fn get_operator_name(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "settings:read").await?;
     let stored = repo::settings_get(&state.db, SETTING_OPERATOR_NAME).await?;
     let effective = stored
         .clone()

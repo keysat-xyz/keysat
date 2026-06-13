@@ -14,7 +14,7 @@
 //! Old "active provider" semantics are gone — profiles attach to
 //! products explicitly.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_admin, require_scope};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::payment::zaprite::{ZapriteClient, ZapriteProvider};
@@ -276,7 +276,7 @@ pub async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "payment_providers:read").await?;
     let default = crate::merchant_profiles::get_default(&state.db).await?;
     let connected_row = match &default {
         Some(profile) => {

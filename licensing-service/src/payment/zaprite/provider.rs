@@ -7,7 +7,7 @@
 
 use crate::payment::{
     CreateInvoiceParams, CreatedInvoiceHandle, Money, PaymentProvider, PaymentReceipt,
-    ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
+    ProviderInvoiceSnapshot, ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
 };
 use anyhow::{anyhow, Context, Result};
 use axum::http::HeaderMap;
@@ -175,7 +175,7 @@ impl PaymentProvider for ZapriteProvider {
     async fn get_invoice_status(
         &self,
         provider_invoice_id: &str,
-    ) -> Result<ProviderInvoiceStatus> {
+    ) -> Result<ProviderInvoiceSnapshot> {
         let order = self
             .client
             .get_order(provider_invoice_id)
@@ -198,7 +198,7 @@ impl PaymentProvider for ZapriteProvider {
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        Ok(match status_str {
+        let status = match status_str {
             "PAID" | "COMPLETE" | "OVERPAID" => ProviderInvoiceStatus::Settled,
             "PENDING" | "PROCESSING" | "UNDERPAID" => ProviderInvoiceStatus::Pending,
             // Zaprite doesn't have explicit Expired/Refunded states
@@ -207,7 +207,30 @@ impl PaymentProvider for ZapriteProvider {
             // doesn't change. Fall-through covers any future
             // additions defensively.
             _ => ProviderInvoiceStatus::Invalid,
-        })
+        };
+        // The amount the order is denominated for, for the advisory
+        // settle-amount tripwire (see docs/guides/payments.md). We create
+        // Zaprite orders priced in "BTC" with the amount already in sats
+        // (see create_invoice above), so a Bitcoin currency maps straight
+        // to sats. Zaprite's order schema isn't fully documented, so this
+        // is best-effort: an absent/unparseable amount yields None and the
+        // tripwire is skipped. A non-Bitcoin currency is passed through so
+        // the tripwire can flag the unexpected currency.
+        let amount = match (
+            order.get("currency").and_then(|v| v.as_str()),
+            order.get("amount").and_then(|v| v.as_i64()),
+        ) {
+            // Zaprite spells Bitcoin as "BTC" with the amount already in sats
+            // (see create_invoice above); "SAT" is accepted defensively. Both
+            // map to our canonical sat unit. Non-positive → None (skip).
+            (Some("BTC") | Some("SAT"), Some(sats)) if sats > 0 => Some(Money::sats(sats)),
+            (Some(cur), Some(v)) if v > 0 => Some(Money {
+                currency: cur.to_string(),
+                amount: v,
+            }),
+            _ => None,
+        };
+        Ok(ProviderInvoiceSnapshot { status, amount })
     }
 
     /// Validate an incoming webhook delivery from Zaprite.

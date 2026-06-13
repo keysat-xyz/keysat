@@ -9,7 +9,7 @@
 //! product when a customer buys it through the normal purchase flow — so most
 //! products should have at least one policy slugged `default`.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::db::repo;
 use crate::error::{AppError, AppResult};
@@ -158,7 +158,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(req): Json<CreatePolicyReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
     let product = repo::get_product_by_slug(&state.db, &req.product_slug)
         .await?
@@ -289,7 +289,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(q): Query<ListPoliciesQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "policies:read").await?;
     let product = repo::get_product_by_slug(&state.db, &q.product_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("product '{}'", q.product_slug)))?;
@@ -314,7 +314,7 @@ pub async fn set_active(
     Path(id): Path<String>,
     Json(req): Json<SetActiveReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::set_policy_active(&state.db, &id, req.active).await?;
     let _ = repo::insert_audit(
@@ -351,7 +351,7 @@ pub async fn set_archived(
     Path(id): Path<String>,
     Json(req): Json<SetArchivedReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::set_policy_archived(&state.db, &id, req.archived).await?;
     let _ = repo::insert_audit(
@@ -389,7 +389,7 @@ pub async fn delete(
     Path(id): Path<String>,
     Query(opts): Query<PolicyDeleteOpts>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
 
     let policy = repo::get_policy_by_id(&state.db, &id)
@@ -606,7 +606,7 @@ pub async fn update(
     Path(id): Path<String>,
     Json(req): Json<UpdatePolicyReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
 
     if let Some(d) = req.duration_seconds {
@@ -739,7 +739,7 @@ pub async fn set_public(
     Path(id): Path<String>,
     Json(req): Json<SetPublicReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::set_policy_public(&state.db, &id, req.public).await?;
     let _ = repo::insert_audit(
@@ -933,7 +933,7 @@ pub async fn set_tip(
     Path(id): Path<String>,
     Json(req): Json<SetTipReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "policies:write").await?;
     let (ip, ua) = request_context(&headers);
     if req.tip_pct_bps < 0 || req.tip_pct_bps > 10_000 {
         return Err(AppError::BadRequest(
@@ -992,7 +992,7 @@ pub async fn list_tips(
     headers: HeaderMap,
     Query(q): Query<ListTipsQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "policies:read").await?;
     let entries = repo::list_tip_attempts(
         &state.db,
         q.license_id.as_deref(),

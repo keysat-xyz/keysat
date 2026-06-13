@@ -20,8 +20,8 @@ use keysat::api::AppState;
 use keysat::config::Config;
 use keysat::license_self::Tier;
 use keysat::payment::{
-    CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceStatus,
-    ProviderKind, ProviderWebhookEvent,
+    CreateInvoiceParams, CreatedInvoiceHandle, PaymentProvider, ProviderInvoiceSnapshot,
+    ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
 };
 use keysat::subscriptions;
 use serde_json::{json, Value};
@@ -133,8 +133,11 @@ impl PaymentProvider for MockProvider {
             checkout_url: format!("http://mock.test/checkout/{n}"),
         })
     }
-    async fn get_invoice_status(&self, _id: &str) -> Result<ProviderInvoiceStatus> {
-        Ok(ProviderInvoiceStatus::Pending)
+    async fn get_invoice_status(&self, _id: &str) -> Result<ProviderInvoiceSnapshot> {
+        Ok(ProviderInvoiceSnapshot {
+            status: ProviderInvoiceStatus::Pending,
+            amount: None,
+        })
     }
     fn validate_webhook(&self, _h: &HeaderMap, _b: &[u8]) -> Result<ProviderWebhookEvent> {
         anyhow::bail!("not exercised by renewal-worker tests")

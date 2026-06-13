@@ -124,7 +124,7 @@ pub async fn admin_status(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> AppResult<axum::Json<serde_json::Value>> {
-    crate::api::admin::require_admin(&state, &headers)?;
+    crate::api::admin::require_scope(&state, &headers, "tier:read").await?;
     let tier = current(&state).await;
     let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM products")
         .fetch_one(&state.db)

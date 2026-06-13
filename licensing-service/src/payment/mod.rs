@@ -18,7 +18,8 @@
 //!
 //! - `kind()`         — provider identity, for logs / audit / admin UI
 //! - `create_invoice` — make a hosted-checkout session, return a URL
-//! - `get_invoice_status` — for the reconcile loop (webhook misses)
+//! - `get_invoice_status` — authoritative status + amount, for the reconcile
+//!   loop (webhook misses) and the webhook settle-confirmation gate
 //! - `validate_webhook` — provider-specific signature scheme + parse
 //! - `pay_lightning_invoice` — for the tip-recipient flow; default impl
 //!   returns a "not supported" error so providers without a Lightning
@@ -280,6 +281,23 @@ pub enum ProviderInvoiceStatus {
     Invalid,
 }
 
+/// The provider's current view of an invoice: its `status` plus the amount
+/// the provider has the invoice denominated for. Returned by
+/// `PaymentProvider::get_invoice_status`.
+///
+/// `amount` is the price the provider has on record for the invoice (what we
+/// asked it to charge), normalized to `SAT` when the provider used a Bitcoin
+/// unit. It is `None` when the response carried no parseable amount/currency.
+/// `status` is the load-bearing settle gate; `amount` feeds only the
+/// **advisory** settle-amount tripwire in `api::webhook` / `reconcile` —
+/// callers treat `None` as "no opinion" and MUST NOT gate issuance on it.
+/// See docs/guides/payments.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInvoiceSnapshot {
+    pub status: ProviderInvoiceStatus,
+    pub amount: Option<Money>,
+}
+
 /// Parsed webhook event. Only the kinds Keysat actually acts on are
 /// modeled; everything else falls into `Other` and is ignored.
 #[derive(Debug, Clone)]
@@ -355,7 +373,7 @@ pub trait PaymentProvider: Send + Sync + Any {
     async fn get_invoice_status(
         &self,
         provider_invoice_id: &str,
-    ) -> Result<ProviderInvoiceStatus>;
+    ) -> Result<ProviderInvoiceSnapshot>;
 
     /// Verify and parse a webhook delivery. Implementations are
     /// responsible for reading whatever signature header their provider

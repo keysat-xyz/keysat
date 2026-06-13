@@ -22,7 +22,7 @@
 //! callback path uses the CSRF `state` token to tie a callback back to the
 //! issuing operator session.
 
-use crate::api::{admin::require_admin, AppState};
+use crate::api::{admin::{require_admin, require_scope}, AppState};
 use crate::btcpay::client::{self as btcpay_client, BtcpayClient};
 use crate::btcpay::config as btcpay_cfg;
 use crate::error::{AppError, AppResult};
@@ -243,7 +243,7 @@ pub async fn payment_methods(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "payment_providers:read").await?;
     let default = crate::merchant_profiles::require_default(&state.db).await?;
     let rows = crate::db::repo::list_payment_providers_for_profile(&state.db, &default.id)
         .await?;
@@ -271,7 +271,7 @@ pub async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "payment_providers:read").await?;
     let default = crate::merchant_profiles::get_default(&state.db).await?;
     let row = match &default {
         Some(profile) => {

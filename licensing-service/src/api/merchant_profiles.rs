@@ -4,7 +4,7 @@
 //! `crate::merchant_profiles` and the rail-preference repo helpers.
 //! Consumed by the new Merchant Profiles section of the admin UI.
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::merchant_profiles::{
@@ -77,7 +77,7 @@ pub async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "merchant_profiles:read").await?;
     let profiles = merchant_profiles::list(&state.db).await?;
     let mut out: Vec<Value> = Vec::with_capacity(profiles.len());
     for p in &profiles {
@@ -94,7 +94,7 @@ pub async fn get(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "merchant_profiles:read").await?;
     let profile = merchant_profiles::get(&state.db, &id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("merchant profile {id}")))?;
@@ -125,7 +125,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(req): Json<NewMerchantProfile>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "merchant_profiles:write").await?;
     let (ip, ua) = request_context(&headers);
     let created = merchant_profiles::create(&state, req).await?;
     let _ = crate::db::repo::insert_audit(
@@ -150,7 +150,7 @@ pub async fn update(
     Path(id): Path<String>,
     Json(patch): Json<MerchantProfileUpdate>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "merchant_profiles:write").await?;
     let (ip, ua) = request_context(&headers);
     let updated = merchant_profiles::update(&state.db, &id, patch).await?;
     let _ = crate::db::repo::insert_audit(
@@ -175,7 +175,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "merchant_profiles:write").await?;
     let (ip, ua) = request_context(&headers);
     merchant_profiles::delete(&state.db, &id).await?;
     let _ = crate::db::repo::insert_audit(
@@ -200,7 +200,7 @@ pub async fn set_default(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "merchant_profiles:write").await?;
     let (ip, ua) = request_context(&headers);
     merchant_profiles::set_default(&state.db, &id).await?;
     let _ = crate::db::repo::insert_audit(
@@ -237,7 +237,7 @@ pub async fn set_rail_preference(
     Path((profile_id, rail)): Path<(String, String)>,
     Json(req): Json<SetRailPreferenceReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "merchant_profiles:write").await?;
     let (ip, ua) = request_context(&headers);
 
     // Validate the rail name.
@@ -311,7 +311,7 @@ pub async fn clear_rail_preference(
     headers: HeaderMap,
     Path((profile_id, rail)): Path<(String, String)>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "merchant_profiles:write").await?;
     let (ip, ua) = request_context(&headers);
 
     let parsed_rail = crate::payment::Rail::parse(&rail).ok_or_else(|| {

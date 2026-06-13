@@ -83,9 +83,9 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
             },
         };
         match provider.get_invoice_status(&inv.btcpay_invoice_id).await {
-            Ok(status) => {
+            Ok(snapshot) => {
                 use crate::payment::ProviderInvoiceStatus::*;
-                let new_status = match status {
+                let new_status = match snapshot.status {
                     Settled => "settled",
                     Expired => "expired",
                     Invalid => "invalid",
@@ -124,6 +124,16 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
                 }
 
                 if new_status == "settled" {
+                    // Same advisory amount tripwire the webhook path applies
+                    // (see crate::api::webhook::audit_settle_amount). Never
+                    // blocks issuance — logs + audits any amount/currency
+                    // drift from what we charged.
+                    crate::api::webhook::audit_settle_amount(
+                        state,
+                        &inv,
+                        snapshot.amount.as_ref(),
+                    )
+                    .await;
                     if let Err(e) = ensure_license(state, &inv).await {
                         tracing::warn!(
                             error = %e,

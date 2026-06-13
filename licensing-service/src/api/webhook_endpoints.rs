@@ -9,7 +9,7 @@
 //! they've stored it somewhere safe, later reads return the secret masked.
 //! (If they lose it, they can rotate by deleting + recreating the endpoint.)
 
-use crate::api::admin::{request_context, require_admin};
+use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::db::repo;
 use crate::error::AppResult;
@@ -48,7 +48,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(req): Json<CreateEndpointReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "webhooks:write").await?;
     let (ip, ua) = request_context(&headers);
     let secret = req.secret.unwrap_or_else(generate_secret);
     let ep = repo::create_webhook_endpoint(
@@ -96,7 +96,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(q): Query<ListEndpointsQuery>,
 ) -> AppResult<Json<Value>> {
-    require_admin(&state, &headers)?;
+    require_scope(&state, &headers, "webhooks:read").await?;
     let rows = repo::list_webhook_endpoints(&state.db, q.include_secret).await?;
     Ok(Json(json!({ "endpoints": rows })))
 }
@@ -112,7 +112,7 @@ pub async fn set_active(
     Path(id): Path<String>,
     Json(req): Json<SetActiveReq>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "webhooks:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::set_webhook_active(&state.db, &id, req.active).await?;
     let _ = repo::insert_audit(
@@ -135,7 +135,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let actor_hash = require_admin(&state, &headers)?;
+    let actor_hash = require_scope(&state, &headers, "webhooks:write").await?;
     let (ip, ua) = request_context(&headers);
     repo::delete_webhook_endpoint(&state.db, &id).await?;
     let _ = repo::insert_audit(

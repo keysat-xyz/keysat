@@ -131,14 +131,21 @@ async fn handle_inner(
     // not the replayed one). BTCPay is HMAC-verified upstream and is settled
     // already, so this is cheap belt-and-suspenders there. On a provider
     // error we fail closed — the reconcile loop re-confirms on its next tick.
-    if new_status == "settled" {
+    // `Some` once a settle is confirmed: the provider-reported amount, fed to
+    // the advisory tripwire below (after the local invoice is loaded). `None`
+    // for non-settle events and when the provider reports no parseable amount.
+    let confirmed_amount = if new_status == "settled" {
         match provider.get_invoice_status(&provider_invoice_id).await {
-            Ok(crate::payment::ProviderInvoiceStatus::Settled) => {}
-            Ok(other) => {
+            Ok(snapshot)
+                if snapshot.status == crate::payment::ProviderInvoiceStatus::Settled =>
+            {
+                snapshot.amount
+            }
+            Ok(snapshot) => {
                 tracing::warn!(
                     provider = provider.kind().as_str(),
                     provider_invoice_id = %provider_invoice_id,
-                    provider_status = ?other,
+                    provider_status = ?snapshot.status,
                     "settle webhook NOT confirmed by provider API; refusing to settle/issue"
                 );
                 return Ok(StatusCode::OK);
@@ -159,7 +166,9 @@ async fn handle_inner(
                 return Ok(StatusCode::OK);
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Persist status.
     repo::update_invoice_status(&state.db, &provider_invoice_id, new_status).await?;
@@ -198,6 +207,12 @@ async fn handle_inner(
         );
         return Ok(StatusCode::OK);
     };
+
+    // Advisory settle-amount tripwire. The Settled gate above already ensures
+    // the provider considers this paid in full, so this never blocks issuance
+    // — it logs + audits if the provider's recorded amount/currency ever
+    // drifts from what we charged. See docs/guides/payments.md.
+    audit_settle_amount(&state, &invoice, confirmed_amount.as_ref()).await;
 
     // Tier-change branch: this settled invoice may be a tier upgrade
     // (recorded by POST /v1/upgrade or the future admin-change-tier
@@ -238,6 +253,65 @@ async fn handle_inner(
     let _license_id = issue_license_for_invoice(&state, &invoice).await?;
 
     Ok(StatusCode::OK)
+}
+
+/// Advisory settle-amount tripwire, shared by the webhook handler and the
+/// reconcile loop. The Settled gate at both call sites already guarantees the
+/// provider considers the invoice paid in full (BTCPay won't settle an unpaid
+/// invoice; Zaprite maps `UNDERPAID` → `Pending`), so this NEVER blocks
+/// issuance. It exists to surface drift: if the provider's recorded amount or
+/// currency ever differs from what we charged — a charge-vs-record bug on our
+/// side, or a currency-confusion bug — we log a warning and write an
+/// `invoice.amount_mismatch` audit row, then let issuance proceed.
+///
+/// `confirmed` is `None` ("no opinion") when the provider response carried no
+/// parseable amount; in that case the tripwire is skipped. Every invoice we
+/// create is SAT-denominated (`purchase.rs` passes `Money::sats`), so the
+/// expected value is `invoice.amount_sats` in `SAT`.
+pub(crate) async fn audit_settle_amount(
+    state: &AppState,
+    invoice: &crate::models::Invoice,
+    confirmed: Option<&crate::payment::Money>,
+) {
+    let Some(paid) = confirmed else { return };
+    // The comparison basis is `invoice.amount_sats` (SAT), which equals what we
+    // told the provider to charge ONLY for SAT-denominated orders — one-shot
+    // purchases and SAT subscriptions (`purchase.rs` / `upgrades` pass
+    // `Money::sats`). Fiat-priced subscription RENEWALS (`subscriptions.rs`)
+    // create the order in the listed fiat currency, where `amount_sats` is not
+    // the charged amount, so there's no clean SAT comparison — skip those (the
+    // `Settled` gate already guarantees paid-in-full). A non-SAT provider
+    // amount therefore means "no comparable basis", not a mismatch.
+    if paid.currency != "SAT" {
+        return;
+    }
+    if paid.amount == invoice.amount_sats {
+        return;
+    }
+    tracing::warn!(
+        invoice_id = %invoice.id,
+        provider_invoice_id = %invoice.btcpay_invoice_id,
+        expected_amount_sats = invoice.amount_sats,
+        provider_amount_sats = paid.amount,
+        "settled invoice amount does NOT match the recorded charge; issuing \
+         anyway (advisory) — investigate provider config or a charge-vs-record bug"
+    );
+    let _ = repo::insert_audit(
+        &state.db,
+        "system",
+        None,
+        "invoice.amount_mismatch",
+        Some("invoice"),
+        Some(&invoice.id),
+        None,
+        None,
+        &serde_json::json!({
+            "provider_invoice_id": invoice.btcpay_invoice_id,
+            "expected_amount_sats": invoice.amount_sats,
+            "provider_amount_sats": paid.amount,
+        }),
+    )
+    .await;
 }
 
 /// Shared issuance path — used by both the webhook handler and the reconcile
