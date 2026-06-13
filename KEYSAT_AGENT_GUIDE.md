@@ -170,7 +170,7 @@ Scope required: `licenses:write` (any role except `read-only`).
 curl -X POST $KS/v1/admin/licenses/$LICENSE_ID/revoke \
   -H "Authorization: Bearer ks_..." \
   -H "Content-Type: application/json" \
-  -d '{"reason":"refund issued"}'
+  -d '{"reason":"customer request"}'
 ```
 
 Idempotent. The next online validate from the buyer's app returns `reason: revoked`.
