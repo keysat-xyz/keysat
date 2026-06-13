@@ -15,13 +15,15 @@ export const manifest = setupManifest({
   id: 'keysat',
   title: 'Keysat Licensing',
   license: 'LicenseRef-Keysat-1.0',
-  packageRepo: 'https://github.com/keysat-xyz/keysat-startos',
+  // packageRepo (the s9pk wrapper source) and upstreamRepo (the daemon source)
+  // are the same URL: the StartOS wrapper and the Rust daemon share one monorepo.
+  packageRepo: 'https://github.com/keysat-xyz/keysat',
   upstreamRepo: 'https://github.com/keysat-xyz/keysat',
   marketingUrl: 'https://keysat.xyz',
   donationUrl: null,
   docsUrls: [
     'https://github.com/keysat-xyz/keysat/blob/main/README.md',
-    'https://github.com/keysat-xyz/keysat/blob/main/docs/INTEGRATION.md',
+    'https://github.com/keysat-xyz/keysat/blob/main/KEYSAT_INTEGRATION.md',
   ],
   description: { short, long },
   // A single data volume holds the SQLite database (which in turn holds the

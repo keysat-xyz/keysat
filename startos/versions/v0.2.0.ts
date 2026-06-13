@@ -1,27 +1,8 @@
-// Draft of the v0.2.0 milestone version entry.
-//
-// NOT YET WIRED INTO `versions/index.ts` — this file sits ready to
-// use when we cut v0.2.0:0 from the alpha-iteration line. To
-// activate:
-//   1. In `versions/index.ts`:
-//        import { v0_2_0 } from './v0.2.0'
-//        export const versions = VersionGraph.of({
-//          current: v0_2_0,
-//          other: [v0_1_0],   // ← so installs on 0.1.0:N can upgrade
-//        })
-//   2. Build the .s9pk (`make x86`).
-//   3. Publish via `~/.keysat/publish.sh` (the version-changed gate
-//      will fire because `0.2.0:0` differs from the recorded
-//      `0.1.0:N`).
-//
-// Why this draft exists separately:
-// - The cut is an irreversible release decision for already-installed
-//   operators (downgrade paths exist in StartOS but they're sticky).
-// - Wiring it in changes how StartOS computes the upgrade dialog
-//   shown to operators on registry refresh — best to QA the
-//   release-notes content in this file before flipping the switch.
-// - Lets us write the v0.2.0 release notes carefully and then ship
-//   them all at once, rather than amending mid-build.
+// The v0.2.0 milestone version entry — the current, active version on
+// the v0.2 line. Wired into `versions/index.ts` as `current: v0_2_0`,
+// with `v0_1_0` in `other` so installs on 0.1.0:N can upgrade. Routine
+// wrapper updates bump the downstream revision here (`0.2.0:N`) before
+// each build/publish; see startos-packaging.md.
 //
 // Version-string format reminder: ExVer is `<upstream>:<downstream>`.
 // The `<upstream>` bump from 0.1.0 → 0.2.0 marks the milestone; the

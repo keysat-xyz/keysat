@@ -1,8 +1,9 @@
 // Action: reveal the auto-generated admin API key.
 //
-// The operator rarely needs this — every other action in StartOS already
-// carries the key for them — but it's useful if they want to script against
-// the admin HTTP API directly.
+// The operator needs this on first install to sign into the admin web UI
+// (until they set a web UI password); afterward it's mainly for scripting
+// the admin HTTP API directly, since every other StartOS action already
+// carries the key for them.
 //
 // The BTCPay webhook secret used to live in the StartOS store; it now lives
 // inside the daemon's own SQLite database, generated automatically during
@@ -35,9 +36,11 @@ export const showCredentials = sdk.Action.withoutInput(
       version: '1',
       title: 'Admin API key',
       message:
-        `Used as 'Authorization: Bearer <key>' against /v1/admin/*. All ` +
-        `StartOS actions already supply this for you — only export it if ` +
-        `you intend to script against the admin API from outside the box.`,
+        `This is your admin API key — the 'Authorization: Bearer <key>' ` +
+        `credential for /v1/admin/*. Use it to sign into the admin web UI on ` +
+        `first install (until you set a web UI password). Every StartOS action ` +
+        `already supplies it for you, so you only need to export it to script ` +
+        `the admin API yourself.`,
       result: {
         type: 'single',
         value: storeData.admin_api_key,

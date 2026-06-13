@@ -6,12 +6,10 @@
 // writes it to /data/keysat-license.txt, and swaps its runtime tier
 // to Licensed without a restart.
 //
-// In permissive builds (the default for local `make x86`) the daemon
-// will start regardless and this action just records the tier. In
-// enforce builds (compiled with KEYSAT_LICENSE_ENFORCE=1, used for
-// the marketplace .s9pk) the daemon refuses to start without a valid
-// license, and this action is the bootstrap path: install Keysat,
-// run this action with your activation key, then start the service.
+// The daemon always boots regardless of license state (enforce mode was
+// retired — see license_self.rs::check_at_boot). With no valid self-license
+// it runs at the free Creator tier with Creator caps; this action records
+// the license and lifts those caps without a restart.
 
 import { sdk } from '../sdk'
 import { store } from '../fileModels/store'
@@ -36,9 +34,9 @@ export const activateLicense = sdk.Action.withInput(
   async () => ({
     name: 'Activate Keysat license',
     description:
-      'Activate this Keysat install. Required for marketplace builds; ' +
-      'optional but recommended for source-built dev installs (signals support, ' +
-      'and lets the admin UI show your tier).',
+      'Activate this Keysat install. Optional — Keysat runs at the free ' +
+      'Creator tier without it. Activating lifts the Creator caps, unlocks ' +
+      'recurring billing + Zaprite payments, and shows your tier in the admin UI.',
     warning: null,
     allowedStatuses: 'only-running',
     group: 'License',
@@ -80,7 +78,6 @@ export const activateLicense = sdk.Action.withInput(
         product_id?: string
         expires_at?: number
         entitlements?: string[]
-        mode: string
       }
       message: string
     }
@@ -132,7 +129,6 @@ export const showLicenseStatus = sdk.Action.withoutInput(
       expires_at?: number
       entitlements?: string[]
       reason?: string
-      mode: string
     }
 
     if (j.tier === 'licensed') {
@@ -146,20 +142,19 @@ export const showLicenseStatus = sdk.Action.withoutInput(
         message:
           `License id: ${j.license_id}\n` +
           `Expires: ${exp}\n` +
-          `Entitlements: ${ents}\n` +
-          `Build mode: ${j.mode}`,
+          `Entitlements: ${ents}`,
         result: null,
       }
     } else {
       return {
         version: '1',
-        title: 'Unlicensed',
+        title: 'Creator (free tier)',
         message:
-          `Reason: ${j.reason || 'no license configured'}\n` +
-          `Build mode: ${j.mode}\n\n` +
-          (j.mode === 'enforce'
-            ? 'This is a marketplace build that requires a valid license to run. Use the "Activate Keysat license" action to bootstrap.'
-            : 'This is a permissive (dev) build. The daemon will keep running. Activate a license to see your tier reflected here.'),
+          `This install is running at the free Creator tier.\n` +
+          `Reason: ${j.reason || 'no license configured'}\n\n` +
+          `Creator caps: 5 products, 5 policies per product, 10 active ` +
+          `discount codes. Activating a license lifts these caps and unlocks ` +
+          `recurring billing + Zaprite payments (the "Activate Keysat license" action).`,
         result: null,
       }
     }
