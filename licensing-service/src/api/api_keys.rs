@@ -5,10 +5,9 @@
 //! script a credential that does only what it needs to. Operator-friendly
 //! flow:
 //!
-//!   1. Operator mints a new key via `POST /v1/admin/api-keys`, picking a role
-//!      from a fixed list (Read-only / License issuer / Support / Full admin).
-//!      (A clickable Settings → API keys panel in the admin SPA is planned;
-//!      until then keys are minted through the API.)
+//!   1. Operator mints a new key via the Settings → "Scoped API keys" panel
+//!      in the admin SPA (or directly via `POST /v1/admin/api-keys`), picking a
+//!      role from a fixed list (Read-only / License issuer / Support / Full admin).
 //!   2. The create response returns the raw token ONCE. The token never
 //!      appears in any response afterward — only its sha256 hash is stored.
 //!   3. Agent uses `Authorization: Bearer <token>` like the master key. Each
