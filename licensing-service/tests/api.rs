@@ -3685,3 +3685,155 @@ async fn merchant_profile_provider_resolution_queries_round_trip() {
     assert_eq!(row_fallback.id, prov);
 }
 
+/// The product → merchant-profile write path. The resolver
+/// (`get_merchant_profile_for_product`) already reads
+/// `products.merchant_profile_id`, but nothing wrote it until
+/// `set_product_merchant_profile` landed. Drives create (NULL → default),
+/// attach (resolves to the chosen profile), and clear (back to default),
+/// plus the bad-id guard.
+#[tokio::test]
+async fn product_merchant_profile_write_path_round_trips() {
+    let (state, _tmp) = make_test_state().await;
+    let now = "2026-06-15T00:00:00Z";
+
+    let default = repo::get_default_merchant_profile(&state.db)
+        .await
+        .expect("get_default_merchant_profile")
+        .expect("a default profile exists post-migration");
+
+    // Fresh product: no profile id set. The repo read returns None (the
+    // column is NULL); the production resolver `for_product` applies the
+    // default-profile fallback.
+    let product = repo::create_product(&state.db, "profile-write", "Profile Write", "", 1_000, &json!({}))
+        .await
+        .expect("create_product");
+    assert_eq!(product.merchant_profile_id, None);
+    assert!(
+        repo::get_merchant_profile_for_product(&state.db, &product.id)
+            .await
+            .expect("get_merchant_profile_for_product")
+            .is_none(),
+        "a NULL-profile product yields no direct match"
+    );
+    let resolved = keysat::merchant_profiles::for_product(&state, &product.id)
+        .await
+        .expect("for_product falls back to default");
+    assert_eq!(resolved.id, default.id);
+
+    // Attach to a second profile → reads back + resolves to that profile.
+    let p2 = Uuid::new_v4().to_string();
+    repo::create_merchant_profile(
+        &state.db, &p2, "Second Biz", None, None, None, None, None, false, now,
+    )
+    .await
+    .expect("create_merchant_profile");
+    let attached = repo::set_product_merchant_profile(&state.db, &product.id, Some(&p2))
+        .await
+        .expect("set_product_merchant_profile attach");
+    assert_eq!(attached.merchant_profile_id.as_deref(), Some(p2.as_str()));
+    let resolved = keysat::merchant_profiles::for_product(&state, &product.id)
+        .await
+        .expect("for_product resolves to attached profile");
+    assert_eq!(resolved.id, p2);
+
+    // Clear back to NULL → resolver falls back to the default again.
+    let cleared = repo::set_product_merchant_profile(&state.db, &product.id, None)
+        .await
+        .expect("set_product_merchant_profile clear");
+    assert_eq!(cleared.merchant_profile_id, None);
+    let resolved = keysat::merchant_profiles::for_product(&state, &product.id)
+        .await
+        .expect("for_product falls back to default after clear");
+    assert_eq!(resolved.id, default.id);
+
+    // Bad profile id is rejected with NotFound, not an FK-violation 500.
+    let err = repo::set_product_merchant_profile(&state.db, &product.id, Some("does-not-exist"))
+        .await
+        .expect_err("bad profile id is rejected");
+    assert!(matches!(err, keysat::error::AppError::NotFound(_)), "got {err:?}");
+}
+
+/// HTTP-layer coverage for the product → merchant-profile wiring: the
+/// thin create/update handler arms (Some / Some(None) / Some(Some(bad)))
+/// that the repo-level round-trip test above can't reach. Runtime-prepared
+/// SQL means a typo in those arms only surfaces at execution.
+#[tokio::test]
+async fn admin_product_merchant_profile_endpoints() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Second profile (repo-direct bypasses the Creator tier cap).
+    let p2 = Uuid::new_v4().to_string();
+    repo::create_merchant_profile(
+        &state.db, &p2, "Second Biz", None, None, None, None, None, false,
+        "2026-06-15T00:00:00Z",
+    )
+    .await
+    .expect("create_merchant_profile");
+
+    // Create with a valid profile id → 200, echoed back.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({"slug": "mp-create", "name": "MP Create", "price_sats": 1000, "merchant_profile_id": p2})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["merchant_profile_id"], json!(p2));
+    let created_id = body["id"].as_str().expect("product id").to_string();
+
+    // PATCH clear (merchant_profile_id: null) → 200, field cleared.
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/products/{created_id}"),
+        &[("authorization", &auth)],
+        Some(json!({"merchant_profile_id": null})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["merchant_profile_id"], json!(null));
+
+    // PATCH set back to the valid profile → 200.
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/products/{created_id}"),
+        &[("authorization", &auth)],
+        Some(json!({"merchant_profile_id": p2})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["merchant_profile_id"], json!(p2));
+
+    // PATCH to a nonexistent profile → 404.
+    let req = build_request(
+        "PATCH",
+        &format!("/v1/admin/products/{created_id}"),
+        &[("authorization", &auth)],
+        Some(json!({"merchant_profile_id": "nope"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Create with a nonexistent profile → 404. The product row is created
+    // before the profile is attached (same post-write order as the
+    // entitlements catalog), so it persists with a NULL profile — benign:
+    // it resolves to the default and the operator can reattach or delete.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({"slug": "mp-bad", "name": "MP Bad", "price_sats": 1000, "merchant_profile_id": "nope"})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let orphan = repo::get_product_by_slug(&state.db, "mp-bad")
+        .await
+        .expect("get_product_by_slug")
+        .expect("product persisted despite the profile-404");
+    assert_eq!(orphan.merchant_profile_id, None);
+}
+

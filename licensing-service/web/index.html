@@ -1574,11 +1574,32 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   }
 
   // -------- Products --------
+  // Merchant-profile picker for the product create/edit forms. Returns
+  // null when the operator runs 0 or 1 profile — there's nothing to
+  // choose, and the product resolves to the default profile. With >1
+  // profile it returns { element, value() }; `selectedId` pre-selects a
+  // profile, falling back to the default when null.
+  function profileSelectField(profiles, selectedId) {
+    if (!profiles || profiles.length <= 1) return null
+    const sel = el('select', { class: 'input', name: 'p_merchant_profile' },
+      profiles.map((pr) => el('option', { value: pr.id },
+        pr.name + (pr.is_default ? ' (default)' : ''))))
+    const fallback = (profiles.find((pr) => pr.is_default) || profiles[0]).id
+    sel.value = selectedId || fallback
+    const element = el('div', { style: 'margin-top:18px; padding-top:14px; border-top:1px dashed var(--border-1)' }, [
+      el('label', { style: 'display:block; font-weight:600; font-size:13px; margin:0 0 4px' }, 'Merchant profile'),
+      sel,
+      el('div', { class: 'muted', style: 'font-size:12px; margin-top:4px' },
+        'Which business this product sells under — sets the payment provider and branding buyers see at checkout.'),
+    ])
+    return { element, value: () => sel.value }
+  }
+
   // Edit-product modal. Opens when the operator clicks Edit on a product
-  // row. Mutable: name, description, price (currency + value). Slug is
-  // intentionally not editable (it's part of the public buy URL —
-  // changing it would break bookmarks).
-  function openEditProduct(p) {
+  // row. Mutable: name, description, price (currency + value), merchant
+  // profile. Slug is intentionally not editable (it's part of the public
+  // buy URL — changing it would break bookmarks).
+  function openEditProduct(p, profiles) {
     const overlay = el('div', {
       style: 'position:fixed; inset:0; background:rgba(14,31,51,0.55); z-index:9999; ' +
         'display:flex; align-items:center; justify-content:center; padding:20px;',
@@ -1586,6 +1607,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const nameField = formInput('e_p_name', 'Display name', { value: p.name || '', required: true })
     const descField = formInput('e_p_description', 'Description', { textarea: true, value: p.description || '' })
     const editCatalog = catalogEditor(p.entitlements_catalog || null)
+    const editProfile = profileSelectField(profiles, p.merchant_profile_id || null)
 
     // Currency-aware price inputs. For SAT-currency products, show
     // the integer sat amount. For USD/EUR, render the cents value
@@ -1643,6 +1665,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       el('div', { style: 'margin-top:18px; padding-top:14px; border-top:1px dashed var(--border-1)' }, [
         editCatalog.element,
       ]),
+      editProfile && editProfile.element,
       status,
       el('div', { style: 'display:flex; gap:10px; margin-top:14px;' }, [
         el('button', { class: 'btn primary', onclick: async function () {
@@ -1663,6 +1686,9 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
             // the server treats null as "set to NULL", absent as
             // "leave alone".
             body.entitlements_catalog = editCatalog.read()
+            // Only present when >1 profile; always a concrete id when
+            // shown, so this is a Some(Some(id)) reassignment server-side.
+            if (editProfile) body.merchant_profile_id = editProfile.value()
             await api('/v1/admin/products/' + p.id, { method: 'PATCH', body })
             overlay.remove()
             routes.products()
@@ -1690,6 +1716,16 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const tierStatus = await loadTierStatus({ forceRefresh: true })
     const gfBanner = grandfatherBanner(tierStatus, 'products', 'products')
     if (gfBanner) target.appendChild(gfBanner)
+
+    // Merchant profiles drive the optional profile picker on the create
+    // + edit forms (rendered only when >1 profile exists). Non-fatal on
+    // error: an empty list just hides the picker, and products resolve
+    // to the default profile.
+    let profiles = []
+    try {
+      const pj = await api('/v1/admin/merchant-profiles')
+      profiles = (pj && pj.profiles) || []
+    } catch (e) { profiles = [] }
 
     // Create form. Currency picker swaps the price-input units in
     // place: SAT → integer sats, USD/EUR → dollar/euro amount which
@@ -1721,6 +1757,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       }
     })
     const createCatalog = catalogEditor(null)
+    const createProfile = profileSelectField(profiles, null)
     const create = el('details', { class: 'disclosure' }, [
       el('summary', null, 'Create a new product'),
       el('div', { class: 'body' }, [
@@ -1750,6 +1787,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         el('div', { style: 'margin-top:18px; padding-top:14px; border-top:1px dashed var(--border-1)' }, [
           createCatalog.element,
         ]),
+        createProfile && createProfile.element,
         // Pre-check warning when the operator is at cap-1 (or already
         // over) for products. Renders inline above the submit so they
         // know what to expect before clicking.
@@ -1781,6 +1819,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
                 metadata: {},
               }
               if (catalog) body.entitlements_catalog = catalog
+              if (createProfile) body.merchant_profile_id = createProfile.value()
               await api('/v1/admin/products', { method: 'POST', body })
               status.replaceWith(ok('Created. Reloading…'))
               setTimeout(routes.products, 600)
@@ -1838,7 +1877,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
         el('td', null, el('div', { class: 'actions-row' }, [
           el('button', {
             class: 'btn sm secondary',
-            onclick: function () { openEditProduct(p) },
+            onclick: function () { openEditProduct(p, profiles) },
           }, 'Edit'),
           el('button', {
             class: 'btn sm danger',

@@ -34,6 +34,12 @@ pub struct Product {
     /// behavior); operators can opt-in by adding rows.
     #[serde(default)]
     pub entitlements_catalog: Option<Vec<EntitlementDef>>,
+    /// Merchant profile this product belongs to (migration 0020). None
+    /// resolves to the default profile (back-compat for rows created
+    /// before the operator ran more than one profile). Set via the admin
+    /// product form when >1 profile exists.
+    #[serde(default)]
+    pub merchant_profile_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

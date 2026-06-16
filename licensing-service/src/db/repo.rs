@@ -14,10 +14,10 @@ use uuid::Uuid;
 
 pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Vec<Product>> {
     let q = if only_active {
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
          FROM products WHERE active = 1 ORDER BY name"
     } else {
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
          FROM products ORDER BY name"
     };
     let rows = sqlx::query(q).fetch_all(pool).await?;
@@ -26,7 +26,7 @@ pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Ve
 
 pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Option<Product>> {
     let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
          FROM products WHERE slug = ?",
     )
     .bind(slug)
@@ -37,7 +37,7 @@ pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Opt
 
 pub async fn get_product_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Product>> {
     let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, created_at, updated_at
+        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
          FROM products WHERE id = ?",
     )
     .bind(id)
@@ -301,6 +301,41 @@ pub async fn set_product_entitlements_catalog(
         .ok_or_else(|| AppError::NotFound(format!("product {product_id}")))
 }
 
+/// Attach a product to a merchant profile (migration 0020). Pass
+/// `Some(profile_id)` to set it, `None` to clear it (the product then
+/// resolves to the default profile). The target profile is validated to
+/// exist first so a bad id returns a clean 404 rather than surfacing as
+/// a raw foreign-key-violation 500.
+pub async fn set_product_merchant_profile(
+    pool: &SqlitePool,
+    product_id: &str,
+    merchant_profile_id: Option<&str>,
+) -> AppResult<Product> {
+    if let Some(profile_id) = merchant_profile_id {
+        if get_merchant_profile_by_id(pool, profile_id).await?.is_none() {
+            return Err(AppError::NotFound(format!(
+                "merchant profile {profile_id}"
+            )));
+        }
+    }
+    let now = Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE products SET merchant_profile_id = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(merchant_profile_id)
+    .bind(&now)
+    .bind(product_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        return Err(AppError::NotFound(format!("product {product_id}")));
+    }
+    get_product_by_id(pool, product_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("product {product_id}")))
+}
+
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
     let metadata_json: String = row.try_get("metadata_json")?;
     let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap_or_default();
@@ -326,6 +361,13 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
         .flatten()
         .and_then(|s| serde_json::from_str::<Vec<crate::models::EntitlementDef>>(&s).ok())
         .filter(|v| !v.is_empty());
+    // merchant_profile_id lands in migration 0020. NULL = resolves to
+    // the default profile (back-compat); try_get is tolerant of older
+    // rows / SELECTs that predate the column.
+    let merchant_profile_id: Option<String> = row
+        .try_get::<Option<String>, _>("merchant_profile_id")
+        .ok()
+        .flatten();
     Ok(Product {
         id: row.try_get("id")?,
         slug: row.try_get("slug")?,
@@ -337,6 +379,7 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
         active: active_int != 0,
         metadata,
         entitlements_catalog,
+        merchant_profile_id,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

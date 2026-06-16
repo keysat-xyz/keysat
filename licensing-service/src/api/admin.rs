@@ -107,6 +107,11 @@ pub struct CreateProductReq {
     /// policies can carry any entitlement string.
     #[serde(default)]
     pub entitlements_catalog: Option<Vec<crate::models::EntitlementDef>>,
+    /// Merchant profile to attach the product to (migration 0020).
+    /// Omit / null to resolve to the default profile. Only meaningful
+    /// when the operator runs more than one profile.
+    #[serde(default)]
+    pub merchant_profile_id: Option<String>,
 }
 
 /// Currencies the admin endpoints accept. Whitelist enforced here so
@@ -209,6 +214,17 @@ pub async fn create_product(
     // is reused for both create + edit.
     let product = if let Some(catalog) = req.entitlements_catalog.as_deref() {
         repo::set_product_entitlements_catalog(&state.db, &product.id, Some(catalog)).await?
+    } else {
+        product
+    };
+    // Attach to a merchant profile if the operator picked one (same
+    // post-write pattern as the entitlements catalog). Omitted = NULL =
+    // resolves to the default profile. A bad profile id 404s here AFTER
+    // the row exists, leaving it with a NULL profile — benign (resolves
+    // to default; reattach or delete). The admin UI only offers existing
+    // profiles, so this is an API-direct edge only.
+    let product = if let Some(profile_id) = req.merchant_profile_id.as_deref() {
+        repo::set_product_merchant_profile(&state.db, &product.id, Some(profile_id)).await?
     } else {
         product
     };
@@ -437,6 +453,20 @@ pub struct UpdateProductReq {
     /// string until the catalog is set again.
     #[serde(default, deserialize_with = "deser_double_option_catalog", skip_serializing_if = "Option::is_none")]
     pub entitlements_catalog: Option<Option<Vec<crate::models::EntitlementDef>>>,
+    /// Reassign the product's merchant profile (migration 0020).
+    /// `Some(Some(id))` attaches, `Some(None)` clears it back to
+    /// default-resolution, omit / absent leaves it unchanged.
+    #[serde(default, deserialize_with = "deser_double_option_profile", skip_serializing_if = "Option::is_none")]
+    pub merchant_profile_id: Option<Option<String>>,
+}
+
+/// Serde adapter for the nullable merchant-profile patch — same
+/// "omitted vs null vs value" three-way distinction as the catalog.
+fn deser_double_option_profile<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(de).map(Some)
 }
 
 /// Serde adapter — distinguishes "field omitted" (None) from
@@ -531,6 +561,16 @@ pub async fn update_product(
         Some(None) => {
             repo::set_product_entitlements_catalog(&state.db, &id, None).await?
         }
+        None => updated,
+    };
+    // Merchant-profile reassignment, same three-way patch as the
+    // catalog: Some(Some) attaches, Some(None) clears to default, None
+    // leaves it untouched.
+    let updated = match &req.merchant_profile_id {
+        Some(Some(profile_id)) => {
+            repo::set_product_merchant_profile(&state.db, &id, Some(profile_id.as_str())).await?
+        }
+        Some(None) => repo::set_product_merchant_profile(&state.db, &id, None).await?,
         None => updated,
     };
     let _ = repo::insert_audit(
