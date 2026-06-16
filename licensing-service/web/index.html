@@ -6618,6 +6618,7 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       el('option', { value: 'read-only' }, 'Read-only — list everything; mutate nothing'),
       el('option', { value: 'license-issuer' }, 'License issuer — read + issue / revoke / change-tier licenses'),
       el('option', { value: 'support' }, 'Support — license issuer + cancel subs + deactivate machines'),
+      el('option', { value: 'merchant-onboard' }, 'Merchant onboard — read + create products / policies + issue licenses (self-serve catalog setup)'),
       el('option', { value: 'full-admin' }, 'Full admin — every scope (use sparingly)'),
     ])
     const status = el('div', { class: 'muted', style: 'margin-top:8px; font-size:12.5px; min-height:18px' }, '')

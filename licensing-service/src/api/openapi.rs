@@ -50,7 +50,7 @@ const SPEC_JSON: &str = r##"{
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Master admin_api_key OR a scoped API key (ks_...). Scoped keys are gated on a role: read-only, license-issuer, support, or full-admin."
+        "description": "Master admin_api_key OR a scoped API key (ks_...). Scoped keys are gated on a role: read-only, license-issuer, support, merchant-onboard, or full-admin."
       }
     },
     "schemas": {
@@ -398,7 +398,7 @@ const SPEC_JSON: &str = r##"{
             "type": "object",
             "properties": {
               "label": { "type": "string", "description": "Operator-friendly name, e.g. 'Recap support bot'" },
-              "role":  { "type": "string", "enum": ["read-only", "license-issuer", "support", "full-admin"] }
+              "role":  { "type": "string", "enum": ["read-only", "license-issuer", "support", "merchant-onboard", "full-admin"] }
             },
             "required": ["label", "role"]
           } } }

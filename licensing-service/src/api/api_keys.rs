@@ -7,7 +7,8 @@
 //!
 //!   1. Operator mints a new key via the Settings → "Scoped API keys" panel
 //!      in the admin SPA (or directly via `POST /v1/admin/api-keys`), picking a
-//!      role from a fixed list (Read-only / License issuer / Support / Full admin).
+//!      role from a fixed list (Read-only / License issuer / Support /
+//!      Merchant onboard / Full admin).
 //!   2. The create response returns the raw token ONCE. The token never
 //!      appears in any response afterward — only its sha256 hash is stored.
 //!   3. Agent uses `Authorization: Bearer <token>` like the master key. Each
@@ -61,6 +62,16 @@ pub enum Role {
     /// Right shape for a customer-support agent that resolves common
     /// requests without touching catalog or settings.
     Support,
+    /// Read-only + catalog *and* license writes: create/edit products,
+    /// define policies/tiers, and issue licenses against them. The
+    /// least-privilege credential for end-to-end self-serve onboarding —
+    /// a merchant (or an integrating agent) standing up a fresh catalog
+    /// via the API without the master key. Deliberately excludes the
+    /// support writes (subs/machines) and every master-only gate
+    /// (settings, tiers, payment connect, key mgmt, signing-key, db).
+    /// Tier caps still bound it: a Creator-tier box stays at 5 products /
+    /// 5 policies-per-product regardless of credential.
+    MerchantOnboard,
     /// Every scope. Equivalent to the master `admin_api_key` for endpoints
     /// that use `require_scope`; still rejected by endpoints that gate on
     /// settings-write or tier-write where the master key is required.
@@ -73,6 +84,7 @@ impl Role {
             Role::ReadOnly => "read-only",
             Role::LicenseIssuer => "license-issuer",
             Role::Support => "support",
+            Role::MerchantOnboard => "merchant-onboard",
             Role::FullAdmin => "full-admin",
         }
     }
@@ -81,6 +93,7 @@ impl Role {
             "read-only" => Some(Role::ReadOnly),
             "license-issuer" => Some(Role::LicenseIssuer),
             "support" => Some(Role::Support),
+            "merchant-onboard" => Some(Role::MerchantOnboard),
             "full-admin" => Some(Role::FullAdmin),
             _ => None,
         }
@@ -102,6 +115,18 @@ impl Role {
                         "licenses:write"
                             | "subscriptions:write"
                             | "machines:write"
+                    )
+            }
+            // Catalog + license writes only. Match scopes EXPLICITLY (never
+            // by `:write` suffix) so this role can never widen into
+            // settings:write / merchant_profiles:write / payment / webhooks
+            // / rates — all of which would otherwise share the suffix. Adding
+            // a write scope here is a deliberate per-string decision.
+            Role::MerchantOnboard => {
+                scope.ends_with(":read")
+                    || matches!(
+                        scope,
+                        "products:write" | "policies:write" | "licenses:write"
                     )
             }
         }
@@ -212,7 +237,8 @@ pub async fn create(
     }
     let role = Role::parse(req.role.trim()).ok_or_else(|| {
         AppError::BadRequest(
-            "role must be one of: read-only, license-issuer, support, full-admin".into(),
+            "role must be one of: read-only, license-issuer, support, merchant-onboard, full-admin"
+                .into(),
         )
     })?;
 

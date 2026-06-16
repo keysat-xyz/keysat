@@ -3449,6 +3449,99 @@ async fn scoped_full_admin_key_manages_catalog() {
     );
 }
 
+/// Merchant-onboard scoped keys can run the full self-serve onboarding chain
+/// with their OWN credential — create a product, define a policy/tier, and
+/// issue a license against it (products:write + policies:write +
+/// licenses:write) — WITHOUT the master key. They must still be denied every
+/// master-only gate (db-info, minting other keys) and the support writes they
+/// don't need (subscriptions:write), which keeps the role least-privilege and
+/// non-escalating.
+#[tokio::test]
+async fn scoped_merchant_onboard_key_onboards_but_not_master() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", mint_scoped_key(&state, "merchant-onboard").await);
+
+    // 1. Create a product — allowed (products:write). Note: the key itself
+    //    creates it, not the master — that's the whole point of the role.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({ "slug": "onboard-prod", "name": "Onboard Prod", "price_sats": 1000 })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::OK,
+        "merchant-onboard must be able to create products"
+    );
+
+    // 2. Define a policy/tier on it — allowed (policies:write). Non-recurring
+    //    so the Creator-tier recurring gate (402) doesn't fire.
+    let req = build_request(
+        "POST",
+        "/v1/admin/policies",
+        &[("authorization", &auth)],
+        Some(json!({
+            "product_slug": "onboard-prod",
+            "name": "Standard",
+            "slug": "standard",
+            "duration_seconds": 0,
+            "max_machines": 1
+        })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::OK,
+        "merchant-onboard must be able to define policies"
+    );
+
+    // 3. Issue a license against it — allowed (licenses:write).
+    let req = build_request(
+        "POST",
+        "/v1/admin/licenses",
+        &[("authorization", &auth)],
+        Some(json!({ "product_slug": "onboard-prod", "policy_slug": "standard" })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::OK,
+        "merchant-onboard must be able to issue licenses"
+    );
+
+    // 4. Master-only gates stay denied — no escalation path.
+    let req = build_request("GET", "/v1/admin/db-info", &[("authorization", &auth)], None);
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "db-info is master-only; merchant-onboard must be denied"
+    );
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({ "label": "tries to elevate", "role": "full-admin" })),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "merchant-onboard must NOT mint other keys (self-elevation guard)"
+    );
+
+    // 5. Support writes it doesn't need stay denied — least-privilege boundary
+    //    on the other side (this is what separates it from the support role).
+    let req = build_request(
+        "POST",
+        "/v1/admin/subscriptions/does-not-exist/cancel",
+        &[("authorization", &auth)],
+        None,
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "merchant-onboard must NOT have subscriptions:write"
+    );
+}
+
 /// Zaprite Connect refuses on Creator-tier (no `zaprite_payments`
 /// entitlement) with 402. Switching the daemon's self-tier to a
 /// Pro-flavored Licensed tier lets the Connect-precheck pass (it then
