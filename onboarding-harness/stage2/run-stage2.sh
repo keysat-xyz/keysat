@@ -2,7 +2,10 @@
 # Stage 2 setup: a sandbox Keysat daemon wired to the regtest BTCPay stack, a
 # scoped key that can BOTH onboard a catalog AND connect a payment provider
 # (merchant-onboard + payment_providers:write), the docs corpus, and a sandbox
-# app — then the agent brief for the buyer-pays journey.
+# app — then the agent brief for the COMBINED journey: gate a paid product
+# (define product + paid tier, integrate the SDK, prove the export is BLOCKED),
+# then prove it end to end (connect BTCPay regtest, a buyer pays, and the
+# PURCHASED license UNLOCKS the gated export).
 #
 # Networking: the daemon binds 0.0.0.0 and registers its BTCPay webhook via
 # host.docker.internal so the BTCPay *container* can reach it on settle; the
@@ -67,32 +70,58 @@ DOCS_URL="$(state_get "$STATE" DOCS_URL)"; SANDBOX="$(state_get "$STATE" SANDBOX
 source "$STAGE2_DIR/btcpay-regtest/.live-env"
 
 cat > "$RUN_DIR/AGENT_BRIEF.md" <<EOF
-# Onboarding-tester brief — Keysat Stage 2 (agent connects BTCPay regtest + buyer pays)
+# Onboarding-tester brief — Keysat combined journey (gate a paid product, then prove it with a real buyer payment)
 
 You are a **fresh adopter**, following \`~/Projects/standards/guides/onboarding-tester.md\`.
-Reach the goal using **only the docs corpus**. Never read Keysat source to unblock
-yourself — a gap in the docs is a finding.
+Reach the goal using **only the docs corpus**. Never read Keysat's server or SDK source to
+unblock yourself — if the docs don't get you there, that is a finding.
 
 ## Goal (checkable end-state)
-Acting for a merchant on a **sandbox** Keysat instance, using a **scoped, non-master**
-API key (it carries \`payment_providers:write\`), and the published docs only:
+You are an operator selling a Next.js/TypeScript app. Do the **whole flow in the order an
+operator actually works** — gate the paid feature first, then prove it end to end with a
+real buyer payment. Use a **scoped, non-master** API key (it carries
+\`payment_providers:write\`), a **sandbox** Keysat instance, and the published docs only:
 
-1. **Connect a BTCPay payment provider** (this box's regtest BTCPay) to Keysat over the
-   API — no master key, no human clicking in a browser. (You hold a BTCPay credential for
-   the regtest server, the way an operator delegating setup would hand one to you.)
-2. Create a product with a **paid** policy/tier.
-3. Produce a **buyer checkout** for that product (a purchase invoice).
-4. Confirm that paying the invoice issues a license (the harness will pay it on regtest if
-   you cannot from the docs alone — note where the docs leave that to plumbing).
+1. **Define the product + a paid tier that grants an entitlement.** Register the product in
+   Keysat's catalog and add a **paid** policy/tier whose purchase grants a named
+   **entitlement** (the thing your gate will check for). Note the entitlement key.
+2. **Integrate the SDK and gate the Pro export — verify the BLOCKED path FIRST.** Wire
+   \`@keysat/licensing-client\` into your app so \`GET /api/export\` returns the CSV **only**
+   when the caller holds a valid license carrying that entitlement. Then prove it is shut:
+   with **no** license and with a **tampered/invalid** license, \`/api/export\` returns a
+   **4xx, not the CSV**. (At this point no real license exists yet — that's expected.)
+3. **Connect BTCPay (regtest) and drive a real buyer payment → license issued.** Connect
+   the regtest BTCPay to Keysat over the API (no master key, no browser — you hold a BTCPay
+   credential the way an operator delegating setup would hand you one). Produce a **buyer
+   checkout** for the paid product, then have the buyer pay it. The settled payment must
+   issue a **real, signed license** carrying the entitlement from step 1. (The harness will
+   pay the regtest invoice for you if the docs leave that last on-chain step to plumbing —
+   note where, but the *checkout* itself must come from the docs.)
+4. **Paste the PURCHASED license into the app → verify the UNLOCKED path.** Feed that
+   purchased license to your app and confirm \`GET /api/export\` now returns the **CSV**.
+   This is the step that ties the two halves together: the license a *buyer's payment*
+   produced unlocks the feature your *gate* protects.
 
-Success = a paid product whose purchase, once settled, yields a valid license — reached
-from the docs alone, under a scoped key, with BTCPay connected by you.
+Success = the same gate that was demonstrably shut in step 2 is opened in step 4 by a
+license that a real (regtest) buyer payment produced in step 3 — reached from the docs
+alone, under a scoped key, with BTCPay connected by you.
 
-## Docs corpus (the ONLY how-to sources)
-- Keysat docs site: **$DOCS_URL** (start at \`/agent.html\`, \`/integrate.html\`).
-- Daemon OpenAPI: **$BASE_URL/v1/openapi.json**.
+## Docs corpus (the ONLY how-to sources you may consult)
+- Keysat docs site: **$DOCS_URL** — start at \`/integrate.html\` (SDK + gating) and
+  \`/agent.html\` (scoped-key + connect-BTCPay workflow); the whole site is in-corpus.
+- Daemon OpenAPI: **$BASE_URL/v1/openapi.json** (unauthenticated; the docs point here).
+- The npm package README for \`@keysat/licensing-client\` is in-corpus (\`npm view\` / the
+  package page).
 
-## Credentials you were handed
+## Your sandbox app (mutate ONLY this)
+\`$SANDBOX\` — a pristine copy of the "Acme Reports" app whose **Pro export**
+(\`GET /api/export\`) is currently ungated. Read its own \`README.md\` freely (it's your
+app; it tells you nothing about Keysat). Deps are installed. Run it with \`npm run dev\`
+(serves on http://localhost:4311). How the app learns the license key (env var, file,
+header) is your call — pick what the docs suggest and note it. Put scratch under
+\`/tmp/onboarding-tester/\`.
+
+## Credentials you were handed (an operator delegating setup would hand you these)
 - Keysat server: **$BASE_URL**
 - Scoped API key (merchant-onboard + payment_providers:write): **$SK**
 - Regtest BTCPay server: **${KEYSAT_LIVE_BTCPAY_URL:-$BTCPAY_URL}**, store
@@ -102,7 +131,9 @@ from the docs alone, under a scoped key, with BTCPay connected by you.
   either an intended operator-only boundary (note it) or a doc gap (log it).
 
 ## Out of corpus (do not open)
-Anything under the Keysat source tree, migrations, tests, or this harness.
+Anything under the Keysat source tree (\`$WORKSPACE/licensing-service-startos\`,
+\`$WORKSPACE/licensing-client-*\`), migrations, tests, or this harness. Reading any of it
+invalidates the run — say so if you do.
 
 ## Output
 Write your friction report to \`$RUN_DIR/reports/friction.md\` AND return it as your final
