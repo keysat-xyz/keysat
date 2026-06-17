@@ -15,4 +15,9 @@
 #
 # Chain targets when needed: `make clean arm install`.
 
+# Only x86_64 and aarch64 are supported and declared in the manifest. The shared
+# s9pk.mk defaults ARCHES to include riscv; override it here so a bare `make`
+# (which builds every arch in ARCHES) does not attempt an unverified riscv build.
+ARCHES := x86 arm
+
 include s9pk.mk
