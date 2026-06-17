@@ -19,7 +19,7 @@ Service metadata including the Ed25519 public key. Useful for SDKs to fetch the 
 ```json
 {
   "service": "keysat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "operator": "Acme Software",
   "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCow...\n-----END PUBLIC KEY-----\n",
   "key_algorithm": "ed25519",

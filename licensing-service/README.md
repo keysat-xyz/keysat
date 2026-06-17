@@ -86,7 +86,7 @@ On first boot the server generates a fresh Ed25519 keypair and stores it in the 
 
 ```bash
 curl -X POST http://localhost:8080/v1/admin/products \
-  -H "Authorization: Bearer $LICENSING_ADMIN_API_KEY" \
+  -H "Authorization: Bearer $KEYSAT_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "slug": "my-app",

@@ -33,7 +33,7 @@ LIC1 - <base32(74-byte payload)> - <base32(64-byte signature)>
 
 The payload is a fixed binary layout, not JSON, to keep keys short. Details in [`src/crypto/mod.rs`](../src/crypto/mod.rs).
 
-Why base32 Crockford-style (no padding)?
+Why base32 (RFC 4648, no padding)?
 
 - Uppercase only, unambiguous chars, easy to read aloud or type from a screen.
 - Slightly longer than base64 but less error-prone for humans copying keys.
@@ -63,13 +63,12 @@ Who might attack this?
 
 5. **Chargeback / dispute** (applicable to non-Bitcoin rails, but worth noting). Bitcoin payments are irreversible, so the normal fraud model that motivates software DRM mostly doesn't apply here. Most revocations will be: key leaked publicly, legitimate business decision, mistaken issuance.
 
-## What's deliberately NOT in v0.1
+## Deliberately out of scope
 
-- **Key rotation.** A single static signing key is fine for first launch. Rotation requires SDK multi-key support and a migration strategy; deferred.
-- **Trial periods / demos.** This is a pure paid-license server. Trials are the developer's responsibility in-app.
-- **Payment currencies other than BTC.** BTCPay supports Lightning, altcoins, and fiat; we only send BTC-denominated invoices. Adding Lightning is straightforward (BTCPay handles it transparently if the store has LN configured).
+- **Key rotation.** A single static signing key is fine for now. Rotation requires SDK multi-key support and a migration strategy; deferred.
 - **Multi-tenant / SaaS mode.** This is a *single-operator* server by design. Running multiple logical operators on one instance is a different product.
-- **Admin UI.** Everything is API-driven. Wrap it in whatever UI you like — or just use `curl`.
+
+(Trial/time-limited policies, multi-currency pricing, the optional Zaprite card rail, and the embedded admin UI all shipped after v0.1 and are no longer on this list.)
 
 ## Notes on Start9 dependencies
 
