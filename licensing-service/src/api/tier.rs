@@ -162,6 +162,10 @@ pub async fn admin_status(
     Ok(axum::Json(serde_json::json!({
         "tier": tier.label,
         "tier_name": tier.display_name,
+        // Daemon-level sandbox flag (env KEYSAT_SANDBOX_MODE, read-only here —
+        // never settable via any API). The admin SPA renders a "SANDBOX"
+        // banner on it; it also gates scoped payment-provider connect.
+        "sandbox": state.config.sandbox_mode,
         "entitlements": tier.entitlements,
         "usage": {
             "products": product_count,

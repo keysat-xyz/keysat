@@ -103,6 +103,7 @@ async fn make_test_state() -> (AppState, NamedTempFile) {
         btcpay_webhook_secret: None,
         public_base_url: "http://keysat.test".to_string(),
         operator_name: Some("Test Operator".into()),
+        sandbox_mode: false,
     };
 
     let state = AppState {
@@ -3540,6 +3541,70 @@ async fn scoped_merchant_onboard_key_onboards_but_not_master() {
         StatusCode::FORBIDDEN,
         "merchant-onboard must NOT have subscriptions:write"
     );
+}
+
+/// À-la-carte `payment_providers:write` can be granted on a key via the `scopes`
+/// field (it's in no role), and round-trips through create + list. This is the
+/// per-key grant mechanism the agent-payment-connect gate (slices 3+) builds on.
+#[tokio::test]
+async fn scoped_key_extra_scopes_round_trip() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Create a key with the à-la-carte scope on top of a read-only role.
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({
+            "label": "Sandbox connect bot",
+            "role": "merchant-onboard",
+            "scopes": ["payment_providers:write"]
+        })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let scopes = body["scopes"].as_array().expect("scopes echoed on create");
+    assert!(
+        scopes.iter().any(|s| s == "payment_providers:write"),
+        "create echoes the granted à-la-carte scope; got {scopes:?}"
+    );
+    let key_id = body["id"].as_str().unwrap().to_string();
+
+    // List shows the same scope on the key entry.
+    let req = build_request("GET", "/v1/admin/api-keys", &[("authorization", &auth)], None);
+    let body = body_json(send(&state, req).await).await;
+    let entry = body["api_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == key_id.as_str())
+        .expect("created key appears in list");
+    let scopes = entry["scopes"].as_array().expect("list entry carries scopes");
+    assert!(
+        scopes.iter().any(|s| s == "payment_providers:write"),
+        "list echoes the granted à-la-carte scope; got {scopes:?}"
+    );
+}
+
+/// Create rejects any scope that isn't in the à-la-carte allowlist — a typo'd
+/// or arbitrary scope string is a 400, never silently granted or dropped.
+#[tokio::test]
+async fn scoped_key_create_rejects_ungrantable_scope() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({
+            "label": "Overreach",
+            "role": "read-only",
+            "scopes": ["billing:nuke"]
+        })),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Zaprite Connect refuses on Creator-tier (no `zaprite_payments`

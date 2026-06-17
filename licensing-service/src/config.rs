@@ -61,6 +61,16 @@ pub struct Config {
 
     /// Optional human-readable operator name shown in `/` index responses.
     pub operator_name: Option<String>,
+
+    /// When true, this daemon is a disposable dev / sandbox instance. It is
+    /// the OUTER gate for agent-delegated payment-provider connect: only on a
+    /// sandbox daemon may a scoped `payment_providers:write` key connect a
+    /// provider (and then only a non-mainnet one — see the network gate). On a
+    /// production daemon (false) scoped payment-connect is refused outright, so
+    /// a scoped key can never disrupt a live store's payments. Daemon-level
+    /// only (env `KEYSAT_SANDBOX_MODE`) and **never settable via any API** —
+    /// otherwise a scoped key could flip it on, then connect.
+    pub sandbox_mode: bool,
 }
 
 impl Config {
@@ -102,6 +112,9 @@ impl Config {
         let btcpay_webhook_secret = optional_nonempty("BTCPAY_WEBHOOK_SECRET");
         let public_base_url = required_with_fallback("KEYSAT_PUBLIC_URL", "LICENSING_PUBLIC_URL")?;
         let operator_name = env_with_fallback("KEYSAT_OPERATOR_NAME", "LICENSING_OPERATOR_NAME");
+        let sandbox_mode = optional_nonempty("KEYSAT_SANDBOX_MODE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
 
         Ok(Self {
             bind,
@@ -115,6 +128,7 @@ impl Config {
             btcpay_webhook_secret,
             public_base_url: public_base_url.trim_end_matches('/').to_string(),
             operator_name,
+            sandbox_mode,
         })
     }
 }

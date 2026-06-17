@@ -1,0 +1,13 @@
+-- Migration 0024: per-key à-la-carte scopes on scoped API keys.
+--
+-- Roles (read-only | license-issuer | support | merchant-onboard | full-admin)
+-- expand to a fixed scope set. Some capabilities are too sensitive to bake into
+-- any role but still need to be grantable to a SPECIFIC key. The first is
+-- `payment_providers:write` — agent-delegated payment-provider connect, itself
+-- gated further by the daemon sandbox flag + a non-mainnet network check (see
+-- plans/agent-payment-connect-scope.md).
+--
+-- `extra_scopes` holds a JSON array of additional scope strings granted to THIS
+-- key on top of its role. NULL / absent = role scopes only (every existing key),
+-- so this is a pure additive column — no table rebuild.
+ALTER TABLE scoped_api_keys ADD COLUMN extra_scopes TEXT;

@@ -60,6 +60,7 @@ async fn make_state() -> (AppState, NamedTempFile) {
         btcpay_webhook_secret: None,
         public_base_url: "http://keysat.test".to_string(),
         operator_name: None,
+        sandbox_mode: false,
     };
     let state = AppState {
         db: pool,

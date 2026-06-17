@@ -77,6 +77,7 @@ async fn make_state() -> (AppState, NamedTempFile, Arc<MockProvider>) {
         btcpay_webhook_secret: None,
         public_base_url: "http://keysat.test".to_string(),
         operator_name: None,
+        sandbox_mode: false,
     };
     let mock = Arc::new(MockProvider::new());
     let state = AppState {
