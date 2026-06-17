@@ -1,0 +1,3 @@
+# Per-run scratch: live daemon DBs, logs, tokens, the symlink to the active run.
+# Disposable and may contain (worthless, post-teardown) fixture tokens.
+runs/

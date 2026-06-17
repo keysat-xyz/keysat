@@ -1,0 +1,22 @@
+{
+  "name": "acme-reports",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pristine proof-of-work app for the Keysat onboarding harness. A tiny Next.js report tool whose 'Pro export' feature is meant to be gated behind a Keysat license.",
+  "scripts": {
+    "dev": "next dev -p 4311",
+    "build": "next build",
+    "start": "next start -p 4311"
+  },
+  "dependencies": {
+    "next": "15.1.6",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.7",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "typescript": "5.7.3"
+  }
+}
