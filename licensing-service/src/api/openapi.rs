@@ -86,9 +86,9 @@ const SPEC_JSON: &str = r##"{
           "slug":           { "type": "string" },
           "name":           { "type": "string" },
           "description":    { "type": "string" },
-          "price_sats":     { "type": "integer", "nullable": true },
-          "price_currency": { "type": "string", "enum": ["SAT", "USD", "EUR"], "nullable": true },
-          "price_value":    { "type": "integer", "nullable": true },
+          "price_sats":     { "type": "integer", "nullable": true, "description": "Legacy SAT price. Still accepted on create for backward compatibility; new callers should send price_value + price_currency instead. Also returned in responses (derived from price_value when that path is used)." },
+          "price_currency": { "type": "string", "enum": ["SAT", "USD", "EUR"], "nullable": true, "description": "Currency for price_value. Defaults to SAT." },
+          "price_value":    { "type": "integer", "nullable": true, "description": "Write field: price in the smallest unit of price_currency (sats for SAT, cents for USD/EUR). Send together with price_currency." },
           "active":         { "type": "boolean" },
           "entitlements_catalog": {
             "type": "array",
@@ -263,13 +263,20 @@ const SPEC_JSON: &str = r##"{
     "/v1/admin/licenses": {
       "get": {
         "summary": "List licenses",
-        "description": "Scope required: `licenses:read`. Filter by status, product_slug, buyer_email, expiring soon, etc. via query params.",
+        "description": "Scope required: `licenses:read`. Requires `product_id=<uuid>` (the product's UUID, not its slug); returns that product's licenses. Use `GET /v1/admin/licenses/search` to look up by buyer_email or invoice id.",
         "responses": { "200": { "description": "License list" } }
       },
       "post": {
         "summary": "Issue a license manually",
         "description": "Scope required: `licenses:write`. Mints a fresh license without going through purchase. Useful for comping, manual support workflows.",
         "responses": { "200": { "description": "Issued license" } }
+      }
+    },
+    "/v1/admin/licenses/search": {
+      "get": {
+        "summary": "Search licenses",
+        "description": "Scope required: `licenses:read`. Look up licenses by `buyer_email`, `nostr_npub`, or `invoice_id` (whichever is supplied). With no filter, returns the 100 most-recent licenses. The `license_key` is never returned here (only on issue / recover).",
+        "responses": { "200": { "description": "Matching licenses" } }
       }
     },
     "/v1/admin/licenses/{id}/revoke": {
@@ -301,11 +308,6 @@ const SPEC_JSON: &str = r##"{
       }
     },
     "/v1/admin/products": {
-      "get": {
-        "summary": "List products",
-        "description": "Scope required: `products:read`.",
-        "responses": { "200": { "description": "Product list" } }
-      },
       "post": {
         "summary": "Create a product",
         "description": "Scope required: `products:write`.",
