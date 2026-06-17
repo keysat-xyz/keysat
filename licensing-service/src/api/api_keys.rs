@@ -227,6 +227,91 @@ pub async fn require_scope(
     Ok(token_hash)
 }
 
+/// Who initiated a payment-provider connect — determines the network gate at
+/// callback time (`btcpay_authorize::finish_connect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectInitiator {
+    /// The master `admin_api_key`. May connect any network.
+    Master,
+    /// A scoped key carrying `payment_providers:write` on a sandbox daemon.
+    /// Restricted to non-mainnet stores (enforced after the OAuth round-trip,
+    /// once the store + network are known).
+    Scoped,
+}
+
+/// Gate for **starting** a BTCPay provider connect — the fund-redirection-
+/// sensitive operation. Stricter than `require_scope`: a scoped key reaches it
+/// ONLY with the à-la-carte `payment_providers:write` scope AND only on a
+/// **sandbox daemon** (the OUTER gate — on a production box scoped connect is
+/// disabled entirely, even for regtest, since a scoped key re-pointing
+/// settlement on a live box is denial-of-revenue). The INNER gate (target
+/// network must be non-mainnet) is enforced separately at callback time, once
+/// the store is known. See `plans/agent-payment-connect-scope.md` §5.
+///
+/// Returns `(actor_hash, initiator)`. The caller records `initiator` in the
+/// authorize-state row so the callback can apply the network gate. Master keys
+/// bypass both gates (still subject to BTCPay's own OAuth approval).
+pub async fn require_provider_connect(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AppResult<(String, ConnectInitiator)> {
+    let header_val = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    let token = header_val
+        .strip_prefix("Bearer ")
+        .ok_or(AppError::Unauthorized)?;
+
+    // Master admin key — full bypass, may connect any network.
+    if bool::from(
+        token
+            .as_bytes()
+            .ct_eq(state.config.admin_api_key.as_bytes()),
+    ) {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        return Ok((hex::encode(hasher.finalize()), ConnectInitiator::Master));
+    }
+
+    // Scoped key — must carry `payment_providers:write` (never role-granted;
+    // only via à-la-carte `extra_scopes`) AND the daemon must be in sandbox mode.
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let token_hash = hex::encode(hasher.finalize());
+
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, role, revoked_at, extra_scopes FROM scoped_api_keys WHERE token_hash = ?",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (key_id, role_str, revoked_at, extra_scopes_json) = row.ok_or(AppError::Forbidden)?;
+    if revoked_at.is_some() {
+        return Err(AppError::Forbidden);
+    }
+    let role = Role::parse(&role_str).ok_or(AppError::Forbidden)?;
+    let has_scope = role.grants("payment_providers:write")
+        || extra_scopes_contains(extra_scopes_json.as_deref(), "payment_providers:write");
+    if !has_scope {
+        return Err(AppError::Forbidden);
+    }
+    // OUTER gate: scoped connect is permitted only on a sandbox daemon.
+    if !state.config.sandbox_mode {
+        return Err(AppError::Forbidden);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let _ = sqlx::query("UPDATE scoped_api_keys SET last_used_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(&key_id)
+        .execute(&state.db)
+        .await;
+
+    Ok((token_hash, ConnectInitiator::Scoped))
+}
+
 // ---------- CRUD endpoints (gated on master admin only) ----------
 
 #[derive(Debug, Deserialize)]

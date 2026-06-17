@@ -400,7 +400,8 @@ const SPEC_JSON: &str = r##"{
             "type": "object",
             "properties": {
               "label": { "type": "string", "description": "Operator-friendly name, e.g. 'Recap support bot'" },
-              "role":  { "type": "string", "enum": ["read-only", "license-issuer", "support", "merchant-onboard", "full-admin"] }
+              "role":  { "type": "string", "enum": ["read-only", "license-issuer", "support", "merchant-onboard", "full-admin"] },
+              "scopes": { "type": "array", "items": { "type": "string", "enum": ["payment_providers:write"] }, "description": "A-la-carte extra scopes granted on top of the role. Only payment_providers:write today: lets the key connect a non-mainnet BTCPay provider on a sandbox daemon. In no role by default." }
             },
             "required": ["label", "role"]
           } } }
@@ -418,8 +419,43 @@ const SPEC_JSON: &str = r##"{
     "/v1/admin/tier": {
       "get": {
         "summary": "Get this daemon's tier + usage + caps",
-        "description": "Master admin key required. Returns current self-tier label + entitlements, current product/code usage, and the caps that apply at this tier.",
+        "description": "Master admin key required. Returns current self-tier label + entitlements, current product/code usage, and the caps that apply at this tier. Includes a read-only `sandbox` boolean (true when KEYSAT_SANDBOX_MODE is set).",
         "responses": { "200": { "description": "Tier info" } }
+      }
+    },
+    "/v1/admin/btcpay/connect": {
+      "post": {
+        "summary": "Start a BTCPay provider connect",
+        "description": "Returns a one-time `state` token and the BTCPay authorize URL; complete the connect at /v1/btcpay/authorize/callback. The master key may connect any network. A scoped key needs the `payment_providers:write` extra scope AND a sandbox daemon (KEYSAT_SANDBOX_MODE); the target store must resolve to a non-mainnet network or the callback refuses. Optional JSON body: { merchant_profile_id }.",
+        "responses": {
+          "200": { "description": "{ authorize_url, state, merchant_profile_id }" },
+          "403": { "description": "Scoped key without payment_providers:write, or not a sandbox daemon" },
+          "409": { "description": "Profile already has a BTCPay provider; disconnect first" }
+        }
+      }
+    },
+    "/v1/btcpay/authorize/callback": {
+      "get": {
+        "summary": "Complete a BTCPay connect",
+        "description": "BTCPay redirects here after the operator approves in a browser, or an agent calls it directly with a pre-issued store API key. Query params: `state` (from /connect) and `apiKey` (a BTCPay store key with the same store-settings + invoice permissions the browser flow grants). Keysat resolves the store's network and, for a scoped initiator, refuses anything not provably non-mainnet (fail-closed). No auth header; the single-use `state` token is the tie. A refusal returns a 4xx on both the GET and POST forms.",
+        "responses": {
+          "200": { "description": "Connected (HTML confirmation page)" },
+          "400": { "description": "Scoped connect to a mainnet/undetermined store; nothing persisted" }
+        }
+      }
+    },
+    "/v1/admin/btcpay/status": {
+      "get": {
+        "summary": "BTCPay connection status (default profile)",
+        "description": "Requires payment_providers:read. Returns { connected, store_id, base_url, webhook_id, ... }.",
+        "responses": { "200": { "description": "Connection status" } }
+      }
+    },
+    "/v1/admin/btcpay/disconnect": {
+      "post": {
+        "summary": "Disconnect a BTCPay provider",
+        "description": "Master admin key required, on any daemon. Best-effort revokes the webhook + key on BTCPay, then clears the local provider row.",
+        "responses": { "200": { "description": "Disconnected (or no-op)" } }
       }
     }
   }

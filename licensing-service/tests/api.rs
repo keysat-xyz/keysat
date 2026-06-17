@@ -86,6 +86,17 @@ async fn make_pool() -> (SqlitePool, NamedTempFile) {
 /// - `self_tier = Tier::Unlicensed` inherits Creator-tier caps (5
 ///   products, 5 codes, etc.). Plenty for the small fixtures here.
 async fn make_test_state() -> (AppState, NamedTempFile) {
+    make_test_state_inner(false).await
+}
+
+/// Same fixture but with the daemon sandbox flag ON — for the
+/// agent-payment-connect outer gate (a scoped `payment_providers:write` key may
+/// only start a connect on a sandbox daemon).
+async fn make_test_state_sandbox() -> (AppState, NamedTempFile) {
+    make_test_state_inner(true).await
+}
+
+async fn make_test_state_inner(sandbox_mode: bool) -> (AppState, NamedTempFile) {
     let (pool, tmp) = make_pool().await;
     let keypair = crypto::keys::load_or_generate(&pool)
         .await
@@ -103,7 +114,7 @@ async fn make_test_state() -> (AppState, NamedTempFile) {
         btcpay_webhook_secret: None,
         public_base_url: "http://keysat.test".to_string(),
         operator_name: Some("Test Operator".into()),
-        sandbox_mode: false,
+        sandbox_mode,
     };
 
     let state = AppState {
@@ -3605,6 +3616,187 @@ async fn scoped_key_create_rejects_ungrantable_scope() {
         })),
     );
     assert_eq!(send(&state, req).await.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Mint a scoped key of `role` plus à-la-carte `scopes`, returning its token.
+async fn mint_scoped_key_with_scopes(state: &AppState, role: &str, scopes: &[&str]) -> String {
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "POST",
+        "/v1/admin/api-keys",
+        &[("authorization", &auth)],
+        Some(json!({ "label": format!("{role}+scopes key"), "role": role, "scopes": scopes })),
+    );
+    let resp = send(state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "minting {role}+{scopes:?} should succeed");
+    body_json(resp)
+        .await
+        .get("token")
+        .and_then(|t| t.as_str())
+        .expect("create returns the raw token once")
+        .to_string()
+}
+
+// ----- agent-payment-connect gate (slices 3-4) -----
+// `plans/agent-payment-connect-scope.md`: a scoped `payment_providers:write`
+// key may START a BTCPay connect ONLY on a sandbox daemon (outer gate); the
+// non-mainnet inner gate is enforced at callback time (covered live in
+// tests/btcpay_network_live.rs). These cover the HTTP-level outer gate.
+
+/// OUTER gate, production: a scoped `payment_providers:write` key is 403 on a
+/// non-sandbox daemon — even though it holds the scope. Proves §5.1 (a scoped
+/// key cannot repoint settlement on a live box, regtest or otherwise).
+#[tokio::test]
+async fn payment_connect_outer_gate_denies_scoped_on_production() {
+    let (state, _tmp) = make_test_state().await; // sandbox_mode = false
+    let token =
+        mint_scoped_key_with_scopes(&state, "merchant-onboard", &["payment_providers:write"]).await;
+    let auth = format!("Bearer {token}");
+    let req = build_request("POST", "/v1/admin/btcpay/connect", &[("authorization", &auth)], None);
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "scoped payment_providers:write key must be 403 on a non-sandbox daemon"
+    );
+}
+
+/// OUTER gate, sandbox: the same key passes on a sandbox daemon, and the
+/// connect is recorded as a SCOPED initiator so the callback applies the
+/// non-mainnet network gate.
+#[tokio::test]
+async fn payment_connect_outer_gate_allows_scoped_on_sandbox() {
+    let (state, _tmp) = make_test_state_sandbox().await; // sandbox_mode = true
+    let token =
+        mint_scoped_key_with_scopes(&state, "merchant-onboard", &["payment_providers:write"]).await;
+    let auth = format!("Bearer {token}");
+    let req = build_request("POST", "/v1/admin/btcpay/connect", &[("authorization", &auth)], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "scoped key passes the outer gate on sandbox");
+    let body = body_json(resp).await;
+    assert!(
+        body["authorize_url"].as_str().unwrap_or("").contains("/api-keys/authorize"),
+        "returns a BTCPay authorize URL; got {body:?}"
+    );
+    let (scoped, actor_hash): (i64, Option<String>) = sqlx::query_as(
+        "SELECT scoped_initiator, initiator_actor_hash FROM btcpay_authorize_state WHERE state_token = ?",
+    )
+    .bind(body["state"].as_str().expect("state token echoed"))
+    .fetch_one(&state.db)
+    .await
+    .expect("authorize_state row persisted");
+    assert_eq!(scoped, 1, "the callback must see this as a scoped initiator");
+    assert!(
+        actor_hash.is_some(),
+        "the scoped initiator's actor hash must be recorded for the callback's audit row"
+    );
+}
+
+/// A scoped key WITHOUT `payment_providers:write` is 403 even on a sandbox
+/// daemon — the scope is in no role (not even full-admin), so merchant-onboard
+/// can't reach connect. Proves the gate isn't widened by role.
+#[tokio::test]
+async fn payment_connect_denies_scoped_without_the_scope() {
+    let (state, _tmp) = make_test_state_sandbox().await; // sandbox ON, so only the missing scope can deny
+    let auth = format!("Bearer {}", mint_scoped_key(&state, "merchant-onboard").await);
+    let req = build_request("POST", "/v1/admin/btcpay/connect", &[("authorization", &auth)], None);
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::FORBIDDEN,
+        "merchant-onboard without payment_providers:write must be 403 (no role widening)"
+    );
+}
+
+/// The master key may start a connect on ANY daemon (bypasses the sandbox
+/// gate). Recorded as a master (non-scoped) initiator → callback applies no
+/// network restriction.
+#[tokio::test]
+async fn payment_connect_allows_master_on_production() {
+    let (state, _tmp) = make_test_state().await; // sandbox OFF
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request("POST", "/v1/admin/btcpay/connect", &[("authorization", &auth)], None);
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "master may connect on any daemon");
+    let body = body_json(resp).await;
+    let scoped: i64 = sqlx::query_scalar(
+        "SELECT scoped_initiator FROM btcpay_authorize_state WHERE state_token = ?",
+    )
+    .bind(body["state"].as_str().unwrap())
+    .fetch_one(&state.db)
+    .await
+    .expect("authorize_state row persisted");
+    assert_eq!(scoped, 0, "master connect is not a scoped initiator");
+}
+
+/// The initiator + actor hash round-trip through `btcpay_authorize_state`
+/// (migration 0025): recorded at start, recovered at callback, single-use.
+#[tokio::test]
+async fn authorize_state_carries_scoped_initiator() {
+    let (state, _tmp) = make_test_state().await;
+    let profile = repo::get_default_merchant_profile(&state.db)
+        .await
+        .expect("query default profile")
+        .expect("a default profile exists post-migration");
+
+    keysat::btcpay::config::record_authorize_state(
+        &state.db,
+        "tok_scoped",
+        Some(&profile.id),
+        true,
+        Some("deadbeef"),
+    )
+    .await
+    .expect("record scoped");
+    let s = keysat::btcpay::config::consume_authorize_state(&state.db, "tok_scoped")
+        .await
+        .expect("consume scoped");
+    assert!(s.scoped_initiator, "scoped_initiator must round-trip");
+    assert_eq!(s.initiator_actor_hash.as_deref(), Some("deadbeef"));
+    assert_eq!(s.merchant_profile_id.as_deref(), Some(profile.id.as_str()));
+    // Single-use: a replay of the same token fails.
+    assert!(
+        keysat::btcpay::config::consume_authorize_state(&state.db, "tok_scoped")
+            .await
+            .is_err(),
+        "consumed token must not replay"
+    );
+
+    // Master initiator: defaults (not scoped, no hash).
+    keysat::btcpay::config::record_authorize_state(
+        &state.db,
+        "tok_master",
+        Some(&profile.id),
+        false,
+        None,
+    )
+    .await
+    .expect("record master");
+    let m = keysat::btcpay::config::consume_authorize_state(&state.db, "tok_master")
+        .await
+        .expect("consume master");
+    assert!(!m.scoped_initiator);
+    assert_eq!(m.initiator_actor_hash, None);
+}
+
+/// The GET BTCPay callback must surface a failed/denied connect as a non-2xx
+/// status, not a 200 with an HTML error body (the POST callback already does via
+/// `?`). An unknown state token fails closed at consume time -> 401. This guards
+/// the regression where the deny path (e.g. a scoped key targeting a mainnet
+/// store) would otherwise return 200 with no programmatic error signal.
+#[tokio::test]
+async fn btcpay_callback_get_propagates_error_status() {
+    let (state, _tmp) = make_test_state_sandbox().await;
+    let req = build_request(
+        "GET",
+        "/v1/btcpay/authorize/callback?state=bogus-token&apiKey=whatever",
+        &[],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a GET callback with an invalid state token must return 401, not a 200 error page"
+    );
 }
 
 /// Zaprite Connect refuses on Creator-tier (no `zaprite_payments`

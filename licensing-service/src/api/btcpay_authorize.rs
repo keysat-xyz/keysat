@@ -22,9 +22,14 @@
 //! callback path uses the CSRF `state` token to tie a callback back to the
 //! issuing operator session.
 
-use crate::api::{admin::{require_admin, require_scope}, AppState};
+use crate::api::{
+    admin::{require_admin, require_scope},
+    api_keys::{require_provider_connect, ConnectInitiator},
+    AppState,
+};
 use crate::btcpay::client::{self as btcpay_client, BtcpayClient};
 use crate::btcpay::config as btcpay_cfg;
+use crate::btcpay::network::BitcoinNetwork;
 use crate::error::{AppError, AppResult};
 use crate::payment::btcpay::BtcpayProvider;
 use std::sync::Arc;
@@ -84,7 +89,12 @@ pub async fn start_connect(
     headers: HeaderMap,
     body: Option<Json<StartConnectReq>>,
 ) -> AppResult<Json<ConnectResp>> {
-    require_admin(&state, &headers)?;
+    // Master key → connect any network. Scoped key with `payment_providers:write`
+    // → permitted ONLY on a sandbox daemon (outer gate); the non-mainnet inner
+    // gate is enforced at callback time once the store is known. See
+    // `plans/agent-payment-connect-scope.md` §5.
+    let (actor_hash, initiator) = require_provider_connect(&state, &headers).await?;
+    let scoped_initiator = matches!(initiator, ConnectInitiator::Scoped);
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
     // Resolve the target merchant profile (defaulting to the default).
@@ -115,9 +125,17 @@ pub async fn start_connect(
     rand::thread_rng().fill_bytes(&mut raw);
     let state_token = BASE32_NOPAD.encode(&raw);
 
-    btcpay_cfg::record_authorize_state(&state.db, &state_token, Some(&profile.id))
-        .await
-        .map_err(AppError::Internal)?;
+    btcpay_cfg::record_authorize_state(
+        &state.db,
+        &state_token,
+        Some(&profile.id),
+        scoped_initiator,
+        // Only stored for scoped connects (the callback's audit row). Master
+        // connects are covered by the StartOS action audit trail.
+        scoped_initiator.then_some(actor_hash.as_str()),
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     // Construct the authorize URL per BTCPay's docs.
     // https://docs.btcpayserver.org/API/Greenfield/v1/#api-keys
@@ -226,11 +244,18 @@ pub async fn callback_get(
         Ok(()) => success_page(
             "BTCPay connected successfully. You can close this tab and return to Keysat.",
         ),
-        Err(e) => Html(format!(
-            "<html><body><h2>BTCPay authorization failed</h2><p>{}</p></body></html>",
-            html_escape::encode_text(&e.to_string())
-        ))
-        .into_response(),
+        // Carry the error's HTTP status onto the HTML page so a denied connect
+        // (e.g. a scoped key targeting a mainnet store -> 400) surfaces as a
+        // non-2xx an agent can detect, not a misleading 200. Matches the POST
+        // callback, which propagates the status via `?`.
+        Err(e) => (
+            e.status_code(),
+            Html(format!(
+                "<html><body><h2>BTCPay authorization failed</h2><p>{}</p></body></html>",
+                html_escape::encode_text(&e.to_string())
+            )),
+        )
+            .into_response(),
     }
 }
 
@@ -302,10 +327,10 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
     // Recovers the `merchant_profile_id` recorded when the operator
     // kicked off the connect flow. NULL falls back to the default
     // profile (back-compat for state tokens from pre-0022 runs).
-    let recorded_profile_id = btcpay_cfg::consume_authorize_state(&state.db, state_token)
+    let auth_state = btcpay_cfg::consume_authorize_state(&state.db, state_token)
         .await
         .map_err(|_| AppError::Unauthorized)?;
-    let profile = match recorded_profile_id.as_deref() {
+    let profile = match auth_state.merchant_profile_id.as_deref() {
         Some(id) => crate::merchant_profiles::get(&state.db, id)
             .await?
             .ok_or_else(|| AppError::BadRequest(format!(
@@ -330,6 +355,43 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
         .ok_or_else(|| AppError::BadRequest(
             "The authorized API key has access to zero stores. Re-run connect and pick a store.".into()
         ))?;
+
+    // INNER gate (scoped initiators only): the target store must settle on a
+    // non-mainnet network. This is the first point in the flow where we know
+    // the store, so detection happens here — BEFORE registering any webhook or
+    // persisting the provider. Fail closed: if the network can't be positively
+    // determined as non-mainnet, treat it as mainnet and refuse. Master
+    // initiators skip this entirely (they may connect any network).
+    let resolved_network = if auth_state.scoped_initiator {
+        let network = match btcpay_client::fetch_onchain_network(base_url, api_key, &store.id).await {
+            Ok(Some(net)) => net,
+            Ok(None) => {
+                tracing::warn!(
+                    store = %store.id,
+                    "scoped BTCPay connect: on-chain network undetermined → fail-closed to mainnet (deny)"
+                );
+                BitcoinNetwork::Mainnet
+            }
+            Err(e) => {
+                tracing::warn!(
+                    store = %store.id, error = %format!("{e:#}"),
+                    "scoped BTCPay connect: network detection errored → fail-closed to mainnet (deny)"
+                );
+                BitcoinNetwork::Mainnet
+            }
+        };
+        if network.is_mainnet() {
+            return Err(AppError::BadRequest(format!(
+                "Scoped payment-provider connect is restricted to non-mainnet \
+                 (regtest/testnet/signet) BTCPay stores; the selected store resolved \
+                 to '{}'. Use the master admin key to connect a mainnet store.",
+                network.as_str()
+            )));
+        }
+        Some(network)
+    } else {
+        None
+    };
 
     // Generate a strong webhook secret, then register the webhook on BTCPay.
     let mut raw_secret = [0u8; 32];
@@ -387,14 +449,40 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
         state.set_payment_provider(provider).await;
     }
 
+    let network_str = resolved_network.map(|n| n.as_str());
     tracing::info!(
         provider_id = %provider_id,
         merchant_profile_id = %profile.id,
         store = %store.id,
         store_name = %store.name,
         webhook_id = %created_webhook.id,
+        scoped = auth_state.scoped_initiator,
+        network = network_str.unwrap_or("master/any"),
         "BTCPay connected via authorize flow"
     );
+
+    // Audit every scoped connect (spec §7) — attributes the fund-redirection-
+    // sensitive op to the initiating credential + the resolved network. Master
+    // connects are already covered by the StartOS action audit trail.
+    if auth_state.scoped_initiator {
+        let _ = crate::db::repo::insert_audit(
+            &state.db,
+            "scoped_api_key",
+            auth_state.initiator_actor_hash.as_deref(),
+            "payment_provider.connect_scoped",
+            Some("payment_provider"),
+            Some(&provider_id),
+            None,
+            None,
+            &json!({
+                "kind": "btcpay",
+                "store_id": store.id,
+                "merchant_profile_id": profile.id,
+                "network": network_str,
+            }),
+        )
+        .await;
+    }
     Ok(())
 }
 

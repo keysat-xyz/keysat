@@ -366,3 +366,87 @@ pub async fn list_payment_methods(
         .cloned()
         .unwrap_or_default())
 }
+
+/// Resolve the Bitcoin **network** a store settles on, for the scoped
+/// payment-connect gate (`plans/agent-payment-connect-scope.md` §6.1).
+///
+/// Lists the store's payment methods, finds the on-chain BTC method
+/// (`paymentMethodId` is `BTC-CHAIN` on BTCPay 2.x, `BTC` on 1.x — never
+/// hardcode), fetches a receive address, and classifies the address prefix.
+///
+/// Returns:
+/// - `Ok(Some(network))` when positively determined;
+/// - `Ok(None)` when it **cannot** be determined (no on-chain method, no
+///   address, Lightning-only store, BTCPay not yet synced → `503`, or an
+///   unrecognized prefix). The caller MUST fail closed (treat `None` as
+///   mainnet and deny the scoped connect).
+///
+/// The address endpoint requires `btcpay.store.canmodifystoresettings`, which
+/// the daemon's authorize flow already requests (see `REQUESTED_PERMISSIONS`).
+pub async fn fetch_onchain_network(
+    base_url: &str,
+    api_key: &str,
+    store_id: &str,
+) -> Result<Option<super::network::BitcoinNetwork>> {
+    // Any failure to enumerate methods → undetermined → caller fails closed.
+    // Swallow the error here (uniform with the non-2xx wallet/address branch
+    // below) and log a body-free reason at warn; detail only at debug so an
+    // upstream error body never lands in normal logs on this sensitive path.
+    let methods = match list_payment_methods(base_url, api_key, store_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                store = %store_id,
+                "fetch_onchain_network: could not list payment methods; network undetermined"
+            );
+            tracing::debug!(error = %format!("{e:#}"), "btcpay list-payment-methods error detail");
+            return Ok(None);
+        }
+    };
+    // Find the on-chain BTC method. Lightning ids (`BTC-LN`,
+    // `BTC_LightningLike`, …) are deliberately excluded.
+    let Some(pmid) = methods.iter().find_map(|m| {
+        let id = m.get("paymentMethodId").and_then(|v| v.as_str())?;
+        match id.to_ascii_uppercase().as_str() {
+            "BTC-CHAIN" | "BTC" => Some(id.to_string()),
+            _ => None,
+        }
+    }) else {
+        return Ok(None); // no on-chain BTC method → undetermined → fail closed
+    };
+
+    // `pmid` is BTCPay-supplied; percent-encode it as a path segment so a
+    // hostile/buggy server returning an odd id can't corrupt the URL (it would
+    // only ever 4xx → Ok(None) → deny anyway, but keep the request well-formed).
+    let url = format!(
+        "{}/api/v1/stores/{store_id}/payment-methods/{}/wallet/address",
+        base_url.trim_end_matches('/'),
+        urlencoding::encode(&pmid),
+    );
+    let resp = Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(&url)
+        .header("Authorization", format!("token {api_key}"))
+        .send()
+        .await
+        .context("calling BTCPay wallet/address")?;
+    if !resp.status().is_success() {
+        // 503 (BTCPay not synced / on-chain service down), 404/422 (no wallet),
+        // 403 (insufficient perms) — none let us positively determine the
+        // network, so report undetermined and let the caller fail closed.
+        return Ok(None);
+    }
+    // A 2xx with a non-JSON body (misconfigured BTCPay) is likewise "can't
+    // determine" → Ok(None). Parsing via Ok(None) instead of `?` also keeps any
+    // body snippet reqwest attaches to a parse error out of warn-level logs.
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "btcpay wallet/address: non-JSON body; network undetermined");
+            return Ok(None);
+        }
+    };
+    let address = body.get("address").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(super::network::classify_address_network(address))
+}

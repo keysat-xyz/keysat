@@ -79,23 +79,47 @@ pub async fn save(pool: &SqlitePool, cfg: &BtcpayConfig) -> Result<()> {
     Ok(())
 }
 
+/// An in-flight authorize round-trip, recovered at callback time. `Default`
+/// (no profile, `scoped_initiator = false`) is the back-compat reading of a
+/// pre-0025 / NULL row: "master connect to the default profile" — the only
+/// kind that existed before scoped connect.
+#[derive(Debug, Clone, Default)]
+pub struct AuthorizeState {
+    /// Merchant profile the resulting provider row attaches to (migration
+    /// 0022). None → "the default profile".
+    pub merchant_profile_id: Option<String>,
+    /// True when a *scoped* key (not the master key) started the connect
+    /// (migration 0025). The callback applies the non-mainnet network gate
+    /// only for scoped initiators.
+    pub scoped_initiator: bool,
+    /// sha256 of the initiating credential — for the callback's audit row.
+    pub initiator_actor_hash: Option<String>,
+}
+
 /// Record a new in-flight authorize state token. `merchant_profile_id`
 /// (multi-provider model, migration 0022) names which merchant profile
 /// the resulting provider row should attach to when the callback fires
 /// — None falls back to "the default profile" at consume-time.
+/// `scoped_initiator` / `actor_hash` (migration 0025) carry who started the
+/// connect so the callback can apply the network gate + attribute the audit.
 pub async fn record_authorize_state(
     pool: &SqlitePool,
     token: &str,
     merchant_profile_id: Option<&str>,
+    scoped_initiator: bool,
+    actor_hash: Option<&str>,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO btcpay_authorize_state (state_token, merchant_profile_id, created_at) \
-         VALUES (?, ?, ?)",
+        "INSERT INTO btcpay_authorize_state \
+            (state_token, merchant_profile_id, created_at, scoped_initiator, initiator_actor_hash) \
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(token)
     .bind(merchant_profile_id)
     .bind(&now)
+    .bind(scoped_initiator as i64)
+    .bind(actor_hash)
     .execute(pool)
     .await
     .context("recording btcpay authorize state")?;
@@ -109,17 +133,18 @@ pub async fn record_authorize_state(
 }
 
 /// Validate that `token` was issued recently and has not been consumed.
-/// Consumes (deletes) the token on success so a replay fails, and
-/// returns the `merchant_profile_id` recorded at start-connect time so
-/// the callback knows which profile to attach the new provider to.
+/// Consumes (deletes) the token on success so a replay fails, and returns the
+/// recorded `AuthorizeState` (profile + initiator) so the callback knows which
+/// profile to attach to and whether to apply the scoped network gate.
 pub async fn consume_authorize_state(
     pool: &SqlitePool,
     token: &str,
-) -> Result<Option<String>> {
+) -> Result<AuthorizeState> {
     use sqlx::Row;
     let cutoff = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
     let row = sqlx::query(
-        "SELECT state_token, merchant_profile_id FROM btcpay_authorize_state \
+        "SELECT merchant_profile_id, scoped_initiator, initiator_actor_hash \
+         FROM btcpay_authorize_state \
          WHERE state_token = ? AND created_at >= ?",
     )
     .bind(token)
@@ -130,11 +155,19 @@ pub async fn consume_authorize_state(
     let Some(row) = row else {
         return Err(anyhow!("unknown or expired authorize state token"));
     };
-    let merchant_profile_id: Option<String> = row.try_get("merchant_profile_id").ok().flatten();
+    let state = AuthorizeState {
+        merchant_profile_id: row.try_get("merchant_profile_id").ok().flatten(),
+        // Tolerant read: a NULL/absent column reads as 0 (master) — fail toward
+        // the *less*-restrictive master path is acceptable here because the
+        // column only exists to ADD the scoped restriction; a pre-0025 token
+        // could only ever have been a master connect.
+        scoped_initiator: row.try_get::<i64, _>("scoped_initiator").unwrap_or(0) != 0,
+        initiator_actor_hash: row.try_get("initiator_actor_hash").ok().flatten(),
+    };
 
     sqlx::query("DELETE FROM btcpay_authorize_state WHERE state_token = ?")
         .bind(token)
         .execute(pool)
         .await?;
-    Ok(merchant_profile_id)
+    Ok(state)
 }

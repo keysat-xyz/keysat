@@ -59,23 +59,46 @@ pub enum AppError {
     Internal(#[from] anyhow::Error),
 }
 
+impl AppError {
+    /// HTTP status this error maps to. Exposed so handlers that render a
+    /// non-JSON body (e.g. the BTCPay callback's HTML page) still return the
+    /// correct status instead of a misleading 200 on a denied request.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::LicenseInvalid(_) => StatusCode::OK,
+            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            AppError::BtcpayNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
+            AppError::Database(_) | AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, code) = match &self {
-            AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
-            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
-            AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
-            AppError::LicenseInvalid(_) => (StatusCode::OK, "invalid"),
-            AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
-            AppError::BtcpayNotConfigured => (StatusCode::SERVICE_UNAVAILABLE, "btcpay_not_configured"),
-            AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-            AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
-            AppError::PaymentRequired { .. } => (StatusCode::PAYMENT_REQUIRED, "tier_cap"),
+        let status = self.status_code();
+        let code = match &self {
+            AppError::NotFound(_) => "not_found",
+            AppError::BadRequest(_) => "bad_request",
+            AppError::Unauthorized => "unauthorized",
+            AppError::Forbidden => "forbidden",
+            AppError::Conflict(_) => "conflict",
+            AppError::LicenseInvalid(_) => "invalid",
+            AppError::Upstream(_) => "upstream_error",
+            AppError::BtcpayNotConfigured => "btcpay_not_configured",
+            AppError::TooManyRequests(_) => "rate_limited",
+            AppError::ServiceUnavailable(_) => "service_unavailable",
+            AppError::PaymentRequired { .. } => "tier_cap",
             AppError::Database(_) | AppError::Internal(_) => {
                 tracing::error!(error = %self, "internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+                "internal_error"
             }
         };
 
