@@ -56,44 +56,21 @@ See [`src/crypto/mod.rs`](src/crypto/mod.rs) for the exact byte layout.
 
 ## Project layout
 
-```
-licensing-service/
-├── Cargo.toml
-├── LICENSE                        # source-available; no redistribution
-├── README.md
-├── .env.example                   # required env vars
-├── migrations/
-│   └── 0001_initial.sql           # SQLite schema
-├── src/
-│   ├── main.rs                    # entry point: wires everything
-│   ├── config.rs                  # env-driven config
-│   ├── error.rs                   # unified error → HTTP mapping
-│   ├── models.rs                  # shared domain types
-│   ├── crypto/
-│   │   ├── mod.rs                 # license key format + sign/verify
-│   │   └── keys.rs                # server keypair lifecycle
-│   ├── db/
-│   │   ├── mod.rs                 # pool + migrations
-│   │   └── repo.rs                # all SQL queries
-│   ├── btcpay/
-│   │   ├── client.rs              # Greenfield API client
-│   │   └── webhook.rs             # HMAC verification + event parsing
-│   └── api/
-│       ├── mod.rs                 # router + AppState
-│       ├── products.rs            # public product endpoints
-│       ├── purchase.rs            # buy + poll
-│       ├── validate.rs            # the hot path for downstream software
-│       ├── webhook.rs             # BTCPay landing
-│       └── admin.rs               # operator-only actions
-└── docs/
-    ├── API.md                     # full endpoint reference
-    ├── INTEGRATION.md             # for developers embedding a client
-    └── ARCHITECTURE.md            # deeper design notes
-```
+The daemon source lives under `src/`, organized by subsystem (browse it for the current layout — the tree below has grown well past the v0.1 snapshot):
+
+- `main.rs`, `config.rs`, `error.rs`, `models.rs` — entry point, env-driven config, error → HTTP mapping, shared domain types.
+- `crypto/` — the LIC1 license-key byte layout and Ed25519 sign/verify (the contract the four SDKs implement).
+- `db/` — SQLite pool, migrations, and `repo.rs` (all SQL). `migrations/` holds the numbered, additive schema (0001 through the latest; the schema has grown substantially since 0001).
+- `payment/` (`btcpay/`, `zaprite/`) + `merchant_profiles.rs` — the payment-provider abstraction and multi-profile routing.
+- `reconcile.rs`, `subscriptions.rs`, `upgrades.rs` — the background worker (invoice reconciliation, recurring renewals, tier upgrades).
+- `api/` — the ~30 route modules: public (`products`, `purchase`, `validate`, `redeem`) and admin (`admin*`, scoped API keys, webhooks, etc.), plus the router and `AppState` in `api/mod.rs`.
+- `web/index.html` — the embedded admin SPA.
+
+Deeper docs: [`docs/API.md`](docs/API.md), [`docs/INTEGRATION.md`](docs/INTEGRATION.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Running locally
 
-Prerequisites: Rust 1.75+, a BTCPay Server instance you can point at (local or hosted).
+Prerequisites: Rust 1.88+ (the build toolchain; the crate's Cargo.toml still declares MSRV 1.75, but the dependency tree now requires a newer compiler), a BTCPay Server instance you can point at (local or hosted).
 
 ```bash
 cp .env.example .env
@@ -143,7 +120,7 @@ curl -X POST http://localhost:8080/v1/validate \
 
 ## Deploying on Start9
 
-This repository ships the service only. To package as an `.s9pk` for the 0.4.0.x platform you'll need a separate wrapper repository following [docs.start9.com/packaging/0.4.0.x](https://docs.start9.com/packaging/0.4.0.x/). The service is designed to slot in cleanly:
+The StartOS wrapper lives in **this same repository** under `../startos/` (this `licensing-service/` directory is the daemon source it bundles). Build the `.s9pk` for the 0.4.0.x platform from the parent directory — see the build/release guide and `../Makefile`. The service is designed to slot in cleanly:
 
 - **Declares a dependency** on BTCPay Server in the manifest. StartOS will make BTCPay reachable at a `.startos` hostname and supply the env vars from the wrapper's action handlers.
 - **Persists to `/data`**, so everything (SQLite DB including the signing key) is covered by one-click encrypted backups.
@@ -170,4 +147,10 @@ Commercial redistribution / resale rights: contact licensing@keysat.xyz.
 
 ## Status
 
-v0.1 — minimal working implementation. Feature direction after this is expected to cover: SDK crates for Rust and TypeScript, s9pk wrapper repository, richer admin UI, invoice reconciliation job for dropped webhooks, per-product webhook endpoints for the operator.
+0.2.0 — shipped and in production. The current feature set:
+
+- **Four published SDKs** — TypeScript (npm), Rust (crates.io), Python (PyPI), and Go — all wire-compatible against the cross-check fixtures in `tests/crosscheck/`.
+- **StartOS wrapper included in this repo** under `../startos/`; build the `.s9pk` from the parent directory (no separate wrapper repository).
+- **Embedded admin SPA** (`web/index.html`) for all day-to-day operations.
+- **Subscriptions** (recurring auto-renew with trials + grace), **policies / tiers** with per-policy entitlements, **discount / referral / free-license codes**, **outbound webhooks** with a dead-letter queue, and a background **invoice reconciliation** job that recovers dropped payment webhooks.
+- **Payment providers**: BTCPay Server is required; Zaprite (card / fiat) is optional and gated by the `zaprite_payments` entitlement.

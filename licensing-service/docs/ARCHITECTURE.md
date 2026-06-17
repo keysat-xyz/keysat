@@ -12,13 +12,18 @@
 
 ## Data model
 
-See [`migrations/0001_initial.sql`](../migrations/0001_initial.sql). Five tables:
+The schema lives in [`migrations/`](../migrations/) as numbered, additive
+migrations (0001 through the latest — it has grown substantially past the
+original five-table v0.1 schema, adding discount codes, tiered pricing,
+multi-currency, subscriptions, tier upgrades, per-product entitlement catalogs,
+scoped API keys, merchant profiles, and more). The core tables established in
+[`0001_initial.sql`](../migrations/0001_initial.sql):
 
 - `products` — what's for sale. Independent pricing per product.
 - `invoices` — one per purchase attempt, keyed by BTCPay's invoice id.
-- `licenses` — one per successful payment (or manual issuance). Has optional `fingerprint` (machine bind) and `bound_identity` (user bind) columns.
+- `licenses` — one per successful payment (or manual issuance). Has optional `fingerprint` (machine bind) and `bound_identity` (user bind) columns. Later migrations add `expires_at`, entitlements, trial flag, and tier columns.
 - `validation_log` — append-only audit log of every validate call. Useful for detecting abuse (same key, many fingerprints) and for rate-limiting layers above us.
-- `server_keys` — singleton table holding the server's Ed25519 keypair. Generated on first boot, never rotated in v0.1 (rotation is a planned feature).
+- `server_keys` — singleton table holding the server's Ed25519 keypair. Generated on first boot.
 
 ## License key format
 
@@ -63,7 +68,6 @@ Who might attack this?
 - **Key rotation.** A single static signing key is fine for first launch. Rotation requires SDK multi-key support and a migration strategy; deferred.
 - **Trial periods / demos.** This is a pure paid-license server. Trials are the developer's responsibility in-app.
 - **Payment currencies other than BTC.** BTCPay supports Lightning, altcoins, and fiat; we only send BTC-denominated invoices. Adding Lightning is straightforward (BTCPay handles it transparently if the store has LN configured).
-- **Subscription / time-limited licenses.** The payload has an `issued_at` field but no `expires_at`. Adding expiry is a later schema + payload change.
 - **Multi-tenant / SaaS mode.** This is a *single-operator* server by design. Running multiple logical operators on one instance is a different product.
 - **Admin UI.** Everything is API-driven. Wrap it in whatever UI you like — or just use `curl`.
 

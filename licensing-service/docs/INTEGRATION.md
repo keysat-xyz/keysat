@@ -25,9 +25,18 @@ curl -s https://license.example.com/v1/pubkey | jq -r .public_key_pem
 
 Commit the resulting PEM into your client source tree. **Do not fetch it dynamically at runtime** — that would let an attacker who compromises your licensing server swap the key and re-sign forged licenses retroactively. A pinned public key is the whole point.
 
+> **Official SDKs exist — use them first.** Four wire-compatible client SDKs
+> are published: TypeScript (`@keysat/licensing-client` on npm), Rust
+> (`keysat-licensing-client` on crates.io), Python (`keysat-licensing-client`
+> on PyPI), and Go (`github.com/keysat-xyz/keysat-client-go`). Install commands
+> are in the main README. The by-hand reference implementations below are a
+> fallback for languages without an SDK, or for understanding exactly what the
+> SDKs do under the hood.
+
 ## Reference integration in Rust
 
-This is what a Start9 package written in Rust might look like. No SDK crate yet — that's planned; here's what you'd write by hand:
+This is what a Start9 package written in Rust might look like if you verify by
+hand instead of using the Rust SDK:
 
 ```rust
 use anyhow::{Context, Result};

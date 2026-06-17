@@ -80,10 +80,10 @@ comp keys, beta access, or "first N users free" launch promos.
 Built from the local `Dockerfile` via `images.main.source.dockerBuild`,
 with build context set to the parent directory so the Dockerfile can
 `COPY` from the sibling `licensing-service/` source tree. The Rust binary
-is statically linked against musl (target
-`*-unknown-linux-musl`) so the runtime image is a `scratch`-based final
-stage with no shared-library dependencies. Architectures: `x86_64` and
-`aarch64`.
+is statically compiled against musl (target `*-unknown-linux-musl`), and the
+runtime stage is `debian:bookworm-slim` with `ca-certificates`, `tini` (init /
+signal handling), and `sqlite3` (an SQL shell for occasional admin tasks)
+installed. Architectures: `x86_64` and `aarch64`.
 
 `start-cli s9pk pack` ingests the resulting OCI image, converts it to a
 squashfs filesystem image, and embeds that in the `.s9pk`. At runtime
@@ -105,25 +105,24 @@ mandatory.
 ## Installation and First-Run Flow
 
 1. Install Keysat via the marketplace (or sideload the `.s9pk`).
-2. Resolve the auto-created **critical task** "Connect BTCPay" by
-   running the **Connect BTCPay** action. This opens a one-click
-   authorize page on your local BTCPay; after approval, Keysat
-   auto-detects your store and registers an inbound webhook. No API
-   keys to copy.
-3. Run **Check BTCPay connection** to confirm — the install task clears
-   automatically.
-4. Set your **operator name** (shown on the public homepage and in
+2. Resolve the auto-created **important task** "Connect BTCPay" — open
+   the embedded admin web UI (**Settings → Payment providers**) and
+   click **Connect BTCPay**. This opens a one-click authorize page on
+   your local BTCPay; after approval, Keysat auto-detects your store and
+   registers an inbound webhook. No API keys to copy. The install task
+   clears automatically once BTCPay reports connected.
+3. Set your **operator name** (shown on the public homepage and in
    buyer-facing receipts).
-5. Create one or more **products** — each represents something you sell.
-6. Create at least one **policy** per product. Multi-tier ladders
+4. Create one or more **products** — each represents something you sell.
+5. Create at least one **policy** per product. Multi-tier ladders
    (Basic / Pro / Max) are first-class: when a product has two or more
    public policies, the buy page renders a tier picker and the buyer
    chooses before paying. Policies define duration, grace period, seat
    cap, entitlements, recurring cadence, trial flag, price overrides,
    marketing bullets, and per-entitlement hide-on-buy-page toggles.
-7. Optionally create **discount / referral / free-license codes** (see
-   `Create discount code` action).
-8. Share the public service URL with buyers.
+6. Optionally create **discount / referral / free-license codes** in the
+   admin web UI.
+7. Share the public service URL with buyers.
 
 ## Configuration Management
 
@@ -145,7 +144,7 @@ interfaces for clarity:
 | Interface | Type | Path prefix | Purpose                                                                      |
 |-----------|------|-------------|------------------------------------------------------------------------------|
 | `api`     | api  | `/`         | Public REST API for buyers (purchase, redeem) and licensed apps (validate, machine activation). Bake the URL into your software builds as the licensing endpoint. |
-| `webhook` | api  | `/btcpay`   | BTCPay webhook landing endpoint. Registered automatically during Connect BTCPay; not for human use. |
+| `webhook` | api  | `/btcpay`   | BTCPay webhook landing endpoint. Registered automatically when you connect BTCPay in the admin web UI; not for human use. |
 
 StartOS terminates TLS at the platform edge. Inside the container every
 request arrives as plain HTTP. For browser-facing URLs (e.g., the public
@@ -153,44 +152,23 @@ purchase page) hardcode `https://`.
 
 ## Actions (StartOS UI)
 
-Grouped as displayed in the dashboard.
+The StartOS Actions tab is intentionally minimal — only the four operations
+that must happen outside the embedded admin web UI are registered as actions:
 
-**General**
-- *Set operator name* — your public-facing brand.
+- *Set web UI password* — set / recover the admin SPA login password (you
+  can't reset it from inside the UI if you're locked out).
+- *Show credentials* — reveal the admin API key on first install, before
+  you've logged into the admin UI.
+- *Activate Keysat license* — first-install bootstrap for paid self-hosting
+  tiers, and recovery if `/data/keysat-license.txt` is lost.
+- *Show license status* — sanity-check the self-license state without
+  logging into the admin UI.
 
-**BTCPay**
-- *Connect BTCPay* — one-click authorize against your BTCPay; auto-detects store and registers webhook.
-- *Check BTCPay connection* — confirm BTCPay state; clears the install task on success.
-
-**Credentials**
-- *Show admin credentials* — admin API key for direct `/v1/admin/*` access.
-
-**Products + Policies**
-- *Create product* — declare something to sell.
-- *Create policy* — license template for a product (duration, grace, seat cap, entitlements, trial flag, price override).
-
-**Discount codes**
-- *Create discount code* — percent-off / fixed-sats-off / free-license.
-- *List discount codes* — usage stats.
-- *Disable / enable discount code*.
-
-**Licenses**
-- *Issue license manually* — comp / press / grandfathered keys.
-- *Search licenses* — by email or BTCPay invoice id.
-- *Suspend license* — reversible lockout.
-- *Unsuspend license*.
-- *Revoke license* — terminal kill.
-
-**Machines**
-- *List machines* — installs bound to a license.
-- *Deactivate machine* — free a seat.
-
-**Webhooks (outbound)**
-- *Register webhook endpoint* — POST signed events to your URL.
-- *List webhook endpoints*.
-
-**Diagnostics**
-- *View audit log* — admin mutation history, filterable.
+Everything else — connecting BTCPay (and Zaprite), operator name, products,
+policies, discount / referral / free-license codes, licenses, machines,
+outbound webhooks, scoped API keys, and the audit log — lives in the embedded
+**admin web UI** (Settings tab + the workspace sidebar), not as StartOS
+actions.
 
 ## Backups and Restore
 
@@ -228,7 +206,7 @@ Known current limitations:
 - **No bulk / volume licensing UI.** "Buy 10 keys at once with discount" is not built into the buy page. Operators can issue N comp licenses via the admin API in a loop.
 - **Webhook delivery retries are bounded.** A subscriber down past the 10-attempt retry window lands in the dead-letter queue (visible in admin UI → Webhooks → Failed). BTCPay invoice reconciliation runs as a background poll so dropped *payment* webhooks are recovered.
 - **Hardware fingerprinting is client-supplied.** Keysat does not derive fingerprints itself; the buyer-side SDK passes whatever the integrator chose. The fingerprint is bound on first activate and enforced thereafter.
-- **Card payments not shipped.** The Zaprite payment provider is in design for v0.3 — operators on Pro / Patron will get a card-payment option alongside BTCPay. Until then, payments are BTC / Lightning only.
+- **Card payments via Zaprite are gated.** Zaprite ships as an optional second payment provider (card / fiat alongside BTCPay) but is gated by the `zaprite_payments` entitlement — operators on the tiers that grant it can connect Zaprite in the admin web UI. BTCPay remains the required provider; without the entitlement, payments are BTC / Lightning only.
 
 ## What Is Unchanged from Upstream
 
@@ -257,7 +235,7 @@ service:
   marketingUrl: https://keysat.xyz
 image:
   source: dockerBuild
-  baseImage: scratch (musl-static Rust binary)
+  baseImage: debian:bookworm-slim (musl-compiled Rust binary; bundles ca-certificates, tini, sqlite3)
   arches: [x86_64, aarch64]
 volumes:
   - id: main
@@ -292,10 +270,10 @@ backups:
 firstRun:
   tasks:
     - id: btcpay-initial-setup
-      severity: critical
+      severity: important
       runs: configureBtcpay
 features:
-  paymentRail: btcpay-server   # zaprite planned for v0.3 (card payments)
+  paymentProviders: [btcpay-server, zaprite]   # btcpay required; zaprite optional, gated by the zaprite_payments entitlement
   signing: ed25519
   offlineVerification: true
   multiSeat: true
@@ -315,7 +293,7 @@ features:
   outboundWebhooks: true
   webhookDlq: true   # failed deliveries retryable from admin UI
   auditLog: true
-  scopedApiKeys: [read-only, license-issuer, support, full-admin]
+  scopedApiKeys: [read-only, license-issuer, support, merchant-onboard, full-admin]
   openapiSpec: /v1/openapi.json
   selfLicensingTier: [Creator, Pro, Patron]
 sdks:

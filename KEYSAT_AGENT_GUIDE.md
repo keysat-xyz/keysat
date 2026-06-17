@@ -57,6 +57,7 @@ API keys. Each carries a role that bounds what it can do. Format: `ks_<43 chars>
 | `read-only` | List / get every resource. Mutate nothing. |
 | `license-issuer` | All `read-only` scopes + issue / revoke / suspend / change-tier on licenses. Cannot touch products, policies, or codes. |
 | `support` | All `license-issuer` scopes + cancel subscriptions + force-deactivate machines. |
+| `merchant-onboard` | All `read-only` scopes + `products:write` + `policies:write` + `licenses:write` — the least-privilege credential for standing up a fresh catalog (create products, define policies/tiers, issue licenses against them) via the API. Deliberately excludes the support writes (subscriptions / machines) and every master-only gate. Tier caps still bound it. |
 | `full-admin` | Every scope. Equivalent to the master key for most endpoints. |
 
 Endpoints that touch settings (operator name, payment provider connections,
@@ -138,7 +139,7 @@ upgrade CTA without parsing message strings.
 | `expired` | Past `expires_at` |
 | `fingerprint_mismatch` | Different machine than the one bound on first activate |
 | `product_mismatch` | License is for a different product than the caller asserted |
-| `machine_cap_exceeded` | Activating this fingerprint would exceed `max_machines` |
+| `too_many_machines` | Activating this fingerprint would exceed `max_machines` |
 
 ---
 
@@ -173,7 +174,9 @@ curl -X POST $KS/v1/admin/licenses/$LICENSE_ID/revoke \
   -d '{"reason":"customer request"}'
 ```
 
-Idempotent. The next online validate from the buyer's app returns `reason: revoked`.
+The next online validate from the buyer's app returns `reason: revoked`. Not
+idempotent — a second revoke of the same license returns `404 not_found` (treat
+as success-equivalent on retry; see Idempotency below).
 
 Scope required: `licenses:write`.
 
@@ -277,10 +280,16 @@ A few patterns that work well in practice.
 
 ### Idempotency
 
-The daemon's mutation endpoints are idempotent where they can be. Revoke,
-suspend, unsuspend, archive, unarchive, subscription cancel — all return
-success on the second call without changing state. Your agent can safely
-retry on network errors.
+The daemon's mutation endpoints are idempotent where they can be. Suspend,
+unsuspend, archive, unarchive, subscription cancel — all return success on the
+second call without changing state. Your agent can safely retry on network
+errors.
+
+One exception: **revoke is not idempotent** — revoking an already-revoked
+license returns `404 not_found` (the row no longer matches the
+`status != 'revoked'` update guard). When retrying a revoke after an ambiguous
+network failure, treat a `404` as success-equivalent: the license is already
+revoked.
 
 ### Pagination
 
@@ -349,15 +358,26 @@ Some operations are deliberately operator-only and not accessible to any
 scoped key, including `full-admin`:
 
 - Generating / revoking scoped API keys (`/v1/admin/api-keys`)
-- Connecting / disconnecting payment providers
+- Disconnecting a payment provider, and connecting *any* provider on a
+  production daemon
 - Setting the operator name
 - Activating the self-license (`/v1/admin/self-license`)
 - Resetting the analytics install_uuid
 - Changing the web UI password (StartOS Action only)
 
 These all require the master `KEYSAT_ADMIN_API_KEY`. The reasoning: an agent
-that can rotate its own credentials, connect arbitrary payment processors, or
-change the operator identity is no longer bounded by the role it was given.
+that can rotate its own credentials, redirect settled payments, or change the
+operator identity is no longer bounded by the role it was given.
+
+**One narrow exception — agent-delegated payment connect.** A key granted the
+à-la-carte `payment_providers:write` scope (never granted by any role —
+operators add it explicitly per key) CAN initiate a BTCPay connect, but only
+fail-closed under two gates: the daemon must be in **sandbox mode** (an outer
+gate — scoped connect is refused outright on a production daemon, even for
+regtest), and the target store must be **non-mainnet** (an inner gate enforced
+after the OAuth round-trip). Disconnecting a provider, and any connect on a
+production / mainnet daemon, remain master-only. This lets an integrating agent
+wire up a throwaway sandbox without ever touching a live store's settlement.
 
 ---
 

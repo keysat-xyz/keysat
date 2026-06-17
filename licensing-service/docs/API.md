@@ -6,7 +6,7 @@ All endpoints are JSON in / JSON out. Errors return a body of the form:
 { "ok": false, "error": "not_found", "message": "product 'xyz'" }
 ```
 
-Admin endpoints require `Authorization: Bearer $LICENSING_ADMIN_API_KEY`.
+Admin endpoints require `Authorization: Bearer $KEYSAT_ADMIN_API_KEY`.
 
 ---
 
@@ -128,7 +128,7 @@ On failure:
 { "ok": false, "reason": "revoked" }
 ```
 
-Possible `reason` values: `bad_format`, `bad_signature`, `not_found`, `revoked`, `product_mismatch`, `fingerprint_mismatch`.
+Possible `reason` values: `bad_format`, `bad_signature`, `not_found`, `revoked`, `suspended`, `expired`, `product_mismatch`, `fingerprint_mismatch`, `too_many_machines` (multi-seat cap reached).
 
 ### `POST /v1/btcpay/webhook`
 
@@ -138,7 +138,7 @@ Landing point for BTCPay Server webhook events. Only BTCPay should call this. We
 
 ## Admin endpoints
 
-All of these require `Authorization: Bearer $LICENSING_ADMIN_API_KEY`.
+All of these require `Authorization: Bearer $KEYSAT_ADMIN_API_KEY`.
 
 ### `POST /v1/admin/products`
 
