@@ -43,14 +43,24 @@ Individual stages (`boot-fixture.sh`, `provision.sh`, `serve-docs.sh`,
    marketing copy), tear down, and re-run on a fresh fixture.
 3. Repeat until `completed-clean`.
 
-## Stage 2 (gated, not built yet)
+## Stage 2 (buyer pays on regtest) — built, `completed-clean`
 
-The buyer-pays-on-regtest path needs Keysat to ship `payment_providers:write` +
-the sandbox-mode daemon flag + the network gate (slices 3–5, in progress). It
-adds a Dockerized BTCPay regtest stack and grants the agent
-`merchant-onboard` + `payment_providers:write` so it can connect BTCPay
-(regtest) and drive a test buyer payment end to end. Connecting a *mainnet*
-wallet stays operator-only by design — that boundary is a feature, not a gap.
+Lives in `stage2/`. Boots a **sandbox** daemon (`KEYSAT_SANDBOX_MODE=1`) wired to
+a Dockerized BTCPay **regtest** stack and grants the agent `merchant-onboard` +
+`payment_providers:write` so it connects BTCPay (regtest) and drives a test buyer
+payment end to end. Connecting a *mainnet* wallet stays operator-only by design —
+that boundary is a feature, not a gap.
+
+```sh
+(cd stage2/btcpay-regtest && docker compose -p keysat-btcpay up -d)   # one-time
+./stage2/run-stage2.sh            # boots sandbox daemon + regtest wiring + scoped key
+# feed runs/<id>/AGENT_BRIEF.md to the onboarding-tester agent
+```
+
+- `stage2/btcpay-regtest/` — the BTCPay regtest compose + de-risk probe (`FINDINGS.md`).
+- `stage2/validate-gate.sh` — end-to-end gate check (deny mainnet/undetermined, allow regtest).
+- `stage2/buyer-pay.sh` — the test buyer's wallet (pay invoice on regtest + mine).
+- `stage2/STAGE2-RESULT.md` — convergence + the publishable walkthrough.
 
 ## Requirements
 

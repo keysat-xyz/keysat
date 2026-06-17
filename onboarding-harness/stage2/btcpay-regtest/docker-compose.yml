@@ -1,0 +1,87 @@
+# Throwaway BTCPay Server regtest stack — de-risk rig for agent-payment-connect
+# network detection (spec §6.1). NOT a production deployment, NOT yet wired into
+# the Stage 2 harness. Bring up:  docker compose -p keysat-btcpay up -d
+# Tear down (incl. volumes):     docker compose -p keysat-btcpay down -v
+#
+# Ports published to the host:
+#   BTCPay UI/Greenfield API → http://127.0.0.1:49392
+#   bitcoind regtest RPC     → 127.0.0.1:43782  (user/pass keysat/keysat)
+services:
+  bitcoind:
+    image: btcpayserver/bitcoin:28.1
+    environment:
+      BITCOIN_NETWORK: regtest
+      BITCOIN_EXTRA_ARGS: |
+        rpcuser=keysat
+        rpcpassword=keysat
+        rpcbind=0.0.0.0:43782
+        rpcallowip=0.0.0.0/0
+        port=39388
+        whitelist=0.0.0.0/0
+        zmqpubrawblock=tcp://0.0.0.0:28332
+        zmqpubrawtx=tcp://0.0.0.0:28333
+        fallbackfee=0.0002
+        txindex=1
+    expose:
+      - "43782"
+      - "39388"
+      - "28332"
+      - "28333"
+    ports:
+      - "127.0.0.1:43782:43782"
+    volumes:
+      - bitcoin_datadir:/data
+
+  postgres:
+    image: postgres:13.13
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres_datadir:/var/lib/postgresql/data
+
+  nbxplorer:
+    image: nicolasdorier/nbxplorer:2.5.22
+    restart: unless-stopped
+    environment:
+      NBXPLORER_NETWORK: regtest
+      NBXPLORER_NOAUTH: "1"
+      NBXPLORER_BIND: 0.0.0.0:32838
+      NBXPLORER_TRIMEVENTS: "10000"
+      NBXPLORER_SIGNALFILESDIR: /datadir
+      NBXPLORER_CHAINS: "btc"
+      NBXPLORER_BTCRPCURL: http://bitcoind:43782/
+      NBXPLORER_BTCRPCUSER: keysat
+      NBXPLORER_BTCRPCPASSWORD: keysat
+      NBXPLORER_BTCNODEENDPOINT: bitcoind:39388
+      NBXPLORER_POSTGRES: User ID=postgres;Host=postgres;Port=5432;Application Name=nbxplorer;MaxPoolSize=20;Database=nbxplorer
+    depends_on:
+      - bitcoind
+      - postgres
+    volumes:
+      - nbxplorer_datadir:/datadir
+
+  btcpayserver:
+    image: btcpayserver/btcpayserver:2.0.6
+    restart: unless-stopped
+    environment:
+      BTCPAY_POSTGRES: User ID=postgres;Host=postgres;Port=5432;Application Name=btcpayserver;MaxPoolSize=20;Database=btcpayserver
+      BTCPAY_NETWORK: regtest
+      BTCPAY_BIND: 0.0.0.0:49392
+      BTCPAY_ROOTPATH: /
+      BTCPAY_PROTOCOL: http
+      BTCPAY_CHAINS: "btc"
+      BTCPAY_BTCEXPLORERURL: http://nbxplorer:32838/
+      BTCPAY_DEBUGLOG: btcpay.log
+    ports:
+      - "127.0.0.1:49392:49392"
+    depends_on:
+      - nbxplorer
+      - postgres
+    volumes:
+      - btcpay_datadir:/datadir
+
+volumes:
+  bitcoin_datadir:
+  postgres_datadir:
+  nbxplorer_datadir:
+  btcpay_datadir:
