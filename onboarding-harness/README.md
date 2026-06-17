@@ -53,14 +53,25 @@ that boundary is a feature, not a gap.
 
 ```sh
 (cd stage2/btcpay-regtest && docker compose -p keysat-btcpay up -d)   # one-time
+./stage2/btcpay-regtest/probe.sh  # mints the BTCPay store token into .live-env (one-time)
 ./stage2/run-stage2.sh            # boots sandbox daemon + regtest wiring + scoped key
 # feed runs/<id>/AGENT_BRIEF.md to the onboarding-tester agent
+./stage2/teardown-stage2.sh       # WHEN DONE: stop daemon(s) + docs + sandbox dev server + BTCPay stack
 ```
 
 - `stage2/btcpay-regtest/` — the BTCPay regtest compose + de-risk probe (`FINDINGS.md`).
 - `stage2/validate-gate.sh` — end-to-end gate check (deny mainnet/undetermined, allow regtest).
 - `stage2/buyer-pay.sh` — the test buyer's wallet (pay invoice on regtest + mine).
+- `stage2/teardown-stage2.sh` — full cleanup: tears down every Stage 2 run, kills any orphaned
+  sandbox dev server (`:4311`), and stops the BTCPay docker stack + volumes (`--keep-btcpay`
+  to leave it up between runs). **Always run this when finished** — the agent can leave a
+  daemon, a docs server, or an `npm run dev` behind.
 - `stage2/STAGE2-RESULT.md` — convergence + the publishable walkthrough.
+
+**Harvesting on a clean run:** do NOT reflexively bolt a new success story onto the public
+HTML. First check whether `keysat-docs/agent.html` (the connect workflow + worked example)
+and the docs already cover the buyer-pays + SDK-gating case well enough; only propose
+additions for a genuine gap, with operator approval.
 
 ## Requirements
 
