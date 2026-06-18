@@ -67,7 +67,7 @@ use crate::payment::CreateInvoiceParams;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use std::time::Duration as StdDuration;
 use uuid::Uuid;
@@ -1349,13 +1349,18 @@ pub async fn capture_zaprite_payment_profile(
 /// worker *after* it has created the order; this turns the order
 /// from "buyer must pay" into "auto-charged, will settle via the
 /// usual webhook." Returns:
-///   - `Ok(true)`  — the charge call succeeded; the buyer is not
-///                   expected to pay manually. The settle webhook
-///                   will fire on its own and flip the sub to
-///                   `active` via `on_invoice_settled`.
-///   - `Ok(false)` — sub has no saved profile, or active provider
-///                   isn't Zaprite. Caller proceeds with manual-pay
-///                   fallback (`subscription.renewal_pending`).
+///   - `Ok(true)`  — the charge settled (order status PAID/COMPLETE/
+///                   OVERPAID); the buyer is not expected to pay
+///                   manually. The settle webhook will fire on its
+///                   own and flip the sub to `active` via
+///                   `on_invoice_settled`.
+///   - `Ok(false)` — sub has no saved profile, active provider isn't
+///                   Zaprite, OR Zaprite accepted the request (HTTP
+///                   2xx) but the order did NOT reach a settled status
+///                   (declined/expired/in-flight/unknown). In every
+///                   `Ok(false)` case the caller proceeds with the
+///                   manual-pay fallback (`subscription.renewal_pending`)
+///                   so the buyer keeps a path to recover the cycle.
 ///   - `Err(_)`    — Zaprite returned an error (declined card,
 ///                   expired profile, network blip). Caller treats
 ///                   this as a soft failure: log, audit, and ALSO
@@ -1400,12 +1405,86 @@ async fn try_auto_charge_zaprite(
         .await
         .context("Zaprite charge_order_with_profile")?;
 
+    // A 2xx from `/v1/orders/charge` only means Zaprite ACCEPTED the
+    // request — the order's `status` says whether the money actually
+    // moved. A charge that came back declined/expired/in-flight (or any
+    // status we don't positively recognize as settled) leaves no settle
+    // webhook to wait for, so returning Ok(true) here would silently
+    // lapse the sub: we'd suppress the manual-pay notification and wait
+    // forever for an `order.paid` that never arrives. Fail safe — only
+    // suppress manual-pay when the order is in a recognized settled
+    // state; otherwise fall through (Ok(false)) so the buyer still gets
+    // a pay link and can recover the cycle.
+    let order_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+    if !zaprite_charge_settled(&resp) {
+        tracing::warn!(
+            sub_id = %sub.id,
+            order_id = %provider_invoice_id,
+            profile_id = %profile_id,
+            order_status,
+            "Zaprite auto-charge accepted (HTTP 2xx) but order is not settled; \
+             falling back to manual-pay renewal"
+        );
+        return Ok(false);
+    }
+
     tracing::info!(
         sub_id = %sub.id,
         order_id = %provider_invoice_id,
         profile_id = %profile_id,
-        order_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
-        "Zaprite auto-charge succeeded; awaiting settle webhook"
+        order_status,
+        "Zaprite auto-charge settled; awaiting settle webhook"
     );
     Ok(true)
+}
+
+/// Does a Zaprite `/v1/orders/charge` response (HTTP 2xx already
+/// confirmed by the client) indicate the charge actually settled?
+///
+/// Mirrors the PAID/COMPLETE/OVERPAID → `Settled` mapping in
+/// `ZapriteProvider::get_invoice_status`. Deliberately an **allowlist**,
+/// not a failure blocklist: Zaprite's confirmed order-status enum is
+/// PENDING|PROCESSING|PAID|COMPLETE|OVERPAID|UNDERPAID with no documented
+/// terminal-failure string, so any unrecognized or missing status must be
+/// treated as "not settled" and routed to manual-pay rather than
+/// optimistically assumed paid.
+fn zaprite_charge_settled(resp: &Value) -> bool {
+    matches!(
+        resp.get("status").and_then(|v| v.as_str()),
+        Some("PAID") | Some("COMPLETE") | Some("OVERPAID")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zaprite_charge_settled;
+    use serde_json::json;
+
+    #[test]
+    fn charge_settled_only_for_recognized_paid_statuses() {
+        // Settled states → suppress manual-pay (Ok(true) upstream).
+        for s in ["PAID", "COMPLETE", "OVERPAID"] {
+            assert!(
+                zaprite_charge_settled(&json!({ "status": s })),
+                "{s} should count as settled"
+            );
+        }
+        // The silent-lapse guard: a 2xx carrying any non-settled status
+        // must NOT be treated as success. In-flight, underpaid,
+        // terminal-failure, and unknown statuses all fall through to the
+        // manual-pay path.
+        for s in [
+            "PENDING", "PROCESSING", "UNDERPAID", "FAILED", "DECLINED", "EXPIRED",
+            "CANCELED", "REFUNDED", "",
+        ] {
+            assert!(
+                !zaprite_charge_settled(&json!({ "status": s })),
+                "{s} must NOT count as settled"
+            );
+        }
+        // Malformed / absent / non-string status fields fall through too.
+        assert!(!zaprite_charge_settled(&json!({})));
+        assert!(!zaprite_charge_settled(&json!({ "status": null })));
+        assert!(!zaprite_charge_settled(&json!({ "status": 200 })));
+    }
 }
