@@ -27,10 +27,14 @@ use uuid::Uuid;
 
 /// A merchant profile row. Mirrors the `merchant_profiles` table.
 ///
-/// SMTP fields are flattened onto the same struct for simplicity; they
-/// land in the same table on the same row. NULL on all six means
-/// "inherit StartOS-level SMTP config." See the keysat-smtp-emails
-/// plan for how they're consumed.
+/// NOTE: the `smtp_*` fields are DORMANT and not consumed by anything.
+/// They were laid down in migration 0020 ahead of the keysat-smtp-emails
+/// plan, which was SUPERSEDED 2026-06-18: Keysat will never send buyer
+/// email itself (operators own that via their own app + the existing
+/// webhooks). The columns are left in place because a removal migration
+/// isn't worth it — do not build a send path against them. See
+/// `plans/keysat-smtp-emails.md` (superseded banner) and the
+/// "Operability & alerts" ROADMAP item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerchantProfile {
     pub id: String,
@@ -42,7 +46,8 @@ pub struct MerchantProfile {
     pub post_purchase_redirect_url: Option<String>,
     pub is_default: bool,
 
-    // SMTP override (all-or-nothing for now; the SMTP plan refines this).
+    // Dormant SMTP-override columns (see struct doc) — stored/returned
+    // but never read to send mail; no send path exists or is planned.
     pub smtp_host: Option<String>,
     pub smtp_port: Option<i64>,
     pub smtp_username: Option<String>,
