@@ -205,13 +205,16 @@ fn log_licensed(tier: &Tier) {
 /// trust root and reads its entitlements from the signed payload. That
 /// signed set is the ceiling. This function lets issuer-applied changes
 /// reach a running daemon without a restart — revocations, suspensions,
-/// and downgrades — by re-reading the `licenses` row by license_id and
-/// applying its current state. The signed key stays authoritative: the
-/// DB row may *narrow* the tier but never *widen* it beyond what the
-/// signature grants (see `clamp_to_signed_ceiling`).
+/// downgrades, and the key's own expiry — by re-verifying the on-disk
+/// key and re-reading the `licenses` row by license_id. The signed key
+/// stays authoritative: the DB row may *narrow* the tier but never
+/// *widen* it beyond what the signature grants (see
+/// `clamp_to_signed_ceiling`).
 ///
 /// Behavior:
 /// - On-disk tier is `Unlicensed` → no-op (no license_id to look up).
+/// - Signed key no longer verifies (expired, tampered, corrupt) → demote
+///   to `Unlicensed`.
 /// - `licenses` row missing → keep the signed-payload tier as last-known
 ///   (legitimate for a daemon that's never synced its row).
 /// - Row revoked or suspended → demote to `Unlicensed`.
@@ -233,6 +236,43 @@ pub async fn refresh_self_tier_from_db(
     let license_id = match current {
         Tier::Licensed { license_id, .. } => license_id.to_string(),
         Tier::Unlicensed { .. } => return current.clone(),
+    };
+
+    // Re-read and re-verify the on-disk/env self-license key on every
+    // pass. This is what makes the key's own EXPIRY (and any tampering or
+    // corruption) take effect on a *running* daemon, not just at the next
+    // restart — mirroring how the licenses we issue are re-checked on
+    // every `/v1/validate`. Done before the DB lookup so an expired key
+    // demotes even when the daemon has no synced `licenses` row. The
+    // verified entitlements double as the ceiling the DB row is clamped
+    // to below.
+    let signed_ceiling = match read_license_string() {
+        Some(key) => match verify_license(&key) {
+            Ok(tier) => Some(entitlements_of(&tier)),
+            // Present but no longer verifies — expired, tampered, or
+            // corrupt. Demote to Creator (free), same as revoked/suspended.
+            // A read racing a concurrent `activate` file-write could trip
+            // this transiently; it self-heals on the next pass.
+            Err(e) => {
+                tracing::warn!(
+                    license_id = %license_id,
+                    "self-tier refresh: self-license no longer verifies ({e:#}); demoting to Creator (free) tier"
+                );
+                return Tier::Unlicensed {
+                    reason: format!("self-license re-verification failed: {e:#}"),
+                };
+            }
+        },
+        // No key on disk or in env though we booted Licensed — the source
+        // was removed. Keep last-known entitlements as the ceiling (offline
+        // grace), but log it.
+        None => {
+            tracing::warn!(
+                license_id = %license_id,
+                "self-tier refresh: self-license source missing; keeping last-known entitlements"
+            );
+            None
+        }
     };
 
     let row = match crate::db::repo::get_license_by_id(pool, &license_id).await {
@@ -269,18 +309,13 @@ pub async fn refresh_self_tier_from_db(
         };
     }
 
-    // The signed key is the ceiling. Re-derive the entitlements it
-    // grants — re-verifying it against the embedded trust root — and
-    // clamp the live DB row to that set: the local row may narrow the
-    // tier (a downgrade applied by the issuer) but must never widen it
-    // beyond what the signature authorizes. Activation keeps the on-disk
-    // key in sync, so this tracks the current license at boot and at
-    // runtime. If the key can't be re-read mid-run, fall back to the
-    // in-effect entitlements — themselves already clamped on a prior
-    // pass — so a DB edit still can't widen the tier.
-    let signed = read_license_string().and_then(|s| verify_license(&s).ok());
-    let ceiling = match &signed {
-        Some(tier) => entitlements_of(tier),
+    // Clamp the live DB row to the signed ceiling derived above: the row
+    // may narrow the tier (an issuer-applied downgrade) but must never
+    // widen it beyond what the signature authorizes. If the key source
+    // was missing, fall back to the in-effect entitlements — themselves
+    // already clamped on a prior pass — so a DB edit still can't widen.
+    let ceiling = match &signed_ceiling {
+        Some(c) => c.clone(),
         None => entitlements_of(current),
     };
     let entitlements = clamp_to_signed_ceiling(row.entitlements.clone(), &ceiling);
@@ -381,5 +416,17 @@ mod tests {
     fn empty_signed_ceiling_strips_everything() {
         let db = v(&["unlimited_products", "patron"]);
         assert!(clamp_to_signed_ceiling(db, &[]).is_empty());
+    }
+
+    #[test]
+    fn partial_downgrade_keeps_the_still_granted_entitlements() {
+        // Multi-entitlement signed key; the DB row drops one of them
+        // (an issuer-applied partial downgrade) and keeps the rest.
+        let signed = v(&["unlimited_products", "recurring_billing", "zaprite_payments"]);
+        let db = v(&["unlimited_products", "zaprite_payments"]);
+        assert_eq!(
+            clamp_to_signed_ceiling(db, &signed),
+            v(&["unlimited_products", "zaprite_payments"])
+        );
     }
 }
