@@ -201,43 +201,31 @@ fn log_licensed(tier: &Tier) {
 
 /// Live-refresh the daemon's self-tier from the local `licenses` row.
 ///
-/// Why this exists: `check_at_boot` parses the on-disk LIC1 key and
-/// extracts entitlements from the SIGNED PAYLOAD. Those entitlements
-/// are immutable for the life of that key — the operator can't ever
-/// downgrade themselves by editing the DB row, because the daemon
-/// trusts the signature, not the DB.
-///
-/// In practice that means tier upgrades / downgrades / revocations
-/// applied via admin (or eventually, via an upstream master) don't
-/// propagate to a running daemon — even though the daemon is online
-/// and the data is right there in its own DB. This function is the
-/// fix: re-read the licenses row by license_id and use the LIVE
-/// entitlements + revocation status. The on-disk signed key is kept
-/// as proof-of-authenticity (signature still verifies) but the live
-/// DB row is the source of tier truth.
+/// `check_at_boot` verifies the on-disk LIC1 key against the embedded
+/// trust root and reads its entitlements from the signed payload. That
+/// signed set is the ceiling. This function lets issuer-applied changes
+/// reach a running daemon without a restart — revocations, suspensions,
+/// and downgrades — by re-reading the `licenses` row by license_id and
+/// applying its current state. The signed key stays authoritative: the
+/// DB row may *narrow* the tier but never *widen* it beyond what the
+/// signature grants (see `clamp_to_signed_ceiling`).
 ///
 /// Behavior:
-/// - If the on-disk tier is `Unlicensed`, do nothing — there's no
-///   license_id to look up.
-/// - If the licenses row is missing in the DB (legitimate for a
-///   daemon that's never been online to sync, e.g.), keep the
-///   signed-payload tier as last-known.
-/// - If the row is revoked, demote to `Unlicensed { reason: "revoked" }`.
-/// - Otherwise, replace the entitlements vec with whatever the DB
-///   row currently says.
+/// - On-disk tier is `Unlicensed` → no-op (no license_id to look up).
+/// - `licenses` row missing → keep the signed-payload tier as last-known
+///   (legitimate for a daemon that's never synced its row).
+/// - Row revoked or suspended → demote to `Unlicensed`.
+/// - Otherwise → keep the signed product/expiry, with entitlements taken
+///   from the DB row clamped to the signed ceiling.
 ///
 /// Run from main.rs at boot (after `check_at_boot`) and on a 1-hour
-/// interval thereafter. Also surfaced as an admin "Refresh
-/// self-license tier" action for operators who want to trigger
-/// immediately after a change instead of waiting for the next tick.
+/// interval thereafter. Also surfaced as an admin "Refresh self-license
+/// tier" action for an immediate pass instead of waiting for the tick.
 ///
-/// Non-master operators in v0.3+ can extend this to call
-/// `https://licensing.keysat.xyz/v1/validate` instead of (or in
-/// addition to) the local DB. For v0.2.x, local-DB-only — which is
-/// the right thing for the master Keysat (which is selling its own
-/// licenses) and a no-op-but-safe for downstream operators (their
-/// own DB row hasn't been mutated, so live read returns the same
-/// thing as the boot-time signed-payload extraction).
+/// Non-master operators in v0.3+ can extend this to consult
+/// `https://licensing.keysat.xyz/v1/validate` in addition to the local
+/// DB. For v0.2.x it is local-DB-only; an honest downstream operator's
+/// DB row matches its signed key, so the clamp is a no-op there.
 pub async fn refresh_self_tier_from_db(
     pool: &sqlx::SqlitePool,
     current: &Tier,
@@ -281,10 +269,21 @@ pub async fn refresh_self_tier_from_db(
         };
     }
 
-    // Pull the LIVE entitlements from the DB. These can differ from
-    // the signed payload's entitlements (which were baked at signing
-    // time) if an admin has done a Change Tier on this license.
-    let entitlements = row.entitlements.clone();
+    // The signed key is the ceiling. Re-derive the entitlements it
+    // grants — re-verifying it against the embedded trust root — and
+    // clamp the live DB row to that set: the local row may narrow the
+    // tier (a downgrade applied by the issuer) but must never widen it
+    // beyond what the signature authorizes. Activation keeps the on-disk
+    // key in sync, so this tracks the current license at boot and at
+    // runtime. If the key can't be re-read mid-run, fall back to the
+    // in-effect entitlements — themselves already clamped on a prior
+    // pass — so a DB edit still can't widen the tier.
+    let signed = read_license_string().and_then(|s| verify_license(&s).ok());
+    let ceiling = match &signed {
+        Some(tier) => entitlements_of(tier),
+        None => entitlements_of(current),
+    };
+    let entitlements = clamp_to_signed_ceiling(row.entitlements.clone(), &ceiling);
 
     // Same product / license / expiry — only the entitlement set is
     // live. Cheap rebuild.
@@ -306,5 +305,81 @@ pub async fn refresh_self_tier_from_db(
         }
     } else {
         current.clone()
+    }
+}
+
+/// Entitlements a tier carries; `Unlicensed` carries none.
+fn entitlements_of(tier: &Tier) -> Vec<String> {
+    match tier {
+        Tier::Licensed { entitlements, .. } => entitlements.clone(),
+        Tier::Unlicensed { .. } => Vec::new(),
+    }
+}
+
+/// Restrict a DB-sourced entitlement set to the signed ceiling.
+///
+/// The signed self-license key bounds what the tier may grant. The
+/// local `licenses` row may *narrow* the tier — an issuer-applied
+/// downgrade — but anything in it that the signature does not grant is
+/// dropped, so the row can never *widen* the tier past the ceiling.
+/// Kept standalone so the invariant is unit-testable without the
+/// offline signing key needed to mint a verifiable self-license.
+fn clamp_to_signed_ceiling(db_entitlements: Vec<String>, signed: &[String]) -> Vec<String> {
+    db_entitlements
+        .into_iter()
+        .filter(|e| signed.iter().any(|s| s == e))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn db_row_cannot_widen_beyond_signed_ceiling() {
+        // Signed key grants only the free tier; a tampered DB row
+        // claiming top-tier entitlements is stripped to the signed set.
+        let signed = v(&["creator_only"]);
+        let tampered = v(&[
+            "unlimited_products",
+            "unlimited_policies",
+            "recurring_billing",
+            "zaprite_payments",
+            "patron",
+            "creator_only",
+        ]);
+        assert_eq!(
+            clamp_to_signed_ceiling(tampered, &signed),
+            v(&["creator_only"])
+        );
+    }
+
+    #[test]
+    fn db_row_may_narrow_below_signed_ceiling() {
+        // Signed key grants a broad set; an issuer-applied downgrade to
+        // a smaller set in the DB row is honored (narrowing is allowed).
+        let signed = v(&["unlimited_products", "recurring_billing", "zaprite_payments"]);
+        let downgraded = v(&["unlimited_products"]);
+        assert_eq!(
+            clamp_to_signed_ceiling(downgraded, &signed),
+            v(&["unlimited_products"])
+        );
+    }
+
+    #[test]
+    fn matching_entitlements_pass_through_unchanged() {
+        let signed = v(&["unlimited_products", "recurring_billing"]);
+        let db = v(&["unlimited_products", "recurring_billing"]);
+        assert_eq!(clamp_to_signed_ceiling(db.clone(), &signed), db);
+    }
+
+    #[test]
+    fn empty_signed_ceiling_strips_everything() {
+        let db = v(&["unlimited_products", "patron"]);
+        assert!(clamp_to_signed_ceiling(db, &[]).is_empty());
     }
 }
