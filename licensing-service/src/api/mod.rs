@@ -1193,3 +1193,22 @@ async fn pubkey(
         "public_key_pem": state.keypair.public_key_pem,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical escaper must cover the single quote — operator/product/
+    /// discount-code text renders into HTML attributes (incl. single-quoted),
+    /// so omitting `'` is an injection hole. Guards against re-forking a copy
+    /// that drops it (the bug that lived in `buy_page.rs`).
+    #[test]
+    fn html_escape_covers_single_quote_and_friends() {
+        assert_eq!(html_escape("'"), "&#39;");
+        assert_eq!(
+            html_escape(r#"<a href='x' title="y">&</a>"#),
+            "&lt;a href=&#39;x&#39; title=&quot;y&quot;&gt;&amp;&lt;/a&gt;"
+        );
+        assert_eq!(html_escape("plain"), "plain");
+    }
+}

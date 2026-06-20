@@ -16,6 +16,9 @@
 //! buyer-facing surface — easy to deploy, no asset hosting required.
 
 use crate::api::AppState;
+// Reuse the canonical HTML escaper (escapes `'` as well as `&<>"`) instead of a
+// private copy, so the buyer-facing page can't fall behind on attribute escaping.
+use crate::api::html_escape;
 use crate::db::repo;
 use axum::{
     extract::{Path, Query, State},
@@ -1531,13 +1534,6 @@ code{{background:#eee;padding:0.1em 0.4em;border-radius:4px;font-family:ui-monos
 </body></html>"#,
         slug_safe = slug_safe
     )
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 fn format_thousands(n: i64) -> String {
