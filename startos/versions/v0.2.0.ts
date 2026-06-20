@@ -39,6 +39,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  "0.2.0:62 — **Escape single quotes on the buyer-facing buy page.** The public buy page (`/buy/:slug`) carried its own HTML escaper that omitted the single-quote (`'`) escape the canonical escaper applies, so operator-controlled text rendered into HTML attributes (product name, description, discount code, operator name) was under-escaped. Replaced the forked escaper with the canonical implementation (which escapes `'` as `&#39;` alongside `&<>\"`) and added a unit test covering the single quote. No schema change, no SDK change — straight drop-in over :61.",
+  '',
   "0.2.0:61 — **Security hardening for self-license tier enforcement.** The daemon now re-verifies its own self-license against the signed key on every hourly tier refresh, not only at boot. Issuer-applied tier changes — downgrade, suspension, revocation, and the license's own expiry — now take effect on a running daemon within the hour instead of waiting for the next restart. Master and honest downstream instances behave exactly as before. No schema change, no SDK change — straight drop-in over :60.",
   '',
   '0.2.0:60 — **Fix a Zaprite auto-charge silent-lapse on the recurring-renewal money path.** `charge_order_with_profile` already errors on a non-2xx response (those route correctly to WARN + `auto_charge_failed` audit + manual-pay fallback), but on a 2xx `try_auto_charge_zaprite` returned `Ok(true)` regardless of the order\'s actual status — it read `status` only for a log line. So a 200 carrying a non-settled status (a declined or expired charge, or an in-flight PENDING/PROCESSING) suppressed the manual-pay renewal notification and left the worker waiting for an `order.paid` webhook that never arrives: the subscription silently lapsed, the buyer got no pay link, and the operator saw no error. Fixed by classifying the charge response — the auto-charge is treated as successful (and manual-pay suppressed) only when the order is in a recognized settled state (`PAID`/`COMPLETE`/`OVERPAID`, mirroring `get_invoice_status`\'s `Settled` mapping); any other or unrecognized status logs a WARN and falls through to the existing manual-pay `subscription.renewal_pending` path so the buyer can always recover the cycle. Allowlist by design — Zaprite has no documented terminal-failure status string, so an unknown or missing status is treated as not-settled rather than optimistically assumed paid. Adds a unit test on the new `zaprite_charge_settled` helper covering settled / in-flight / failed / unknown statuses. BTCPay subscriptions and any sub without a saved Zaprite profile are unaffected. Also docs-only: flagged the dormant `merchant_profiles.smtp_*` columns (the buyer-email / SMTP plan was dropped — Keysat does not send email). No schema change, no SDK change — straight drop-in over :59.',
@@ -538,7 +540,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:61',
+  version: '0.2.0:62',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
