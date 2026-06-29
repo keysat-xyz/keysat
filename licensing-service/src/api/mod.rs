@@ -734,7 +734,11 @@ async fn thank_you(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Html<String> {
     let invoice_id = params.get("invoice_id").cloned().unwrap_or_default();
-    let invoice_id_json = serde_json::to_string(&invoice_id).unwrap_or_else(|_| "\"\"".into());
+    // `invoice_id` is a raw public query param reflected into a `<script>`
+    // literal below — script-escape the serialized JSON so a `</script>`
+    // payload can't break out of the block. See `script_json_escape`.
+    let invoice_id_json =
+        script_json_escape(&serde_json::to_string(&invoice_id).unwrap_or_else(|_| "\"\"".into()));
     // Live-read operator_name from the settings table; fall back to the
     // env-var config; final fallback to a neutral brand name.
     let live = crate::db::repo::settings_get(
@@ -816,8 +820,12 @@ async fn thank_you(
             "btcpay",
         ),
     };
-    let provider_kind_json = serde_json::to_string(provider_kind_str)
-        .unwrap_or_else(|_| "\"btcpay\"".into());
+    // Closed set ("btcpay"/"zaprite") today, so not injectable — but it shares
+    // the same `<script>` block as INVOICE_ID, so script-escape it too to keep
+    // the whole block's JSON embeds uniformly safe.
+    let provider_kind_json = script_json_escape(
+        &serde_json::to_string(provider_kind_str).unwrap_or_else(|_| "\"btcpay\"".into()),
+    );
     let body = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -1185,6 +1193,23 @@ fn html_escape(s: &str) -> String {
         .collect()
 }
 
+/// Re-escape a JSON string so it is safe to embed inside an HTML `<script>`
+/// block. `serde_json` escapes `"`, `\`, and control characters but leaves
+/// `<`, `>`, `&`, and the U+2028/U+2029 line separators literal — so a value
+/// containing `</script>` would close the script element and inject markup
+/// (reflected XSS when the value is attacker-controlled, e.g. the public
+/// `/thank-you?invoice_id=` query param). The `\uXXXX` forms below are valid
+/// JSON/JS string content, so the data the page reads is unchanged; only the
+/// HTML parser's view of it is neutralized. None of the replacement outputs
+/// contains another target character, so replacement order is irrelevant.
+fn script_json_escape(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 async fn pubkey(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Json<serde_json::Value> {
@@ -1210,5 +1235,36 @@ mod tests {
             "&lt;a href=&#39;x&#39; title=&quot;y&quot;&gt;&amp;&lt;/a&gt;"
         );
         assert_eq!(html_escape("plain"), "plain");
+    }
+
+    /// A `</script>` payload reflected into a `<script>` JSON literal (the
+    /// public `/thank-you?invoice_id=` sink) must not survive as literal markup.
+    /// The escaped form must contain no raw `<`/`>`/`&`, yet remain JSON that
+    /// parses back to the original string.
+    #[test]
+    fn script_json_escape_neutralizes_script_breakout() {
+        let payload = "</script><script>alert(1)</script>";
+        let json = serde_json::to_string(payload).unwrap();
+        let escaped = script_json_escape(&json);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('&'));
+        assert!(escaped.contains("\\u003c"));
+        assert!(escaped.contains("\\u003e"));
+        // Still valid JSON round-tripping to the original value.
+        let back: String = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(back, payload);
+
+        // `&` and the JS-only line separators U+2028/U+2029 are also escaped,
+        // and each still round-trips to the original character.
+        let amp = script_json_escape(&serde_json::to_string("foo&bar").unwrap());
+        assert!(amp.contains("\\u0026") && !amp.contains('&'));
+        assert_eq!(serde_json::from_str::<String>(&amp).unwrap(), "foo&bar");
+        let seps = script_json_escape(&serde_json::to_string("a\u{2028}b\u{2029}c").unwrap());
+        assert!(seps.contains("\\u2028") && seps.contains("\\u2029"));
+        assert_eq!(serde_json::from_str::<String>(&seps).unwrap(), "a\u{2028}b\u{2029}c");
+
+        // Plain ids are passed through untouched.
+        assert_eq!(script_json_escape("\"abc-123\""), "\"abc-123\"");
     }
 }

@@ -18,7 +18,7 @@
 use crate::api::AppState;
 // Reuse the canonical HTML escaper (escapes `'` as well as `&<>"`) instead of a
 // private copy, so the buyer-facing page can't fall behind on attribute escaping.
-use crate::api::html_escape;
+use crate::api::{html_escape, script_json_escape};
 use crate::db::repo;
 use axum::{
     extract::{Path, Query, State},
@@ -1091,10 +1091,15 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
         price_sats_fmt = price_sats_fmt,
         price_unit_label = price_unit_label,
         tiers_html = tiers_html,
-        slug_json = serde_json::to_string(&product.slug).unwrap_or_else(|_| "\"\"".into()),
-        tiers_json = tiers_json,
-        initial_policy_json = serde_json::to_string(&initial_policy_slug)
-            .unwrap_or_else(|_| "\"\"".into()),
+        // These embed operator-controlled JSON into `<script>` blocks, so they
+        // are not attacker-reflected today — but script-escape them anyway so the
+        // sink class is uniformly safe and the pattern can't be copied unsafely.
+        slug_json =
+            script_json_escape(&serde_json::to_string(&product.slug).unwrap_or_else(|_| "\"\"".into())),
+        tiers_json = script_json_escape(&tiers_json),
+        initial_policy_json = script_json_escape(
+            &serde_json::to_string(&initial_policy_slug).unwrap_or_else(|_| "\"\"".into())
+        ),
     );
     Ok(Html(body))
 }
