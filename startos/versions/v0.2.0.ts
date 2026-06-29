@@ -39,6 +39,8 @@ const RELEASE_NOTES = [
 // in RELEASE_NOTES above (the milestone). Subsequent revisions
 // append here.
 const ROUTINE_NOTES = [
+  "0.2.0:63 — **Security: close a reflected XSS on the public `/thank-you` page.** The thank-you page (where buyers wait while their license is signed) reflected its `?invoice_id=` query param into an inline `<script>` block as a JSON literal via `serde_json::to_string`, which escapes `\"`, `\\`, and control chars but leaves `<`/`>`/`&` literal — so a crafted `invoice_id` containing `</script>` could break out of the script element and execute attacker JavaScript in the daemon's own origin. Because that origin also serves the admin SPA at `/admin/` with no CSP, a logged-in operator who clicked a crafted link could have had a full-admin API key minted or settlement repointed (fund redirection). Fixed with a new `script_json_escape` helper that re-escapes `<`, `>`, `&`, and the U+2028/U+2029 line separators as `\\uXXXX` (still valid JSON/JS, so the value the page reads at runtime is unchanged — only the HTML parser's view is neutralized), applied at the attacker-controlled sink. The same helper is also applied as defense-in-depth to the operator-controlled `<script>` JSON embeds on the buy page (`/buy/:slug`) so the sink class is uniformly safe and the pattern can't be copied unsafely. Adds a unit test covering the `</script>` breakout. No schema change, no SDK change — straight drop-in over :62.",
+  '',
   "0.2.0:62 — **Escape single quotes on the buyer-facing buy page.** The public buy page (`/buy/:slug`) carried its own HTML escaper that omitted the single-quote (`'`) escape the canonical escaper applies, so operator-controlled text rendered into HTML attributes (product name, description, discount code, operator name) was under-escaped. Replaced the forked escaper with the canonical implementation (which escapes `'` as `&#39;` alongside `&<>\"`) and added a unit test covering the single quote. No schema change, no SDK change — straight drop-in over :61.",
   '',
   "0.2.0:61 — **Security hardening for self-license tier enforcement.** The daemon now re-verifies its own self-license against the signed key on every hourly tier refresh, not only at boot. Issuer-applied tier changes — downgrade, suspension, revocation, and the license's own expiry — now take effect on a running daemon within the hour instead of waiting for the next restart. Master and honest downstream instances behave exactly as before. No schema change, no SDK change — straight drop-in over :60.",
@@ -540,7 +542,7 @@ const ROUTINE_NOTES = [
 ].join('\n\n')
 
 export const v0_2_0 = VersionInfo.of({
-  version: '0.2.0:62',
+  version: '0.2.0:63',
   releaseNotes: { en_US: ROUTINE_NOTES },
   // No on-disk transformation needed — v0.2.0:0 is a label change.
   // SQLite-level migrations live separately under
