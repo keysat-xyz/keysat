@@ -297,6 +297,128 @@ async fn validate_rejects_unsigned_garbage() {
     assert_eq!(body["reason"], "bad_format");
 }
 
+/// `/v1/redeem` (a license-MINTING endpoint) must be rate-limited like its
+/// public siblings, so low-entropy free_license codes can't be brute-forced
+/// at network speed. The throttle runs before any product/code lookup, so a
+/// bogus body still consumes a token. Capacity is 10 → the 11th call from the
+/// same client IP is refused with 429.
+#[tokio::test]
+async fn redeem_is_rate_limited() {
+    let (state, _tmp) = make_test_state().await;
+    let body = json!({"product": "nope", "code": "NOPE"});
+    for _ in 0..10 {
+        let req = build_request(
+            "POST",
+            "/v1/redeem",
+            &[("x-forwarded-for", "9.9.9.9")],
+            Some(body.clone()),
+        );
+        let status = send(&state, req).await.status();
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "first 10 redeem attempts should not be throttled"
+        );
+    }
+    let req = build_request(
+        "POST",
+        "/v1/redeem",
+        &[("x-forwarded-for", "9.9.9.9")],
+        Some(body),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the 11th redeem attempt from the same IP should be rate-limited"
+    );
+}
+
+/// `/v1/purchase` shares the redeem throttle wiring but with capacity 20 and a
+/// different body extractor, so it gets its own regression test: the 21st call
+/// from one IP is refused.
+#[tokio::test]
+async fn purchase_is_rate_limited() {
+    let (state, _tmp) = make_test_state().await;
+    let body = json!({"product": "nope"});
+    for _ in 0..20 {
+        let req = build_request(
+            "POST",
+            "/v1/purchase",
+            &[("x-forwarded-for", "8.8.8.8")],
+            Some(body.clone()),
+        );
+        let status = send(&state, req).await.status();
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    let req = build_request(
+        "POST",
+        "/v1/purchase",
+        &[("x-forwarded-for", "8.8.8.8")],
+        Some(body),
+    );
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+/// The `/v1/discount-codes/preview` oracle is throttled too (capacity 30, and a
+/// Query rather than a JSON body — a distinct extractor wiring worth pinning).
+#[tokio::test]
+async fn preview_is_rate_limited() {
+    let (state, _tmp) = make_test_state().await;
+    let uri = "/v1/discount-codes/preview?code=NOPE&product=nope";
+    for _ in 0..30 {
+        let req = build_request("GET", uri, &[("x-forwarded-for", "7.7.7.7")], None);
+        let status = send(&state, req).await.status();
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    let req = build_request("GET", uri, &[("x-forwarded-for", "7.7.7.7")], None);
+    assert_eq!(
+        send(&state, req).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+/// Every response carries the baseline security headers, and the CSP is
+/// content-type-aware: a JSON response gets the strict `default-src 'none'`
+/// policy (it needs to load nothing), while a server-rendered HTML page gets
+/// the allow-list that permits what it actually loads.
+#[tokio::test]
+async fn responses_carry_security_headers() {
+    let (state, _tmp) = make_test_state().await;
+
+    // JSON → strict.
+    let req = build_request("GET", "/healthz", &[], None);
+    let resp = send(&state, req).await;
+    let h = resp.headers();
+    assert_eq!(
+        h.get("x-content-type-options").and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert!(h.get("referrer-policy").is_some());
+    assert_eq!(
+        h.get("content-security-policy").and_then(|v| v.to_str().ok()),
+        Some("default-src 'none'; frame-ancestors 'none'"),
+        "JSON responses should get the strict CSP"
+    );
+
+    // HTML → allow-list (locks in that the buy/thank-you pages can still load
+    // their inline blocks + the SPA's fonts/icons).
+    let req = build_request("GET", "/thank-you?invoice_id=abc", &[], None);
+    let resp = send(&state, req).await;
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        csp.starts_with("default-src 'self'")
+            && csp.contains("script-src 'self' 'unsafe-inline' https://unpkg.com"),
+        "HTML responses should get the allow-list CSP, got: {csp}"
+    );
+}
+
 /// End-to-end license validation:
 ///   - seed a product
 ///   - issue a license tied to it

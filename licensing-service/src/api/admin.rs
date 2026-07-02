@@ -58,14 +58,31 @@ pub fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<String>
     }
 }
 
+/// The trustworthy client IP from `X-Forwarded-For`.
+///
+/// Keysat always runs behind exactly one front proxy (StartOS's StartTunnel /
+/// nginx), which appends the real peer address as the LAST entry. A remote
+/// client can prepend arbitrary values (`X-Forwarded-For: 1.2.3.4, <real>`),
+/// so taking the *first* entry — as this used to — let an attacker forge the
+/// address that keys our rate-limit buckets and audit rows, rotating it to
+/// dodge brute-force throttles. Taking the last entry uses the value our own
+/// trusted proxy stamped on and ignores anything the client prepended.
+///
+/// Note: correct for a single trusted proxy. If Keysat is ever fronted by more
+/// than one proxy hop, this needs a configurable trusted-hop count instead.
+pub fn client_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next_back())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Pull the best-effort client IP and User-Agent out of the request headers
 /// for audit logging.
 pub fn request_context(headers: &HeaderMap) -> (Option<String>, Option<String>) {
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty());
+    let client_ip = client_ip(headers);
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -1221,4 +1238,32 @@ pub async fn get_operator_name(
         "effective": effective,
         "fallback_env": state.config.operator_name,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_ip;
+    use axum::http::HeaderMap;
+
+    fn hm(xff: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", xff.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn client_ip_takes_the_last_forwarded_hop() {
+        // Attacker prepends a spoofed value; our trusted proxy appends the real
+        // peer last — so we must return the last hop, not the first.
+        assert_eq!(
+            client_ip(&hm("1.2.3.4, 203.0.113.9")).as_deref(),
+            Some("203.0.113.9")
+        );
+        // Single value (proxy replaced the header outright) → that value.
+        assert_eq!(client_ip(&hm("203.0.113.9")).as_deref(), Some("203.0.113.9"));
+        // No header at all → None.
+        assert_eq!(client_ip(&HeaderMap::new()), None);
+        // Empty last hop → None (don't collapse everyone into a "" bucket).
+        assert_eq!(client_ip(&hm("1.2.3.4, ")), None);
+    }
 }

@@ -689,7 +689,63 @@ pub fn router(state: AppState) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        // Security headers on every response. Declared last → outermost, so it
+        // covers handler responses, the session bridge, and CORS preflights.
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Attach security headers to every response.
+///
+/// `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy` are safe
+/// on all responses. The Content-Security-Policy is content-type-aware: API /
+/// JSON (and any non-HTML) responses get a maximally strict `default-src
+/// 'none'`, while the server-rendered HTML pages (buy / thank-you / recover)
+/// and the embedded admin SPA get an allow-list covering exactly what they load
+/// — self + inline, plus the SPA's Google Fonts and its unpkg icon script.
+///
+/// This is defense-in-depth for the reflected-XSS class fixed at the sink in
+/// `:63`. The remaining gap is `'unsafe-inline'` on `script-src`: it still
+/// blocks external-script injection, framing, object/base-uri hijacks, and
+/// off-origin exfil, but not an injected *inline* script. The upgrade path is
+/// per-request nonces on the inline blocks (the pages carry no inline event
+/// handlers, so this is clean to add). See the daemon-architecture guide.
+async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header::{
+        HeaderValue, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY,
+        X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    };
+    let mut resp = next.run(req).await;
+    let is_html = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.starts_with("text/html"))
+        .unwrap_or(false);
+    let csp = if is_html {
+        "default-src 'self'; \
+         script-src 'self' 'unsafe-inline' https://unpkg.com; \
+         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+         font-src 'self' https://fonts.gstatic.com; \
+         img-src 'self' data:; \
+         connect-src 'self'; \
+         object-src 'none'; base-uri 'none'; form-action 'self'; \
+         frame-ancestors 'self'"
+    } else {
+        "default-src 'none'; frame-ancestors 'none'"
+    };
+    let h = resp.headers_mut();
+    h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
+    h.insert(
+        REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    h.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(csp));
+    resp
 }
 
 async fn root(

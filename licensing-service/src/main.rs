@@ -164,6 +164,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Hourly rate-limit-bucket reaper — drops buckets idle long enough to
+    // have fully refilled (1h ≫ our largest capacity/refill window), which is
+    // a no-op for behavior but bounds the otherwise-unbounded rate_buckets
+    // table against slow growth and spoofed-key row minting.
+    {
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                match db::repo::reap_idle_rate_buckets(&pool, 3600).await {
+                    Ok(n) if n > 0 => tracing::info!("reaped {n} idle rate-limit bucket(s)"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("rate-bucket reaper: {e}"),
+                }
+            }
+        });
+    }
+
     // 5-min discount-redemption reaper — frees discount-code slots that
     // were reserved at /v1/purchase time for buyers who never paid.
     // Two failure cases get cleaned up here: (a) BTCPay fired

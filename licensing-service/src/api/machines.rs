@@ -75,10 +75,7 @@ pub async fn activate(
         }));
     }
 
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+    let client_ip = crate::api::admin::client_ip(&headers);
 
     let fp_hash = crate::hex_sha256(&req.fingerprint);
 
@@ -169,10 +166,7 @@ pub async fn heartbeat(
     }
 
     let fp_hash = crate::hex_sha256(&req.fingerprint);
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+    let client_ip = crate::api::admin::client_ip(&headers);
 
     match repo::get_active_machine_by_fp(&state.db, &license_id, &fp_hash).await? {
         Some(m) => {

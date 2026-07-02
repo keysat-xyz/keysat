@@ -457,8 +457,27 @@ pub struct PreviewQuery {
 /// the buyer what they'll be charged before they commit.
 pub async fn preview(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<PreviewQuery>,
 ) -> AppResult<Json<Value>> {
+    // Throttle by client IP: this is a side-effect-free code-validity oracle
+    // (returns valid:true/false), so an unthrottled caller can enumerate
+    // low-entropy codes here and then mint via /v1/redeem or /v1/purchase.
+    let bucket = crate::api::admin::client_ip(&headers).unwrap_or_else(|| "_lan_".to_string());
+    if !crate::rate_limit::consume(
+        &state.db,
+        "preview_ip",
+        &bucket,
+        /* capacity */ 30.0,
+        /* refill_per_second */ 1.0 / 2.0, // 30 / 60s
+    )
+    .await?
+    {
+        return Err(AppError::TooManyRequests(
+            "code checks are rate-limited; try again in a minute".into(),
+        ));
+    }
+
     let code_str = q.code.trim();
     if code_str.is_empty() {
         return Err(AppError::BadRequest("code is required".into()));

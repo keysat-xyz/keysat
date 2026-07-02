@@ -112,6 +112,15 @@ impl IntoResponse for AppError {
                 "message": message,
                 "upgrade_url": upgrade_url,
             })),
+            // Never surface the underlying sqlx/anyhow text to the client — it
+            // leaks query fragments, column names, and internal paths that aid
+            // schema recon. The full detail is already logged above via
+            // `tracing::error!`; the client gets a generic message.
+            AppError::Database(_) | AppError::Internal(_) => Json(json!({
+                "ok": false,
+                "error": code,
+                "message": "internal error",
+            })),
             _ => Json(json!({
                 "ok": false,
                 "error": code,

@@ -1,0 +1,48 @@
+name: CI
+
+# Regression gate for the daemon + StartOS wrapper. The Rust test suite and the
+# wrapper typecheck must pass; clippy runs advisory-only (warnings don't fail the
+# build yet — the tree carries some pre-existing lints). Formatting is NOT checked
+# here: the tree has never been run through `cargo fmt`, so a `--check` gate would
+# fail on mechanical diffs unrelated to any change.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  daemon:
+    name: daemon (cargo test + clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: licensing-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: licensing-service
+      - name: cargo test (gate)
+        run: cargo test
+      - name: cargo clippy (advisory)
+        run: cargo clippy --all-targets
+
+  wrapper:
+    name: wrapper (tsc --noEmit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm ci
+        run: npm ci
+      - name: tsc --noEmit (gate)
+        run: npm run check

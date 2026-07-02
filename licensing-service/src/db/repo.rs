@@ -2932,6 +2932,20 @@ pub async fn reap_expired_sessions(pool: &SqlitePool) -> AppResult<u64> {
     Ok(res.rows_affected())
 }
 
+/// Delete rate-limit buckets that have been idle long enough to have fully
+/// refilled. A bucket untouched for `idle_secs` has (at our refill rates)
+/// returned to capacity, so deleting it is a no-op — the next request just
+/// recreates a full bucket. This bounds `rate_buckets`, which otherwise grows
+/// one row per distinct bucket key forever (a slow-leak / spoofed-key DoS).
+pub async fn reap_idle_rate_buckets(pool: &SqlitePool, idle_secs: i64) -> AppResult<u64> {
+    let cutoff = (Utc::now() - chrono::Duration::seconds(idle_secs)).to_rfc3339();
+    let res = sqlx::query("DELETE FROM rate_buckets WHERE last_refill_at < ?")
+        .bind(&cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Upsert a key into the runtime settings table. Pass `None` to clear it.
 pub async fn settings_set(pool: &SqlitePool, key: &str, value: Option<&str>) -> AppResult<()> {
     let now = Utc::now().to_rfc3339();

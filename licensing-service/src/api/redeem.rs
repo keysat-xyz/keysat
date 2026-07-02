@@ -19,7 +19,7 @@ use crate::api::AppState;
 use crate::crypto::{encode_key, sign_payload, LicensePayload, FLAG_TRIAL, KEY_VERSION_V2};
 use crate::db::repo;
 use crate::error::{AppError, AppResult};
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -49,8 +49,28 @@ pub struct RedeemResp {
 
 pub async fn redeem(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RedeemReq>,
 ) -> AppResult<Json<RedeemResp>> {
+    // Throttle by client IP: this endpoint MINTS a signed license on a valid
+    // free_license code, so an unthrottled caller could brute-force low-entropy
+    // operator-chosen codes at network speed. Sibling public endpoints
+    // (validate/recover/machines) already throttle; this one must too.
+    let bucket = crate::api::admin::client_ip(&headers).unwrap_or_else(|| "_lan_".to_string());
+    if !crate::rate_limit::consume(
+        &state.db,
+        "redeem_ip",
+        &bucket,
+        /* capacity */ 10.0,
+        /* refill_per_second */ 1.0 / 6.0, // 10 / 60s
+    )
+    .await?
+    {
+        return Err(AppError::TooManyRequests(
+            "redemption requests are rate-limited; try again in a minute".into(),
+        ));
+    }
+
     let product = repo::get_product_by_slug(&state.db, &req.product)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("product '{}'", req.product)))?;

@@ -92,10 +92,7 @@ pub async fn validate(
     headers: HeaderMap,
     Json(req): Json<ValidateReq>,
 ) -> AppResult<Json<ValidateResp>> {
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+    let client_ip = crate::api::admin::client_ip(&headers);
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())

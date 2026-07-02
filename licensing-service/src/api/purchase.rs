@@ -14,6 +14,7 @@ use crate::error::{AppError, AppResult};
 use crate::payment::{CreateInvoiceParams, Money};
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -77,8 +78,29 @@ const MIN_INVOICE_SATS: i64 = 1;
 
 pub async fn start(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<StartPurchaseReq>,
 ) -> AppResult<Json<StartPurchaseResp>> {
+    // Throttle by client IP: each call creates a pending invoice (an upstream
+    // BTCPay API call) and, on free/100%-off paths, mints a signed license
+    // inline. Unthrottled, this is an invoice-spam / DB-growth vector and a
+    // free-license mint path. Kept looser than /v1/redeem since legitimate
+    // buyers may retry a checkout a few times.
+    let bucket = crate::api::admin::client_ip(&headers).unwrap_or_else(|| "_lan_".to_string());
+    if !crate::rate_limit::consume(
+        &state.db,
+        "purchase_ip",
+        &bucket,
+        /* capacity */ 20.0,
+        /* refill_per_second */ 1.0 / 3.0, // 20 / 60s
+    )
+    .await?
+    {
+        return Err(AppError::TooManyRequests(
+            "purchase requests are rate-limited; try again in a minute".into(),
+        ));
+    }
+
     let product = repo::get_product_by_slug(&state.db, &req.product)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("product '{}'", req.product)))?;

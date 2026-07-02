@@ -59,15 +59,11 @@ pub async fn recover(
     headers: HeaderMap,
     Json(req): Json<RecoverReq>,
 ) -> AppResult<Json<Value>> {
-    // Rate-limit by client IP so this can't be hammered. Bucket on
-    // X-Forwarded-For (set by StartTunnel/nginx); fallback to a
-    // catch-all bucket for direct LAN access in dev.
-    let bucket = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "_lan_".to_string());
+    // Rate-limit by client IP so this can't be hammered. Bucket on the
+    // trusted-proxy-stamped X-Forwarded-For (see admin::client_ip for why the
+    // last hop, not the first); fallback to a catch-all bucket for direct LAN
+    // access in dev.
+    let bucket = crate::api::admin::client_ip(&headers).unwrap_or_else(|| "_lan_".to_string());
     let ok = crate::rate_limit::consume(
         &state.db,
         "recover_ip",
