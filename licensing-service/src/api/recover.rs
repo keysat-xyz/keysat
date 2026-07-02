@@ -35,8 +35,14 @@ use serde_json::{json, Value};
 /// because customers reaching this page may have just had a
 /// catastrophic failure of their primary computer and we don't want
 /// to depend on cookies, JS frameworks, or admin auth.
-pub async fn page(State(_state): State<AppState>) -> impl IntoResponse {
-    Html(RECOVER_PAGE_HTML)
+pub async fn page(
+    State(_state): State<AppState>,
+    axum::Extension(nonce): axum::Extension<crate::api::CspNonce>,
+) -> impl IntoResponse {
+    // The page is otherwise static; stamp the per-request CSP nonce (set by the
+    // security_headers middleware) onto its single inline <script> so it matches
+    // the `script-src 'nonce-…'` policy.
+    Html(RECOVER_PAGE_HTML.replace("__CSP_NONCE__", &nonce.0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,7 +232,7 @@ const RECOVER_PAGE_HTML: &str = r##"<!DOCTYPE html>
   </form>
   <div id="result"></div>
 </main>
-<script>
+<script nonce="__CSP_NONCE__">
 const f = document.getElementById('f');
 const result = document.getElementById('result');
 f.addEventListener('submit', async (e) => {

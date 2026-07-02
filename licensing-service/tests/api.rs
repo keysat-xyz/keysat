@@ -444,19 +444,117 @@ async fn responses_carry_security_headers() {
         "JSON responses should get the strict CSP"
     );
 
-    // HTML → allow-list (locks in that the buy/thank-you pages can still load
-    // their inline blocks + the SPA's fonts/icons).
+    // Public HTML page → strict nonce CSP (no 'unsafe-inline' on scripts), and
+    // the served inline <script> must carry that exact nonce, else the browser
+    // would block the page's own JS. This is the end-to-end invariant.
     let req = build_request("GET", "/thank-you?invoice_id=abc", &[], None);
     let resp = send(&state, req).await;
     let csp = resp
         .headers()
         .get("content-security-policy")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     assert!(
-        csp.starts_with("default-src 'self'")
-            && csp.contains("script-src 'self' 'unsafe-inline' https://unpkg.com"),
-        "HTML responses should get the allow-list CSP, got: {csp}"
+        csp.starts_with("default-src 'self'") && csp.contains("script-src 'nonce-"),
+        "public page should get a nonce CSP, got: {csp}"
+    );
+    assert!(
+        !csp.contains("'unsafe-inline' https://unpkg.com"),
+        "public page script-src must not allow unsafe-inline, got: {csp}"
+    );
+    let nonce = csp
+        .split("script-src 'nonce-")
+        .nth(1)
+        .and_then(|s| s.split('\'').next())
+        .expect("nonce in CSP")
+        .to_string();
+    let body = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains(&format!("<script nonce=\"{nonce}\">")),
+        "served <script> must carry the CSP nonce {nonce}"
+    );
+}
+
+/// CSP is tailored per surface. The public pages each get a per-request nonce
+/// that matches their served `<script>`; other HTML responders (admin SPA, the
+/// BTCPay OAuth-callback page) get the allow-list, NOT the strict JSON policy.
+/// The callback assertion is a regression guard: a path-only classifier once
+/// dropped that HTML page into `default-src 'none'`, which would block its
+/// inline styles.
+#[tokio::test]
+async fn csp_is_tailored_per_surface() {
+    let (state, _tmp) = make_test_state().await;
+    repo::create_product(&state.db, "csp-demo", "CSP Demo", "", 1000, &json!({}))
+        .await
+        .expect("create_product");
+
+    // Public pages: the CSP nonce must equal the served <script> nonce, checked
+    // on a SINGLE response (each request mints a fresh nonce).
+    for path in ["/buy/csp-demo", "/recover"] {
+        let resp = send(&state, build_request("GET", path, &[], None)).await;
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let nonce = csp
+            .split("script-src 'nonce-")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .unwrap_or_else(|| panic!("no nonce in CSP for {path}: {csp}"))
+            .to_string();
+        let body = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains(&format!("<script nonce=\"{nonce}\">")),
+            "{path}: served <script> must carry the CSP nonce {nonce}"
+        );
+    }
+
+    // Admin SPA: allow-list with unpkg, not a nonce policy.
+    let resp = send(&state, build_request("GET", "/admin/", &[], None)).await;
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        csp.contains("script-src 'self' 'unsafe-inline' https://unpkg.com"),
+        "admin SPA should keep the unsafe-inline allow-list, got: {csp}"
+    );
+
+    // BTCPay OAuth-callback page: HTML but neither public nor admin path — must
+    // still get the allow-list (its inline <style>), not `default-src 'none'`.
+    let resp = send(
+        &state,
+        build_request(
+            "GET",
+            "/v1/btcpay/authorize/callback?state=x&error=denied",
+            &[],
+            None,
+        ),
+    )
+    .await;
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("text/html"), "callback should render HTML, got: {ct}");
+    assert!(
+        csp.contains("style-src 'self' 'unsafe-inline'") && !csp.starts_with("default-src 'none'"),
+        "btcpay callback HTML must get the allow-list CSP, got: {csp}"
     );
 }
 

@@ -37,9 +37,13 @@ pub struct BuyPageQuery {
 
 pub async fn render(
     State(state): State<AppState>,
+    axum::Extension(nonce): axum::Extension<crate::api::CspNonce>,
     Path(slug): Path<String>,
     Query(q): Query<BuyPageQuery>,
 ) -> Result<Html<String>, (StatusCode, Html<String>)> {
+    // Per-request CSP nonce for this page's inline <script> blocks (set by the
+    // security_headers middleware for this public page).
+    let nonce = nonce.0;
     // Look up the product. Inactive or missing → 404 with a friendly page.
     let product = match repo::get_product_by_slug(&state.db, &slug).await {
         Ok(Some(p)) if p.active => p,
@@ -660,7 +664,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   <span>Powered by <a href="https://keysat.xyz" target="_blank" rel="noopener">Keysat</a> &middot; Bitcoin-native self-hosted software licensing</span>
 </footer>
 
-<script>
+<script nonce="{nonce}">
 (function() {{
   const form = document.getElementById('buy-form');
   const btn = document.getElementById('btn-pay');
@@ -1084,6 +1088,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
 </body>
 </html>
 "#,
+        nonce = nonce,
         operator = operator,
         product_name = product_name,
         product_slug = product_slug,

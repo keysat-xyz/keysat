@@ -695,29 +695,58 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Per-request Content-Security-Policy nonce. `security_headers` generates one
+/// for each public server-rendered page request and stashes it in the request
+/// extensions; those handlers (`thank_you`, `buy_page::render`, `recover::page`)
+/// read it and stamp it on their inline `<script nonce="…">` tags so the tags
+/// match the `script-src 'nonce-…'` policy this middleware sets.
+#[derive(Clone)]
+pub struct CspNonce(pub String);
+
 /// Attach security headers to every response.
 ///
 /// `X-Content-Type-Options`, `X-Frame-Options`, and `Referrer-Policy` are safe
-/// on all responses. The Content-Security-Policy is content-type-aware: API /
-/// JSON (and any non-HTML) responses get a maximally strict `default-src
-/// 'none'`, while the server-rendered HTML pages (buy / thank-you / recover)
-/// and the embedded admin SPA get an allow-list covering exactly what they load
-/// — self + inline, plus the SPA's Google Fonts and its unpkg icon script.
+/// on all responses. The Content-Security-Policy is tailored per surface:
 ///
-/// This is defense-in-depth for the reflected-XSS class fixed at the sink in
-/// `:63`. The remaining gap is `'unsafe-inline'` on `script-src`: it still
-/// blocks external-script injection, framing, object/base-uri hijacks, and
-/// off-origin exfil, but not an injected *inline* script. The upgrade path is
-/// per-request nonces on the inline blocks (the pages carry no inline event
-/// handlers, so this is clean to add). See the daemon-architecture guide.
+/// - **Public server-rendered pages** (`/thank-you`, `/buy/*`, `/recover`) get
+///   `script-src 'nonce-<per-request>'` with **no** `'unsafe-inline'` — so an
+///   injected inline `<script>` cannot execute even if a future sink-escaping
+///   bug recurred. This is the full defense-in-depth backstop for the reflected
+///   XSS class fixed at the sink in `:63`. These pages carry no inline event
+///   handlers, so the nonce covers every script they run.
+/// - **Admin SPA** (`/admin*`) keeps `script-src 'self' 'unsafe-inline'
+///   https://unpkg.com`: it is auth-gated, only the operator writes its data,
+///   and it uses inline `onmouseover` handlers + an unpkg icon script that a
+///   nonce policy can't cover without a browser-verified refactor (tracked).
+/// - **Everything else** (JSON/API) gets a maximally strict `default-src 'none'`.
 async fn security_headers(
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::http::header::{
         HeaderValue, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY,
         X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
     };
+
+    // Only the public server-rendered pages get the strict nonce policy, and
+    // only they need a nonce generated (skipping it on the hot JSON paths like
+    // /v1/validate). Everything else that returns HTML (admin SPA, BTCPay
+    // OAuth-callback confirmation pages, 404 pages, any future HTML responder)
+    // gets the allow-list policy below; JSON/other gets `default-src 'none'`.
+    let path = req.uri().path();
+    let is_public_page =
+        path == "/thank-you" || path == "/recover" || path.starts_with("/buy/");
+    let nonce = if is_public_page {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let n = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        req.extensions_mut().insert(CspNonce(n.clone()));
+        Some(n)
+    } else {
+        None
+    };
+
     let mut resp = next.run(req).await;
     let is_html = resp
         .headers()
@@ -725,18 +754,37 @@ async fn security_headers(
         .and_then(|v| v.to_str().ok())
         .map(|c| c.starts_with("text/html"))
         .unwrap_or(false);
-    let csp = if is_html {
-        "default-src 'self'; \
-         script-src 'self' 'unsafe-inline' https://unpkg.com; \
-         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-         font-src 'self' https://fonts.gstatic.com; \
-         img-src 'self' data:; \
-         connect-src 'self'; \
-         object-src 'none'; base-uri 'none'; form-action 'self'; \
-         frame-ancestors 'self'"
-    } else {
-        "default-src 'none'; frame-ancestors 'none'"
+
+    // Strict fallback for non-HTML (JSON/API) and any response we can't classify.
+    let strict = "default-src 'none'; frame-ancestors 'none'";
+    let csp: String = match (is_html, &nonce) {
+        // Public page: strict, nonce-gated scripts. Google Fonts stylesheet +
+        // gstatic fonts are the only off-origin resources the buy page loads.
+        (true, Some(n)) => format!(
+            "default-src 'self'; \
+             script-src 'nonce-{n}'; \
+             style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+             font-src 'self' https://fonts.gstatic.com; \
+             img-src 'self' data:; \
+             connect-src 'self'; \
+             object-src 'none'; base-uri 'none'; form-action 'self'; \
+             frame-ancestors 'self'"
+        ),
+        // Any other HTML (admin SPA, BTCPay callback pages, 404s): allow-list
+        // covering inline scripts/styles + the SPA's unpkg icon script + fonts.
+        (true, None) => "default-src 'self'; \
+             script-src 'self' 'unsafe-inline' https://unpkg.com; \
+             style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+             font-src 'self' https://fonts.gstatic.com; \
+             img-src 'self' data:; \
+             connect-src 'self'; \
+             object-src 'none'; base-uri 'none'; form-action 'self'; \
+             frame-ancestors 'self'"
+            .to_string(),
+        // JSON/API and anything non-HTML.
+        (false, _) => strict.to_string(),
     };
+
     let h = resp.headers_mut();
     h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
@@ -744,7 +792,12 @@ async fn security_headers(
         REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
-    h.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(csp));
+    // Fall back to the strict policy rather than silently dropping the header if
+    // the CSP string somehow isn't a valid header value (unreachable — the nonce
+    // is base64 — but keep a header on every response).
+    let csp_value = HeaderValue::from_str(&csp)
+        .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"));
+    h.insert(CONTENT_SECURITY_POLICY, csp_value);
     resp
 }
 
@@ -787,8 +840,12 @@ async fn healthz() -> Json<serde_json::Value> {
 /// as the buy page's free-license success state.
 async fn thank_you(
     axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Extension(nonce): axum::extract::Extension<CspNonce>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Html<String> {
+    // Per-request CSP nonce for the single inline <script> below (set by the
+    // security_headers middleware for this public page).
+    let nonce = nonce.0;
     let invoice_id = params.get("invoice_id").cloned().unwrap_or_default();
     // `invoice_id` is a raw public query param reflected into a `<script>`
     // literal below — script-escape the serialized JSON so a `</script>`
@@ -1094,7 +1151,7 @@ footer.kfooter a:hover {{ color:var(--navy-900); }}
   <span>Powered by <a href="https://keysat.xyz" target="_blank" rel="noopener">Keysat</a> &middot; Bitcoin-native self-hosted software licensing</span>
 </footer>
 
-<script>
+<script nonce="{nonce}">
 (function() {{
   const INVOICE_ID = {invoice_id_json};
   // 'zaprite' | 'btcpay' — selects which payment-rail copy the
