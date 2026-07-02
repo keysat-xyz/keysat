@@ -32,8 +32,12 @@ async-trait = "0.1"
 # only use the macros that don't need a live DB (no `query!` calls in the
 # codebase), so enabling `macros` doesn't impose any compile-time database
 # requirement.
-sqlx = { version = "0.7", default-features = false, features = [
-    "runtime-tokio-rustls",
+# SQLite is a local file — no network, so sqlx needs no TLS. We use only the
+# tokio runtime feature (0.8 removed the combined `runtime-tokio-rustls`), which
+# keeps sqlx off the rustls/webpki chain entirely; HTTPS to BTCPay is reqwest's
+# job. 0.8 also drops the unused mysql driver (and its unfixable `rsa` advisory).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
     "sqlite",
     "migrate",
     "macros",
