@@ -90,6 +90,45 @@ pub fn request_context(headers: &HeaderMap) -> (Option<String>, Option<String>) 
     (client_ip, ua)
 }
 
+// Bounds for operator-supplied product strings. Generous but finite — stops a
+// client from storing megabytes in a text column (the 2026-06-28 exerciser
+// found a 100 KB `slug` was accepted and stored). These are input hygiene, not
+// a security boundary on their own: every render site already escapes.
+const MAX_SLUG_LEN: usize = 64;
+const MAX_NAME_LEN: usize = 200;
+const MAX_DESCRIPTION_LEN: usize = 4000;
+
+/// Validate a URL-safe product slug: 1..=`MAX_SLUG_LEN` chars of lowercase
+/// ASCII letters, digits, and hyphens. Slugs are reflected into routes
+/// (`/buy/:slug`, `/v1/products/:slug`), so `/`, whitespace, control chars, and
+/// HTML must be rejected at write time rather than stored and escaped later.
+fn validate_slug(slug: &str) -> AppResult<()> {
+    if slug.is_empty() || slug.len() > MAX_SLUG_LEN {
+        return Err(AppError::BadRequest(format!(
+            "slug must be 1 to {MAX_SLUG_LEN} characters"
+        )));
+    }
+    if !slug
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(AppError::BadRequest(
+            "slug may contain only lowercase letters, digits, and hyphens".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject an over-long free-text field with a clear message naming the field.
+fn validate_max_len(field: &str, value: &str, max: usize) -> AppResult<()> {
+    if value.chars().count() > max {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most {max} characters"
+        )));
+    }
+    Ok(())
+}
+
 // ---------- Products ----------
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +239,9 @@ pub async fn create_product(
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_scope(&state, &headers, "products:write").await?;
     let (ip, ua) = request_context(&headers);
+    validate_slug(&req.slug)?;
+    validate_max_len("name", &req.name, MAX_NAME_LEN)?;
+    validate_max_len("description", &req.description, MAX_DESCRIPTION_LEN)?;
     // Tier-cap gate: Creator caps at 5 products. 402 if over.
     crate::api::tier::enforce_product_cap(&state).await?;
 
@@ -507,6 +549,12 @@ pub async fn update_product(
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_scope(&state, &headers, "products:write").await?;
     let (ip, ua) = request_context(&headers);
+    if let Some(name) = &req.name {
+        validate_max_len("name", name, MAX_NAME_LEN)?;
+    }
+    if let Some(description) = &req.description {
+        validate_max_len("description", description, MAX_DESCRIPTION_LEN)?;
+    }
 
     // Resolve the pricing patch into (currency, value, sats) tuple
     // before passing to the repo. This mirrors the create-side

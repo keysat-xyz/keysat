@@ -333,6 +333,47 @@ async fn redeem_is_rate_limited() {
     );
 }
 
+/// Product `slug` is validated at create: it lands in routes (`/buy/:slug`,
+/// `/v1/products/:slug`), so non-URL-safe values (HTML, `/`, spaces, uppercase)
+/// and over-long strings are rejected up front rather than stored. Over-long
+/// free-text fields (name/description) are capped too.
+#[tokio::test]
+async fn create_product_validates_slug_and_lengths() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    let bad_slug = |slug: &str| {
+        build_request(
+            "POST",
+            "/v1/admin/products",
+            &[("authorization", &auth)],
+            Some(json!({"slug": slug, "name": "X", "price_sats": 100})),
+        )
+    };
+    for slug in ["</script><script>alert(1)</script>", "a/b", "Bad Slug", "", &"x".repeat(65)] {
+        let status = send(&state, bad_slug(slug)).await.status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "slug {slug:?} should be rejected");
+    }
+
+    // Over-long name is rejected even with a valid slug.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({"slug": "ok-slug", "name": "n".repeat(201), "price_sats": 100})),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::BAD_REQUEST);
+
+    // A clean slug + name still creates.
+    let req = build_request(
+        "POST",
+        "/v1/admin/products",
+        &[("authorization", &auth)],
+        Some(json!({"slug": "good-slug", "name": "Good", "price_sats": 100})),
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::OK);
+}
+
 /// `/v1/purchase` shares the redeem throttle wiring but with capacity 20 and a
 /// different body extractor, so it gets its own regression test: the 21st call
 /// from one IP is refused.
