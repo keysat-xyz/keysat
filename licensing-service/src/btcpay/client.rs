@@ -169,11 +169,6 @@ impl BtcpayClient {
         Ok(resp.json().await?)
     }
 
-    #[allow(dead_code)]
-    pub fn store_id(&self) -> &str {
-        &self.store_id
-    }
-
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

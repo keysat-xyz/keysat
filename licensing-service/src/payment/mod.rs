@@ -41,66 +41,6 @@ use std::any::Any;
 pub mod btcpay;
 pub mod zaprite;
 
-// =========================================================================
-// Legacy compatibility shims — DEPRECATED, will be removed once all call
-// sites migrate to the merchant-profile-aware resolution layer.
-// =========================================================================
-//
-// During the multi-provider transition the singleton-config-and-active-
-// provider-preference helpers stay callable so the existing connect flows
-// (`btcpay_authorize.rs`, `zaprite_authorize.rs`) and the boot loader in
-// `main.rs` keep working. Each shim wraps the new schema with the old
-// semantics: `read_active_provider_preference` looks up the first provider
-// attached to the default merchant profile and returns its kind;
-// `write_active_provider_preference` is a no-op (the new model doesn't
-// track an "active provider" preference — providers attach to profiles,
-// profiles attach to products).
-
-#[deprecated(
-    note = "use merchant-profile-aware resolution: \
-            state.payment_provider_for(product_id, rail)"
-)]
-pub const SETTING_ACTIVE_PROVIDER: &str = "active_payment_provider";
-
-#[deprecated(
-    note = "look up providers via list_payment_providers_for_profile or \
-            payment_provider_by_id on AppState"
-)]
-pub async fn read_active_provider_preference(
-    pool: &sqlx::SqlitePool,
-) -> Option<ProviderKind> {
-    // Post-migration: derive from the first provider attached to the
-    // default merchant profile (deterministic by connected_at ASC).
-    // Pre-migration (if the migration hasn't run yet on this DB):
-    // fall back to the legacy settings-table read.
-    let default_profile = crate::db::repo::get_default_merchant_profile(pool).await.ok().flatten();
-    if let Some(profile) = default_profile {
-        if let Ok(rows) = crate::db::repo::list_payment_providers_for_profile(pool, &profile.id).await {
-            if let Some(first) = rows.first() {
-                return ProviderKind::parse(&first.kind);
-            }
-        }
-    }
-    // Legacy fallback for the pre-migration window.
-    match crate::db::repo::settings_get(pool, SETTING_ACTIVE_PROVIDER).await {
-        Ok(Some(s)) => ProviderKind::parse(&s),
-        _ => None,
-    }
-}
-
-#[deprecated(
-    note = "providers are now attached to merchant profiles, not implicitly active. \
-            This shim is a no-op; remove the call."
-)]
-pub async fn write_active_provider_preference(
-    _pool: &sqlx::SqlitePool,
-    _kind: ProviderKind,
-) -> anyhow::Result<()> {
-    // No-op. In the multi-provider model there's no "active" preference
-    // to write — providers are looked up by id (per-product) or by profile.
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {

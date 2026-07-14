@@ -32,7 +32,6 @@ use crate::models::{License, Policy, Product};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -599,19 +598,4 @@ pub struct TierChangeRow {
     pub actor: String,
     pub reason: Option<String>,
     pub created_at: String,
-}
-
-// Suppress dead-code warnings on the audit-payload helper until
-// Phase 3 wires it into the webhook + admin endpoints.
-#[allow(dead_code)]
-fn _audit_payload(quote: &UpgradeQuote) -> serde_json::Value {
-    json!({
-        "from_policy_id": quote.from_policy_id,
-        "from_policy_slug": quote.from_policy_slug,
-        "to_policy_id": quote.to_policy_id,
-        "to_policy_slug": quote.to_policy_slug,
-        "direction": quote.direction.as_str(),
-        "listed_currency": quote.listed_currency,
-        "proration_charge_value": quote.proration_charge_value,
-    })
 }
