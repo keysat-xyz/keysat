@@ -231,10 +231,10 @@ pub async fn enforce_policy_cap(state: &AppState, product_id: &str) -> AppResult
 /// operators have the default profile (auto-created by migration 0020)
 /// and can't add more; Pro and Patron operators are unlimited.
 ///
-/// The `unlimited_merchant_profiles` entitlement needs to be added to
-/// the master Keysat's Pro and Patron policies as a separate admin
-/// action — see plans/multi-provider-payment-model.md "Tier gating"
-/// section.
+/// The `unlimited_merchant_profiles` entitlement is live on the master
+/// Keysat's Pro and Patron policies (verified 2026-07-14 via
+/// `GET /v1/products/keysat/policies`) — see
+/// plans/multi-provider-payment-model.md "Tier gating" section.
 pub async fn enforce_merchant_profile_cap(state: &AppState) -> AppResult<()> {
     let tier = current(state).await;
     if tier.has("unlimited_merchant_profiles") {
