@@ -25,13 +25,17 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use url::{Host, Url};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEndpointReq {
     pub url: String,
     /// Event types this endpoint is interested in. Use `["*"]` to receive all
     /// events. Examples: `license.issued`, `license.revoked`,
     /// `license.suspended`, `machine.activated`, `machine.deactivated`,
-    /// `invoice.settled`.
-    #[serde(default = "default_event_types")]
+    /// `invoice.settled`. Accepts the `events` alias for the same field; a
+    /// mistyped field name is rejected (422 — a deserialization/data error via
+    /// `deny_unknown_fields`, not a 400 syntax error) rather than silently
+    /// defaulting to `["*"]` (subscribe-to-all).
+    #[serde(default = "default_event_types", alias = "events")]
     pub event_types: Vec<String>,
     #[serde(default)]
     pub description: String,

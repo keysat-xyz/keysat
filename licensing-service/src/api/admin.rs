@@ -1097,7 +1097,7 @@ pub async fn issue_license(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RevokeReq {
     #[serde(default)]
     pub reason: String,
@@ -1107,10 +1107,13 @@ pub async fn revoke_license(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(license_id): Path<String>,
-    Json(req): Json<RevokeReq>,
+    // Accept an empty (or absent) body as `{}` — an admin revoke needs no
+    // fields; `reason` is optional. Mirrors `subscriptions::admin_cancel`.
+    body: Option<Json<RevokeReq>>,
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_scope(&state, &headers, "licenses:write").await?;
     let (ip, ua) = request_context(&headers);
+    let req = body.map(|Json(b)| b).unwrap_or_default();
     let reason = if req.reason.is_empty() {
         "admin revoke".to_string()
     } else {
@@ -1140,7 +1143,7 @@ pub async fn revoke_license(
 
 // ---------- Suspension / un-suspension ----------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct SuspendReq {
     #[serde(default)]
     pub reason: String,
@@ -1150,10 +1153,13 @@ pub async fn suspend_license(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(license_id): Path<String>,
-    Json(req): Json<SuspendReq>,
+    // Accept an empty (or absent) body as `{}` — like revoke, `reason` is
+    // optional. Mirrors `subscriptions::admin_cancel`.
+    body: Option<Json<SuspendReq>>,
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_scope(&state, &headers, "licenses:write").await?;
     let (ip, ua) = request_context(&headers);
+    let req = body.map(|Json(b)| b).unwrap_or_default();
     let reason = if req.reason.is_empty() {
         "admin suspend".to_string()
     } else {

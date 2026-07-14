@@ -1609,6 +1609,210 @@ async fn webhook_endpoint_create_rejects_ssrf_urls() {
     assert_eq!(count, 1, "the valid webhook url should have been stored");
 }
 
+/// Field-name strictness on webhook registration. A mistyped `event_types`
+/// field used to be silently swallowed to the `["*"]` default (subscribe to
+/// everything) — a footgun. `CreateEndpointReq` now carries
+/// `deny_unknown_fields`, so a wrong field name 400s; and it accepts the
+/// documented `events` alias for `event_types`. A genuinely absent field
+/// still defaults to `["*"]`.
+#[tokio::test]
+async fn webhook_endpoint_create_field_strictness() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // (a) A wrong/mistyped field name is rejected, NOT silently persisted with
+    //     the `["*"]` default. `deny_unknown_fields` makes serde reject the
+    //     extra field; axum's Json extractor surfaces a deserialization *data*
+    //     error as 422 Unprocessable Entity (400 is reserved for JSON *syntax*
+    //     errors), so the rejection is a 422 rather than the handler's own 400.
+    //     What matters for the footgun: it's a client-error rejection and no
+    //     row is persisted.
+    let req = build_request(
+        "POST",
+        "/v1/admin/webhook-endpoints",
+        &[("authorization", &auth)],
+        Some(json!({ "url": "https://example.com/hook", "event_type": ["license.issued"] })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a mistyped field name (event_type) should be rejected, not defaulted to [\"*\"]"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_endpoints")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "a request with an unknown field must not persist a row");
+
+    // (b) The `events` alias is accepted and maps onto `event_types`.
+    let req = build_request(
+        "POST",
+        "/v1/admin/webhook-endpoints",
+        &[("authorization", &auth)],
+        Some(json!({ "url": "https://example.com/hook", "events": ["license.issued"] })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the `events` alias should be accepted");
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["event_types"],
+        json!(["license.issued"]),
+        "the `events` alias should populate event_types verbatim (not the [\"*\"] default)"
+    );
+
+    // (c) An absent field still defaults to `["*"]`.
+    let req = build_request(
+        "POST",
+        "/v1/admin/webhook-endpoints",
+        &[("authorization", &auth)],
+        Some(json!({ "url": "https://example.com/hook2" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "an absent event_types field should be accepted");
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["event_types"],
+        json!(["*"]),
+        "an absent event_types field should default to [\"*\"]"
+    );
+}
+
+/// Empty-body tolerance on license revoke/suspend. Both endpoints take an
+/// optional `reason`, so an empty (or absent) request body must be treated as
+/// `{}` and succeed — not 400. A supplied `{"reason":…}` is still applied.
+/// `unsuspend` (which takes no JSON body at all) must keep accepting empty
+/// bodies — a regression guard.
+#[tokio::test]
+async fn revoke_suspend_accept_empty_body() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    let product = repo::create_product(
+        &state.db,
+        "revoke-suspend-test",
+        "Revoke/Suspend Test",
+        "",
+        100,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    // Helper: issue a fresh, active, perpetual single-machine license.
+    let new_license = || {
+        let db = state.db.clone();
+        let product_id = product.id.clone();
+        async move {
+            let id = Uuid::new_v4().to_string();
+            repo::create_license(
+                &db,
+                &id,
+                &product_id,
+                None,
+                &Utc::now().to_rfc3339(),
+                &json!({}),
+                None,
+                None,
+                0,
+                1,
+                &[],
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("create_license");
+            id
+        }
+    };
+
+    // (a) Empty-body revoke succeeds (not 400) and revokes the license.
+    let lic = new_license().await;
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{lic}/revoke"),
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "empty-body revoke should succeed, not 400");
+    let status: String = sqlx::query_scalar("SELECT status FROM licenses WHERE id = ?")
+        .bind(&lic)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "revoked", "empty-body revoke should revoke the license");
+
+    // (b) A supplied reason on revoke is applied.
+    let lic = new_license().await;
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{lic}/revoke"),
+        &[("authorization", &auth)],
+        Some(json!({ "reason": "fraud" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "revoke with a reason should succeed");
+    let stored: String = sqlx::query_scalar("SELECT revocation_reason FROM licenses WHERE id = ?")
+        .bind(&lic)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(stored, "fraud", "the supplied revoke reason should be persisted");
+
+    // (c) Empty-body suspend succeeds (not 400) and suspends the license.
+    let lic = new_license().await;
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{lic}/suspend"),
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "empty-body suspend should succeed, not 400");
+    let status: String = sqlx::query_scalar("SELECT status FROM licenses WHERE id = ?")
+        .bind(&lic)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "suspended", "empty-body suspend should suspend the license");
+
+    // (d) A supplied reason on suspend is applied.
+    let lic = new_license().await;
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{lic}/suspend"),
+        &[("authorization", &auth)],
+        Some(json!({ "reason": "chargeback" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "suspend with a reason should succeed");
+    let stored: String = sqlx::query_scalar("SELECT suspension_reason FROM licenses WHERE id = ?")
+        .bind(&lic)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(stored, "chargeback", "the supplied suspend reason should be persisted");
+
+    // (e) Regression guard: empty-body unsuspend (bodyless endpoint) still
+    //     succeeds — this fix must not have touched it.
+    let req = build_request(
+        "POST",
+        &format!("/v1/admin/licenses/{lic}/unsuspend"),
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "empty-body unsuspend should still succeed");
+    let status: String = sqlx::query_scalar("SELECT status FROM licenses WHERE id = ?")
+        .bind(&lic)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "active", "unsuspend should return the license to active");
+}
+
 /// Webhook DLQ (dead-letter queue) — list + retry round trip.
 ///
 /// The delivery worker retries failed deliveries with exponential
