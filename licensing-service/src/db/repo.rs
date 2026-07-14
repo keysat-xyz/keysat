@@ -12,23 +12,22 @@ use uuid::Uuid;
 
 // ---------- Products ----------
 
+const PRODUCT_COLS: &str = "id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at";
+
 pub async fn list_products(pool: &SqlitePool, only_active: bool) -> AppResult<Vec<Product>> {
     let q = if only_active {
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
-         FROM products WHERE active = 1 ORDER BY name"
+        format!("SELECT {PRODUCT_COLS} FROM products WHERE active = 1 ORDER BY name")
     } else {
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
-         FROM products ORDER BY name"
+        format!("SELECT {PRODUCT_COLS} FROM products ORDER BY name")
     };
-    let rows = sqlx::query(q).fetch_all(pool).await?;
+    let rows = sqlx::query(&q).fetch_all(pool).await?;
     rows.into_iter().map(row_to_product).collect()
 }
 
 pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Option<Product>> {
-    let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
-         FROM products WHERE slug = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {PRODUCT_COLS} FROM products WHERE slug = ?"
+    ))
     .bind(slug)
     .fetch_optional(pool)
     .await?;
@@ -36,10 +35,9 @@ pub async fn get_product_by_slug(pool: &SqlitePool, slug: &str) -> AppResult<Opt
 }
 
 pub async fn get_product_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Product>> {
-    let row = sqlx::query(
-        "SELECT id, slug, name, description, price_sats, price_currency, price_value, active, metadata_json, entitlements_catalog_json, merchant_profile_id, created_at, updated_at
-         FROM products WHERE id = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {PRODUCT_COLS} FROM products WHERE id = ?"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -387,6 +385,8 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> AppResult<Product> {
 
 // ---------- Invoices ----------
 
+const INVOICE_COLS: &str = "id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note, amount_sats, checkout_url, created_at, updated_at, policy_id, listed_currency, listed_value, payment_provider_id";
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_invoice(
     pool: &SqlitePool,
@@ -512,12 +512,9 @@ pub async fn create_free_invoice(
 }
 
 pub async fn get_invoice_by_id(pool: &SqlitePool, id: &str) -> AppResult<Option<Invoice>> {
-    let row = sqlx::query(
-        "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at, policy_id,
-                listed_currency, listed_value, payment_provider_id
-         FROM invoices WHERE id = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {INVOICE_COLS} FROM invoices WHERE id = ?"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -528,12 +525,9 @@ pub async fn get_invoice_by_btcpay_id(
     pool: &SqlitePool,
     btcpay_invoice_id: &str,
 ) -> AppResult<Option<Invoice>> {
-    let row = sqlx::query(
-        "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at, policy_id,
-                listed_currency, listed_value, payment_provider_id
-         FROM invoices WHERE btcpay_invoice_id = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {INVOICE_COLS} FROM invoices WHERE btcpay_invoice_id = ?"
+    ))
     .bind(btcpay_invoice_id)
     .fetch_optional(pool)
     .await?;
@@ -565,14 +559,11 @@ pub async fn list_pending_invoices(
     max_age_hours: i64,
 ) -> AppResult<Vec<Invoice>> {
     let cutoff = (Utc::now() - chrono::Duration::hours(max_age_hours)).to_rfc3339();
-    let rows = sqlx::query(
-        "SELECT id, btcpay_invoice_id, product_id, status, buyer_email, buyer_note,
-                amount_sats, checkout_url, created_at, updated_at, policy_id,
-                listed_currency, listed_value, payment_provider_id
-         FROM invoices
+    let rows = sqlx::query(&format!(
+        "SELECT {INVOICE_COLS} FROM invoices
          WHERE status = 'pending' AND created_at >= ?
-         ORDER BY created_at ASC",
-    )
+         ORDER BY created_at ASC"
+    ))
     .bind(&cutoff)
     .fetch_all(pool)
     .await?;
