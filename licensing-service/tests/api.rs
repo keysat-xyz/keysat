@@ -1535,6 +1535,80 @@ async fn tier_caps_block_at_creator_limit_and_unlock_after_upgrade() {
     assert_eq!(count, 6, "the previously-blocked product should now exist");
 }
 
+/// SSRF guard on webhook registration. The daemon later POSTs to whatever
+/// URL an admin registers, from inside the operator's network — so
+/// `POST /v1/admin/webhook-endpoints` must reject non-http(s) schemes and
+/// loopback/link-local hosts before persisting. Private LAN ranges stay
+/// allowed (a self-hosted operator may legitimately webhook a LAN service),
+/// so a normal public https URL still registers (200 OK per the create
+/// handler's `Json` response).
+#[tokio::test]
+async fn webhook_endpoint_create_rejects_ssrf_urls() {
+    let (state, _tmp) = make_test_state().await;
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+
+    // Cases that must be rejected with 400 before hitting the DB.
+    let rejected = [
+        "file:///etc/passwd",     // non-http(s) scheme
+        "http://127.0.0.1/x",     // IPv4 loopback
+        "http://localhost/x",     // loopback by name
+        "http://[::1]/x",         // IPv6 loopback
+        "http://169.254.169.254/latest/meta-data", // link-local (cloud metadata)
+        "ftp://example.com/x",    // non-http(s) scheme
+        "not a url",              // unparseable
+        "http://[::ffff:127.0.0.1]/x", // IPv4-mapped IPv6 loopback
+        "http://0.0.0.0/",        // unspecified (Linux routes to 127.0.0.1)
+        "http://localhost./x",    // trailing-dot FQDN loopback
+    ];
+    for url in rejected {
+        let req = build_request(
+            "POST",
+            "/v1/admin/webhook-endpoints",
+            &[("authorization", &auth)],
+            Some(json!({ "url": url })),
+        );
+        let resp = send(&state, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "webhook url {url:?} should be rejected with 400"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], false, "rejection body should carry ok=false for {url:?}");
+        assert_eq!(
+            body["error"], "bad_request",
+            "rejection body should use the bad_request error envelope for {url:?}"
+        );
+    }
+
+    // No endpoint rows should have been persisted by any rejected request.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_endpoints")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no rejected webhook url should have been stored");
+
+    // A normal public https URL still registers successfully (200 OK).
+    let req = build_request(
+        "POST",
+        "/v1/admin/webhook-endpoints",
+        &[("authorization", &auth)],
+        Some(json!({ "url": "https://example.com/hook" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a normal https webhook url should register; got {}",
+        resp.status()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_endpoints")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the valid webhook url should have been stored");
+}
+
 /// Webhook DLQ (dead-letter queue) — list + retry round trip.
 ///
 /// The delivery worker retries failed deliveries with exponential

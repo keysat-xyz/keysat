@@ -12,7 +12,7 @@
 use crate::api::admin::{request_context, require_scope};
 use crate::api::AppState;
 use crate::db::repo;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
@@ -21,6 +21,8 @@ use axum::{
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use url::{Host, Url};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEndpointReq {
@@ -43,6 +45,82 @@ fn default_event_types() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// Validate a webhook target URL before we persist it, to blunt SSRF: the
+/// daemon later POSTs to this URL from inside the operator's network, so an
+/// attacker who can register an endpoint could otherwise coerce it into
+/// hitting internal-only services or non-http schemes.
+///
+/// Rejected: anything not parseable, any scheme other than http/https (blocks
+/// `file://`, `ftp://`, `gopher://`, …), and loopback/link-local hosts
+/// (`localhost`, `127.0.0.0/8`, `::1`, `169.254.0.0/16`, `fe80::/10`).
+///
+/// Deliberately still allowed: RFC-1918 / ULA private ranges (`10/8`,
+/// `192.168/16`, `172.16-31/12`, `fc00::/7`). A self-hosted operator may
+/// legitimately webhook a LAN service on the same box or network.
+fn validate_webhook_url(raw: &str) -> Result<(), AppError> {
+    let url = Url::parse(raw)
+        .map_err(|_| AppError::BadRequest(format!("invalid webhook url: {raw}")))?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "webhook url scheme must be http or https, got {other}"
+            )))
+        }
+    }
+
+    let blocked = match url.host() {
+        // Loopback by name — the url crate keeps a trailing FQDN dot
+        // (`localhost.`), so strip trailing dots before comparing.
+        Some(Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ipv4_is_blocked(&ip),
+        Some(Host::Ipv6(ip)) => ipv6_is_blocked(&ip),
+        // No host at all (can't normally happen for http/https, but be safe).
+        None => {
+            return Err(AppError::BadRequest(
+                "webhook url must include a host".into(),
+            ))
+        }
+    };
+    if blocked {
+        return Err(AppError::BadRequest(format!(
+            "webhook url host may not be loopback/link-local/unspecified: {raw}"
+        )));
+    }
+    Ok(())
+}
+
+/// v4 hosts we refuse to webhook: loopback (`127.0.0.0/8`), link-local
+/// (`169.254.0.0/16`), and the unspecified `0.0.0.0` — Linux routes a
+/// `connect(0.0.0.0)` to `127.0.0.1`, so it's a standard SSRF-to-localhost
+/// vector even though Rust doesn't classify it as loopback.
+fn ipv4_is_blocked(ip: &Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+}
+
+/// v6 hosts we refuse to webhook: `::1` loopback, `::` unspecified, `fe80::/10`
+/// link-local, AND any IPv4-mapped/compatible form (`::ffff:127.0.0.1`,
+/// `::127.0.0.1`) whose embedded v4 address is itself blocked — otherwise a
+/// mapped loopback slips past `is_loopback()` (which only matches `::1`) and the
+/// `fe80::/10` prefix test (which sees a `0` first segment for a mapped addr).
+fn ipv6_is_blocked(ip: &Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || is_ipv6_link_local(ip) {
+        return true;
+    }
+    // `to_ipv4()` unwraps both `::ffff:a.b.c.d` (mapped) and `::a.b.c.d`
+    // (compatible) into the embedded v4 address; re-run the v4 blocklist on it.
+    matches!(ip.to_ipv4(), Some(v4) if ipv4_is_blocked(&v4))
+}
+
+/// `fe80::/10` — the first 10 bits are `1111111010`. `Ipv6Addr` has no stable
+/// `is_unicast_link_local()` (still behind the unstable `ip` feature), so check
+/// the prefix by hand. (IPv4-mapped loopback/link-local is handled separately in
+/// [`ipv6_is_blocked`] via `to_ipv4()`, not here.)
+fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -50,6 +128,7 @@ pub async fn create(
 ) -> AppResult<Json<Value>> {
     let actor_hash = require_scope(&state, &headers, "webhooks:write").await?;
     let (ip, ua) = request_context(&headers);
+    validate_webhook_url(&req.url)?;
     let secret = req.secret.unwrap_or_else(generate_secret);
     let ep = repo::create_webhook_endpoint(
         &state.db,
