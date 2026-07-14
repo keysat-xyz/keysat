@@ -134,7 +134,7 @@ declared BTCPay dependency hostname.
 
 For advanced operators, the `/v1/admin/*` HTTP API exposes everything
 the actions do plus bulk-list operations not yet surfaced in the UI.
-Retrieve the admin API key via the **Show admin credentials** action.
+Retrieve the admin API key via the **Show admin API key** action.
 
 ## Network Access and Interfaces
 
@@ -157,7 +157,7 @@ that must happen outside the embedded admin web UI are registered as actions:
 
 - *Set web UI password* — set / recover the admin SPA login password (you
   can't reset it from inside the UI if you're locked out).
-- *Show credentials* — reveal the admin API key on first install, before
+- *Show admin API key* — reveal the admin API key on first install, before
   you've logged into the admin UI.
 - *Activate Keysat license* — first-install bootstrap for paid self-hosting
   tiers, and recovery if `/data/keysat-license.txt` is lost.
