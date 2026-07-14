@@ -1132,6 +1132,190 @@ async fn settle_webhook_acks_without_issuing_when_provider_unreachable() {
     );
 }
 
+/// Money-path routing regression (net-new): the per-provider webhook route
+/// `/v1/btcpay/webhook/:provider_id` must settle ONLY the invoice named in the
+/// body, on the profile that owns it — never touch a second merchant profile —
+/// and must reject an unrecognized provider id with 404. This is the multi-
+/// profile settlement path (which customer's payment settles which merchant
+/// profile), which had zero automated coverage.
+///
+/// Mechanism (verified against `webhook::handle_for_provider`): the handler
+/// resolves the provider via `payment_provider_by_id(provider_id)` FIRST — an
+/// unknown id short-circuits to `AppError::NotFound` (404) before the body is
+/// ever parsed — then settles the invoice identified by the `provider_invoice_id`
+/// in the webhook body via `get_invoice_by_btcpay_id`. With the single global
+/// `provider_override` mock, a two-real-provider-row setup suffices: the mock
+/// confirms `Settled` for any resolved provider, so routing/selection is proven
+/// by (a) only the body's invoice settling and (b) an unknown path id 404ing.
+#[tokio::test]
+async fn webhook_routes_to_correct_profile() {
+    // install_mock_provider seeds a default profile + one provider row and the
+    // happy-path (confirms Settled) global mock override.
+    let (state, _tmp) = install_mock_provider(MockPaymentProvider::new()).await;
+    let now = Utc::now().to_rfc3339();
+
+    let product = repo::create_product(
+        &state.db,
+        "routing-test",
+        "Routing Test",
+        "",
+        5_000,
+        &json!({}),
+    )
+    .await
+    .expect("create_product");
+
+    // Two distinct merchant profiles, each with its own payment-provider row
+    // (provider ids A and B). These are the two "businesses" whose webhook URLs
+    // differ only by the trailing provider id.
+    let profile_a = Uuid::new_v4().to_string();
+    let profile_b = Uuid::new_v4().to_string();
+    repo::create_merchant_profile(
+        &state.db, &profile_a, "Profile A", None, None, None, None, None, false, &now,
+    )
+    .await
+    .expect("create profile A");
+    repo::create_merchant_profile(
+        &state.db, &profile_b, "Profile B", None, None, None, None, None, false, &now,
+    )
+    .await
+    .expect("create profile B");
+
+    let provider_a = Uuid::new_v4().to_string();
+    let provider_b = Uuid::new_v4().to_string();
+    repo::create_payment_provider(
+        &state.db, &provider_a, &profile_a, "btcpay", "A BTCPay",
+        "inert-key-a", "http://btcpay.test", None, Some("secret-a"), Some("store-a"), &now,
+    )
+    .await
+    .expect("create provider A");
+    repo::create_payment_provider(
+        &state.db, &provider_b, &profile_b, "btcpay", "B BTCPay",
+        "inert-key-b", "http://btcpay.test", None, Some("secret-b"), Some("store-b"), &now,
+    )
+    .await
+    .expect("create provider B");
+
+    // One pending invoice per profile, each tied to that profile's provider.
+    let invoice_a = Uuid::new_v4().to_string();
+    let invoice_b = Uuid::new_v4().to_string();
+    repo::create_invoice(
+        &state.db,
+        &invoice_a,
+        "mock-inv-A",
+        &product.id,
+        5_000,
+        "http://mock-checkout.test/i/A",
+        None,               // buyer_email
+        None,               // buyer_note
+        None,               // policy_id
+        Some(&provider_a),  // payment_provider_id
+    )
+    .await
+    .expect("create invoice A");
+    repo::create_invoice(
+        &state.db,
+        &invoice_b,
+        "mock-inv-B",
+        &product.id,
+        5_000,
+        "http://mock-checkout.test/i/B",
+        None,               // buyer_email
+        None,               // buyer_note
+        None,               // policy_id
+        Some(&provider_b),  // payment_provider_id
+    )
+    .await
+    .expect("create invoice B");
+
+    // --- Assertion 1: a Settled webhook to A's provider path carrying A's
+    //     invoice id settles A's invoice and issues its license. ---
+    let req = build_request(
+        "POST",
+        &format!("/v1/btcpay/webhook/{provider_a}"),
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": "mock-inv-A" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "webhook to A's provider path with A's invoice must ack 200"
+    );
+
+    let status_a: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE btcpay_invoice_id = 'mock-inv-A'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(status_a, "settled", "profile A's invoice must settle");
+    assert!(
+        repo::get_license_by_invoice(&state.db, &invoice_a)
+            .await
+            .expect("get_license_by_invoice A")
+            .is_some(),
+        "profile A must have a license issued"
+    );
+
+    // --- Assertion 2: profile B is untouched — its invoice stays pending and
+    //     no license exists for it (no cross-profile settlement leak). ---
+    let status_b: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE btcpay_invoice_id = 'mock-inv-B'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_b, "pending",
+        "profile B's invoice must NOT settle — a webhook for A must not leak to B"
+    );
+    assert!(
+        repo::get_license_by_invoice(&state.db, &invoice_b)
+            .await
+            .expect("get_license_by_invoice B")
+            .is_none(),
+        "profile B must have NO license (no cross-profile leak)"
+    );
+    let licenses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(licenses, 1, "exactly one license (profile A's) may exist");
+
+    // --- Assertion 3: an unrecognized provider id in the path is rejected
+    //     with 404 (provider resolution fails BEFORE any body processing), and
+    //     B — whose invoice id rides in this body — stays untouched. ---
+    let req = build_request(
+        "POST",
+        "/v1/btcpay/webhook/no-such-provider-id",
+        &[("content-type", "application/json")],
+        Some(json!({ "kind": "settled", "provider_invoice_id": "mock-inv-B" })),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "an unknown provider id must 404 (handle_for_provider rejects it)"
+    );
+
+    let status_b_after: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE btcpay_invoice_id = 'mock-inv-B'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_b_after, "pending",
+        "the unknown-provider webhook must not settle B's invoice"
+    );
+    let licenses_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM licenses")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        licenses_after, 1,
+        "the unknown-provider webhook must issue no license"
+    );
+}
+
 /// Advisory settle-amount tripwire (P1): when the provider confirms `Settled`
 /// but reports a different amount than we charged, the handler STILL issues
 /// the license — the amount check is advisory, NOT a gate — and records an
