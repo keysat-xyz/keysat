@@ -92,6 +92,7 @@ async fn make_state() -> (AppState, NamedTempFile, Arc<MockProvider>) {
             reason: "test".into(),
         })),
         rates: keysat::rates::RateCache::new(),
+        provider_health: Default::default(),
     };
     (state, tmp, mock)
 }

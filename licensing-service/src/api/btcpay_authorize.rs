@@ -441,7 +441,17 @@ async fn finish_connect(state: &AppState, state_token: &str, api_key: &str) -> A
     let existing = crate::db::repo::list_payment_providers_for_profile(&state.db, &profile.id)
         .await?;
     if profile.is_default && existing.len() == 1 {
-        let client = BtcpayClient::new(base_url, api_key, &store.id);
+        // Bind the singleton's client to the health map too. This is NOT
+        // covered by `build_provider`: the provider installed here serves the
+        // legacy `state.payment` call sites until the next restart, and without
+        // a sink every one of those calls would be invisible to the alert rule
+        // for the whole life of the process.
+        let client = BtcpayClient::new(base_url, api_key, &store.id).with_sink(
+            crate::payment::health::ProviderHealthSink::new(
+                state.provider_health.clone(),
+                provider_id.clone(),
+            ),
+        );
         let provider = Arc::new(
             BtcpayProvider::new(client, webhook_secret.clone())
                 .with_public_base(state.config.btcpay_public_url.clone()),

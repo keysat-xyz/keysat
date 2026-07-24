@@ -154,13 +154,21 @@ pub fn rails_for_kind(kind: ProviderKind) -> Vec<Rail> {
 /// Build a typed `PaymentProvider` trait object from a `payment_providers`
 /// row. Dispatch on `kind`. Used by the AppState provider cache when
 /// resolving by provider id.
+///
+/// `provider_health` is the shared auth-health map; the client this builds is
+/// bound to it under `row.id`, so every call it makes — through the trait, or
+/// through the `as_any()` downcast escapes in `subscriptions.rs` that reach the
+/// raw client past the trait — reports to the same tracker.
 pub fn build_provider(
     row: &crate::db::repo::PaymentProviderRow,
     public_base_url: Option<&str>,
+    provider_health: &health::ProviderHealthMap,
 ) -> anyhow::Result<std::sync::Arc<dyn PaymentProvider>> {
     use crate::btcpay::client::BtcpayClient;
     use crate::payment::btcpay::BtcpayProvider;
     use crate::payment::zaprite::{ZapriteClient, ZapriteProvider};
+
+    let sink = health::ProviderHealthSink::new(provider_health.clone(), row.id.clone());
 
     match ProviderKind::parse(&row.kind) {
         Some(ProviderKind::Btcpay) => {
@@ -168,13 +176,15 @@ pub fn build_provider(
                 anyhow::anyhow!("BTCPay provider row {} missing store_id", row.id)
             })?;
             let webhook_secret = row.webhook_secret.clone().unwrap_or_default();
-            let client = BtcpayClient::new(&row.base_url, &row.api_key, store_id);
+            let client =
+                BtcpayClient::new(&row.base_url, &row.api_key, store_id).with_sink(sink);
             let provider = BtcpayProvider::new(client, webhook_secret)
                 .with_public_base(public_base_url.map(|s| s.to_string()));
             Ok(std::sync::Arc::new(provider))
         }
         Some(ProviderKind::Zaprite) => {
-            let client = ZapriteClient::new(row.base_url.clone(), row.api_key.clone());
+            let client =
+                ZapriteClient::new(row.base_url.clone(), row.api_key.clone()).with_sink(sink);
             Ok(std::sync::Arc::new(ZapriteProvider::new(client)))
         }
         None => Err(anyhow::anyhow!(
@@ -376,4 +386,257 @@ pub trait PaymentProvider: Send + Sync + Any {
     /// `btcpay_client()` accessor reach the inner BTCPay-specific
     /// client. v0.3 will retire the compat accessors and remove this.
     fn as_any(&self) -> &dyn Any;
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`build_provider`] is attachment sites 1 and 2 of the auth-health sink.
+    //! These drive a provider it built against a throwaway 401 server and read
+    //! the shared map back out, so nothing about the wiring is asserted from a
+    //! hand-built value.
+    //!
+    //! The two paths worth proving separately are the ones the trait cannot
+    //! see: the `as_any()` downcast escapes in `subscriptions.rs`, which reach
+    //! the raw client past the trait, and `pay_lightning_invoice`, which never
+    //! reaches a client at all on a non-Lightning provider.
+
+    use super::health::{ProviderAuthHealth, ProviderHealthMap};
+    use super::*;
+    use axum::{http::StatusCode, Router};
+    use tokio::net::TcpListener;
+
+    /// Same shape as the stubs in `btcpay::client` and `zaprite::client`'s test
+    /// modules. Duplicated rather than shared for the same reason they are:
+    /// a shared helper would be a new module outside this change's blast radius.
+    async fn spawn_stub(status: StatusCode, body: &'static str) -> String {
+        let app = Router::new().fallback(move || async move { (status, body) });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    fn row(id: &str, kind: &str, base_url: &str) -> crate::db::repo::PaymentProviderRow {
+        crate::db::repo::PaymentProviderRow {
+            id: id.to_string(),
+            merchant_profile_id: "profile-1".to_string(),
+            kind: kind.to_string(),
+            label: format!("Test {kind}"),
+            api_key: "dead-key".to_string(),
+            base_url: base_url.to_string(),
+            webhook_id: None,
+            webhook_secret: Some("secret".to_string()),
+            store_id: Some("store-1".to_string()),
+            connected_at: "2026-07-24T00:00:00Z".to_string(),
+            updated_at: "2026-07-24T00:00:00Z".to_string(),
+        }
+    }
+
+    fn health_of(map: &ProviderHealthMap, id: &str) -> ProviderAuthHealth {
+        map.read().expect("not poisoned").get(id).cloned().unwrap_or_default()
+    }
+
+    fn invoice_params<'a>(redirect: &'a str, order_id: &'a str) -> CreateInvoiceParams<'a> {
+        CreateInvoiceParams {
+            amount: Money::sats(1000),
+            redirect_url: redirect,
+            metadata: serde_json::json!({}),
+            external_order_id: order_id,
+            buyer_email: None,
+            allow_save_payment_profile: None,
+        }
+    }
+
+    /// Site 1. The provider `build_provider` returns must report under the
+    /// **row's** id, not some other key — a mis-bound key would file a revoked
+    /// provider's failures against a healthy one.
+    #[tokio::test]
+    async fn build_provider_binds_the_btcpay_client_to_the_row_id() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+
+        let provider = build_provider(&row("prov-btc", "btcpay", &base), None, &map)
+            .expect("build_provider");
+        provider
+            .create_invoice(invoice_params("https://x/thanks", "inv-1"))
+            .await
+            .unwrap_err();
+        // The reconcile loop's call, through the same client.
+        provider.get_invoice_status("inv-1").await.unwrap_err();
+
+        let h = health_of(&map, "prov-btc");
+        assert_eq!(h.consecutive_auth_failures, 2);
+        assert_eq!(h.last_status, Some(401));
+        assert_eq!(map.read().expect("not poisoned").len(), 1);
+    }
+
+    /// Site 2.
+    #[tokio::test]
+    async fn build_provider_binds_the_zaprite_client_to_the_row_id() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+
+        let provider = build_provider(&row("prov-zap", "zaprite", &base), None, &map)
+            .expect("build_provider");
+        provider
+            .create_invoice(invoice_params("https://x/thanks", "inv-1"))
+            .await
+            .unwrap_err();
+
+        let h = health_of(&map, "prov-zap");
+        assert_eq!(h.consecutive_auth_failures, 1);
+        assert_eq!(h.last_status, Some(401));
+    }
+
+    /// Two rows sharing one map keep separate streaks. This is what makes the
+    /// map safe for a multi-provider profile, where one revoked key must not
+    /// implicate the other provider.
+    #[tokio::test]
+    async fn two_rows_get_independent_entries() {
+        let bad = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let good = spawn_stub(StatusCode::OK, r#"{"id":"ord-1","checkoutUrl":"https://x/y"}"#).await;
+        let map: ProviderHealthMap = Default::default();
+
+        let failing =
+            build_provider(&row("prov-a", "zaprite", &bad), None, &map).expect("build_provider");
+        let healthy =
+            build_provider(&row("prov-b", "zaprite", &good), None, &map).expect("build_provider");
+
+        failing
+            .create_invoice(invoice_params("https://x/thanks", "inv-1"))
+            .await
+            .unwrap_err();
+        healthy
+            .create_invoice(invoice_params("https://x/thanks", "inv-2"))
+            .await
+            .expect("2xx must succeed");
+
+        assert_eq!(health_of(&map, "prov-a").consecutive_auth_failures, 1);
+        assert_eq!(health_of(&map, "prov-b").consecutive_auth_failures, 0);
+        assert!(health_of(&map, "prov-b").last_success_at.is_some());
+    }
+
+    /// **The `as_any()` escapes.** `subscriptions.rs` reaches the raw
+    /// `ZapriteClient` past the trait in two places — the capture path
+    /// (`zaprite.client().get_order` / `get_contact`) and the auto-charge path
+    /// (`zaprite.client().charge_order_with_profile`) — and those are the calls
+    /// a recurring subscription actually makes. A trait decorator would have
+    /// missed every one of them; that is precisely why tracking lives in the
+    /// client. This drives the same downcast the production code does.
+    #[tokio::test]
+    async fn the_as_any_escape_paths_record() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+        let provider = build_provider(&row("prov-zap", "zaprite", &base), None, &map)
+            .expect("build_provider");
+
+        let zaprite = provider
+            .as_any()
+            .downcast_ref::<crate::payment::zaprite::ZapriteProvider>()
+            .expect("downcast to ZapriteProvider");
+
+        // subscriptions.rs capture path.
+        zaprite.client().get_order("ord-1").await.unwrap_err();
+        zaprite.client().get_contact("con-1").await.unwrap_err();
+        // subscriptions.rs auto-charge path.
+        zaprite
+            .client()
+            .charge_order_with_profile("ord-1", "pp-1")
+            .await
+            .unwrap_err();
+
+        let h = health_of(&map, "prov-zap");
+        assert_eq!(
+            h.consecutive_auth_failures, 3,
+            "every call reached past the trait must still reach the sink"
+        );
+    }
+
+    /// `AppState::btcpay_client()` hands out a **clone** of the inner client
+    /// (`api/mod.rs`: `.map(|p| p.client().clone())`), and the legacy BTCPay
+    /// call sites work off that clone. Nothing else pins that a clone keeps its
+    /// sink — it does only because the field is part of the derived `Clone`, so
+    /// a hand-written `Clone` that forgot it would silently un-track every one
+    /// of those call sites. This drives the exact expression that accessor uses.
+    #[tokio::test]
+    async fn a_cloned_btcpay_client_keeps_its_sink() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+        let provider = build_provider(&row("prov-btc", "btcpay", &base), None, &map)
+            .expect("build_provider");
+
+        let cloned = provider
+            .as_any()
+            .downcast_ref::<crate::payment::btcpay::BtcpayProvider>()
+            .expect("downcast to BtcpayProvider")
+            .client()
+            .clone();
+
+        cloned.get_invoice("inv-1").await.unwrap_err();
+
+        assert_eq!(health_of(&map, "prov-btc").consecutive_auth_failures, 1);
+    }
+
+    /// The inert-status rule, end to end through a real client rather than at
+    /// the pure-rule layer. A provider outage must neither manufacture an auth
+    /// alert nor paper over one — and the second half is the dangerous one: a
+    /// 5xx that quietly reset the streak would let a revoked key hide behind
+    /// any flaky provider.
+    #[tokio::test]
+    async fn a_5xx_does_not_disturb_a_running_streak() {
+        let map: ProviderHealthMap = Default::default();
+        let bad = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let flaky = spawn_stub(StatusCode::BAD_GATEWAY, "upstream down").await;
+
+        let revoked =
+            build_provider(&row("prov-1", "zaprite", &bad), None, &map).expect("build_provider");
+        revoked
+            .create_invoice(invoice_params("https://x/thanks", "inv-1"))
+            .await
+            .unwrap_err();
+        revoked
+            .create_invoice(invoice_params("https://x/thanks", "inv-2"))
+            .await
+            .unwrap_err();
+
+        // Same provider row, now answering 502.
+        let outage =
+            build_provider(&row("prov-1", "zaprite", &flaky), None, &map).expect("build_provider");
+        outage
+            .create_invoice(invoice_params("https://x/thanks", "inv-3"))
+            .await
+            .unwrap_err();
+
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.consecutive_auth_failures, 2, "a 502 must not reset");
+        assert_eq!(h.last_status, Some(502));
+        assert_eq!(h.last_success_at, None, "and must not count as a success");
+    }
+
+    /// **The tipping regression.** `pay_lightning_invoice` on a provider with
+    /// no outbound Lightning bails without issuing any HTTP request, so it must
+    /// record nothing at all. Tracking at the trait layer would have counted
+    /// every tip attempt against a Zaprite-connected operator as a provider
+    /// auth failure and eventually alerted on a perfectly healthy key.
+    #[tokio::test]
+    async fn pay_lightning_invoice_on_a_non_lightning_provider_records_nothing() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+        let provider = build_provider(&row("prov-zap", "zaprite", &base), None, &map)
+            .expect("build_provider");
+
+        // The real tipping call site (`tipping.rs`) invokes exactly this.
+        let err = provider
+            .pay_lightning_invoice("lnbc1...")
+            .await
+            .expect_err("a non-Lightning provider must refuse");
+        assert!(err.to_string().contains("does not support outbound Lightning"));
+
+        assert!(
+            map.read().expect("not poisoned").is_empty(),
+            "a refusal that never left the daemon is not a provider failure"
+        );
+    }
 }

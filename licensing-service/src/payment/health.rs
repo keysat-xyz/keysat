@@ -7,10 +7,20 @@
 //! notices. It folds a stream of observed provider-call outcomes into the one
 //! question an operator cares about — "is this provider's key still working?"
 //!
-//! Everything here is pure: no IO, no lock, no ambient clock (every entry
-//! point takes `now`). The shared map, the sink handle and the client
-//! attachment sites are wiring and land separately.
+//! Two layers live here, and the split is the point.
+//!
+//! [`ProviderAuthHealth`] is the **rule**, and it is pure: no IO, no lock, no
+//! ambient clock (every entry point takes `now`). It can be reasoned about, and
+//! tested, one call at a time.
+//!
+//! [`ProviderHealthSink`] over [`ProviderHealthMap`] is the **boundary** that
+//! makes the rule usable from many providers and many concurrent requests. It
+//! owns the one thing the rule deliberately does not: the lock, held once
+//! across each read-modify-write. Everything shared and everything fallible
+//! sits there, so nothing above it has to think about either.
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 /// Consecutive counting auth failures required before an alert can fire.
@@ -136,32 +146,19 @@ pub fn is_probe_label(label: &str) -> bool {
 /// There is intentionally **no re-export** from `payment/mod.rs`: one type, one
 /// path, `crate::payment::health::ProviderAuthHealth`.
 ///
-/// **2. A client will hold one pre-bound sink handle, not `(sink, provider_id)`.**
-/// When the clients are wired up, `BtcpayClient` and `ZapriteClient` each get a
-/// single `Option<ProviderHealthSink>` field, shaped roughly:
-///
-/// ```text
-/// #[derive(Debug, Clone)]
-/// pub struct ProviderHealthSink {
-///     map: Arc<RwLock<HashMap<String, ProviderAuthHealth>>>, // key: payment_providers.id
-///     provider_id: String,
-/// }
-/// impl ProviderHealthSink {
-///     pub fn record_success(&self, label: &str, now: SystemTime);
-///     pub fn record_failure(&self, label: &str, status: u16, now: SystemTime);
-/// }
-/// ```
-///
-/// attached through a `with_sink()` builder rather than a `new()` parameter, so
-/// the test-only `ZapriteClient::new` call sites keep compiling. Two fields
-/// would be two `Option`s that can disagree, would leak the map's key type into
-/// both clients, and would force each of them to re-derive the locking
-/// discipline — which must be a **single `write()` held across the whole
-/// read-modify-write**, never a read followed by a write, or two concurrent
-/// calls can lose a failure. Binding the id once, at the four construction
-/// sites that know it, puts that discipline in exactly one place. `Debug` and
-/// `Clone` are load-bearing on the handle for the same reason they are on this
-/// type: `ZapriteClient` derives both.
+/// **2. A client holds one pre-bound sink handle, not `(sink, provider_id)`.**
+/// That handle is [`ProviderHealthSink`], and `BtcpayClient` / `ZapriteClient`
+/// each hold a single `Option<ProviderHealthSink>` attached through a
+/// `with_sink()` builder rather than a `new()` parameter, so the test-only
+/// `ZapriteClient::new` call sites keep compiling. Two fields would be two
+/// `Option`s that can disagree, would leak the map's key type into both
+/// clients, and would force each of them to re-derive the locking discipline —
+/// which must be a **single `write()` held across the whole read-modify-write**,
+/// never a read followed by a write, or two concurrent calls can lose a
+/// failure. Binding the id once, at the four construction sites that know it,
+/// puts that discipline in exactly one place. `Debug` and `Clone` are
+/// load-bearing on the handle for the same reason they are on this type:
+/// `ZapriteClient` derives both.
 ///
 /// One thing the wiring must get right and cannot see from here: **record the
 /// outcome as soon as the status is known, before reading the response body.**
@@ -293,6 +290,92 @@ impl ProviderAuthHealth {
             // time. Refusing to alert on a streak with no known start is the
             // safe reading of that.
             None => false,
+        }
+    }
+}
+
+/// The process-wide auth-health map, keyed by `payment_providers.id`.
+///
+/// Lives on `AppState`, is written by the provider clients through a
+/// [`ProviderHealthSink`], and is read by the health-summary endpoint.
+///
+/// **A `std::sync::RwLock`, not `tokio`'s**, unlike `AppState`'s other locked
+/// fields. The critical section is a pure in-memory read-modify-write with no
+/// `await` in it, so a sync lock is both cheaper and *structurally* safer here:
+/// holding a `std` guard across an `.await` does not compile, which is exactly
+/// the mistake this map invites. Poisoning is recovered from rather than
+/// propagated — a panic mid-update leaves the map internally consistent (every
+/// mutation is a single infallible field write), and losing the whole alert
+/// surface because one unrelated task panicked would be the worse failure.
+///
+/// In-memory only, so it empties on restart. Deliberate ceiling, documented on
+/// [`ProviderAuthHealth`]; the upgrade path is a `provider_health` table.
+///
+/// **Keys are not garbage-collected.** Disconnecting a provider deletes its
+/// row but leaves its entry here, and nothing removes it today. Pruning
+/// orphans on read is the contract the health-summary endpoint is expected to
+/// honor when it lands — stated here as the intended design, not as current
+/// behavior, so a reader written before then does not assume every key still
+/// names a live row.
+pub type ProviderHealthMap = Arc<RwLock<HashMap<String, ProviderAuthHealth>>>;
+
+/// A write handle onto [`ProviderHealthMap`], pre-bound to one provider row.
+///
+/// One of these is attached to a provider client at construction, at each of
+/// the four sites that know which `payment_providers` row the client speaks
+/// for. Everything downstream of that — the trait impls, the `as_any()`
+/// downcast escapes in `subscriptions.rs`, the legacy `state.payment`
+/// singleton — reaches the same client and therefore the same sink, which is
+/// why tracking lives in the client rather than in a trait decorator.
+///
+/// The handle is `Option`al on the client, so a client built with no row to
+/// key on records nothing at all: the Zaprite connect-time smoke test, and the
+/// test fixtures that are exercising something other than this.
+#[derive(Debug, Clone)]
+pub struct ProviderHealthSink {
+    map: ProviderHealthMap,
+    /// `payment_providers.id`. Bound once, here, so neither client has to
+    /// carry the map's key type.
+    provider_id: String,
+}
+
+impl ProviderHealthSink {
+    pub fn new(map: ProviderHealthMap, provider_id: impl Into<String>) -> Self {
+        Self {
+            map,
+            provider_id: provider_id.into(),
+        }
+    }
+
+    /// Fold one observed provider call into this provider's health.
+    ///
+    /// **The single entry point on purpose.** Routing on the status here, once,
+    /// rather than at each client, is what makes it impossible for a wiring
+    /// site to hand a 2xx to [`ProviderAuthHealth::record_failure`] — the slip
+    /// that type's `debug_assert!` guards against, whose harm is a streak that
+    /// never resets and so a false alert no later success can clear.
+    ///
+    /// `status` is the HTTP status the provider returned, and the caller must
+    /// pass it **as soon as it is known, before reading the response body**;
+    /// see the note on [`ProviderAuthHealth`]. An outcome that never reached a
+    /// status — a timeout, a DNS or TLS failure — is not recorded at all, which
+    /// is why there is no entry point for one.
+    ///
+    /// Success is `200..300`, matching `reqwest::StatusCode::is_success`, which
+    /// is what both clients branch on to decide whether the call failed.
+    pub fn record(&self, label: &str, status: u16, now: SystemTime) {
+        // ONE `write()` held across the whole read-modify-write. A read
+        // followed by a write would lose increments under exactly the
+        // concurrency a shared provider client invites.
+        let mut map = match self.map.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = map.entry(self.provider_id.clone()).or_default();
+        if (200..300).contains(&status) {
+            entry.record_success(label, now);
+        } else {
+            entry.record_failure(label, status, now);
         }
     }
 }
@@ -618,6 +701,127 @@ mod tests {
         assert_eq!(h.first_failure_at, None);
         assert_eq!(h.last_success_at, Some(t(120)));
         assert!(!h.is_alerting(t(100_000)));
+    }
+
+    // -----------------------------------------------------------------
+    // The sink handle. The rule above is pure; these cover the shared map
+    // it is folded into and the status routing that sits in front of it.
+    // -----------------------------------------------------------------
+
+    fn sink_for(map: &ProviderHealthMap, id: &str) -> ProviderHealthSink {
+        ProviderHealthSink::new(map.clone(), id)
+    }
+
+    fn health_of(map: &ProviderHealthMap, id: &str) -> ProviderAuthHealth {
+        map.read().expect("not poisoned").get(id).cloned().unwrap_or_default()
+    }
+
+    /// The reason `record` is the single entry point: it, not the caller,
+    /// decides which of the two folds a status is. A wiring site cannot route
+    /// a 2xx into `record_failure` — the slip whose `debug_assert!` above
+    /// exists because it would leave a streak that no later success clears.
+    #[test]
+    fn the_sink_routes_a_2xx_to_success_and_everything_else_to_failure() {
+        let map: ProviderHealthMap = Default::default();
+        let sink = sink_for(&map, "prov-1");
+
+        sink.record(HOT, 401, t(0));
+        sink.record(HOT, 401, t(60));
+        assert_eq!(health_of(&map, "prov-1").consecutive_auth_failures, 2);
+
+        // A 2xx folds as a success — no panic, and the streak resets.
+        sink.record(HOT, 200, t(120));
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.consecutive_auth_failures, 0);
+        assert_eq!(h.last_success_at, Some(t(120)));
+        assert_eq!(h.last_status, None);
+
+        // The boundaries of the success range, which must match
+        // `reqwest::StatusCode::is_success` — the same test both clients apply
+        // when deciding whether the call failed.
+        sink.record(HOT, 299, t(130));
+        assert_eq!(health_of(&map, "prov-1").last_success_at, Some(t(130)));
+        sink.record(HOT, 300, t(140));
+        assert_eq!(health_of(&map, "prov-1").last_status, Some(300));
+        sink.record(HOT, 199, t(150));
+        assert_eq!(health_of(&map, "prov-1").last_status, Some(199));
+    }
+
+    /// One entry per `payment_providers` row. A shared map with a mis-bound key
+    /// would blend two providers' streaks and alert on the wrong one.
+    #[test]
+    fn sinks_on_one_map_are_keyed_by_provider_id() {
+        let map: ProviderHealthMap = Default::default();
+        let a = sink_for(&map, "prov-a");
+        let b = sink_for(&map, "prov-b");
+
+        a.record(HOT, 401, t(0));
+        a.record(HOT, 401, t(300));
+        a.record(HOT, 401, t(700));
+        b.record(HOT, 200, t(700));
+
+        assert!(health_of(&map, "prov-a").is_alerting(t(700)));
+        assert!(!health_of(&map, "prov-b").is_alerting(t(700)));
+        assert_eq!(map.read().expect("not poisoned").len(), 2);
+        // A provider nothing has been observed for has no entry at all, which
+        // is how a consumer tells "never called" from "called and healthy".
+        assert!(!map.read().expect("not poisoned").contains_key("prov-c"));
+    }
+
+    /// **Map membership means "a status was observed", not "something was
+    /// learned about the key".** An inert status — a 5xx, a 429 — creates an
+    /// entry that reads as healthy with a non-2xx `last_status`, which is the
+    /// honest reading: the provider answered, and what it answered says nothing
+    /// about authentication either way.
+    ///
+    /// Pinned because a consumer will want to tell "never called" from "called
+    /// and fine", and this is the line it has to draw on. Reporting a provider
+    /// whose only traffic was a 502 as never-called would be false; reporting
+    /// its auth as failing would be worse.
+    #[test]
+    fn an_inert_status_still_creates_an_entry() {
+        let map: ProviderHealthMap = Default::default();
+        let sink = sink_for(&map, "prov-1");
+
+        assert!(!map.read().expect("not poisoned").contains_key("prov-1"));
+
+        sink.record(HOT, 502, t(0));
+
+        assert!(
+            map.read().expect("not poisoned").contains_key("prov-1"),
+            "a provider that answered 502 has been called"
+        );
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.last_status, Some(502));
+        assert_eq!(h.consecutive_auth_failures, 0);
+        assert_eq!(h.last_success_at, None);
+        assert!(!h.is_alerting(t(100_000)));
+    }
+
+    /// The read-modify-write must be one `write()`, never a read followed by a
+    /// write. Under a shared client — which is what an `Arc<dyn PaymentProvider>`
+    /// handed to concurrent requests is — the read-then-write shape drops
+    /// increments, and a dropped increment is a missed alert.
+    #[test]
+    fn concurrent_records_do_not_lose_increments() {
+        use std::thread;
+
+        let map: ProviderHealthMap = Default::default();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let sink = sink_for(&map, "prov-1");
+                thread::spawn(move || {
+                    for i in 0..100 {
+                        sink.record(HOT, 401, t(i));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker thread");
+        }
+
+        assert_eq!(health_of(&map, "prov-1").consecutive_auth_failures, 800);
     }
 
     #[test]

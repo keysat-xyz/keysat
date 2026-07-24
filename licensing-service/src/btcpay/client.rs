@@ -1,11 +1,13 @@
 //! Minimal BTCPay Greenfield API client — only the endpoints this service
 //! actually calls. Add more as needs grow.
 
+use crate::payment::health::ProviderHealthSink;
 use crate::payment::ProviderHttpError;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::SystemTime;
 
 /// Whether a failing BTCPay call reads the response body for its message.
 ///
@@ -28,6 +30,10 @@ pub struct BtcpayClient {
     base_url: String,
     api_key: String,
     store_id: String,
+    /// Where [`send`](Self::send) reports every observed HTTP status, so a
+    /// revoked or de-scoped API key surfaces as an operator alert. `None` for a
+    /// client built with no `payment_providers` row to attribute calls to.
+    health: Option<ProviderHealthSink>,
 }
 
 /// Response subset from `POST /api/v1/stores/{storeId}/invoices`.
@@ -67,7 +73,21 @@ impl BtcpayClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             store_id: store_id.to_string(),
+            health: None,
         }
+    }
+
+    /// Bind this client's calls to the shared auth-health map for one
+    /// `payment_providers` row.
+    ///
+    /// A builder rather than a `new()` parameter, deliberately: the provider id
+    /// is not known at every construction site (the connect flows build a
+    /// client before, or without, a row), and several test fixtures construct
+    /// clients that have nothing to report to. Making it a parameter would put
+    /// a `None` at all of those.
+    pub fn with_sink(mut self, sink: ProviderHealthSink) -> Self {
+        self.health = Some(sink);
+        self
     }
 
     /// The one place a `&self` BTCPay request is executed and a non-success
@@ -106,6 +126,17 @@ impl BtcpayClient {
         };
 
         let status = resp.status();
+
+        // Report the outcome the instant the status is known — before the
+        // success branch, and before any body read. Ordering is load-bearing:
+        // it keeps this identical to Zaprite's `send`, where a body read sits
+        // between the two and can fail with `?`, and it means a provider
+        // answering 401 with a truncated body still counts. See the wiring note
+        // on `ProviderAuthHealth`.
+        if let Some(sink) = &self.health {
+            sink.record(label, status.as_u16(), SystemTime::now());
+        }
+
         if status.is_success() {
             return Ok(resp);
         }
@@ -518,6 +549,7 @@ mod tests {
     //! `&self`, and were left untouched.
 
     use super::*;
+    use crate::payment::health::{ProviderAuthHealth, ProviderHealthMap};
     use axum::{http::StatusCode, Router};
     use tokio::net::TcpListener;
 
@@ -650,6 +682,112 @@ mod tests {
         assert_eq!(inv.id, "inv-1");
         assert_eq!(inv.checkout_link, "https://pay.test/i/inv-1");
         assert_eq!(inv.status, "New");
+    }
+
+    // -----------------------------------------------------------------
+    // Auth-health reporting. `send` is the only place a status is observed,
+    // so these drive a real client against a real (throwaway) server and
+    // read the shared map back out.
+    // -----------------------------------------------------------------
+
+    fn health_of(map: &ProviderHealthMap, id: &str) -> ProviderAuthHealth {
+        map.read().expect("not poisoned").get(id).cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_401_from_a_real_client_reaches_the_sink() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+        let client = BtcpayClient::new(&base, "tok", "store1")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        client
+            .create_invoice(1000, json!({}), None)
+            .await
+            .expect_err("non-2xx must error");
+
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.consecutive_auth_failures, 1);
+        assert_eq!(h.last_status, Some(401));
+        assert!(h.first_failure_at.is_some());
+    }
+
+    /// Every `&self` site reports, not just the one wired first. `get_invoice`
+    /// matters most here: it is the reconcile loop's call, so it is what a
+    /// background sweep would surface a revoked key through.
+    #[tokio::test]
+    async fn every_self_site_reports_to_the_sink() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let map: ProviderHealthMap = Default::default();
+        let client = BtcpayClient::new(&base, "tok", "store1")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        client.create_invoice(1000, json!({}), None).await.unwrap_err();
+        client.pay_lightning_invoice("lnbc1...").await.unwrap_err();
+        client.get_invoice("inv-1").await.unwrap_err();
+
+        assert_eq!(health_of(&map, "prov-1").consecutive_auth_failures, 3);
+    }
+
+    /// A 2xx records a success and clears a running streak — the recovery
+    /// transition the admin card renders.
+    #[tokio::test]
+    async fn a_2xx_records_a_success_and_clears_the_streak() {
+        let map: ProviderHealthMap = Default::default();
+
+        let bad = spawn_stub(StatusCode::UNAUTHORIZED, "revoked").await;
+        let failing = BtcpayClient::new(&bad, "tok", "store1")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+        failing.get_invoice("inv-1").await.unwrap_err();
+        failing.get_invoice("inv-1").await.unwrap_err();
+        assert_eq!(health_of(&map, "prov-1").consecutive_auth_failures, 2);
+
+        let good = spawn_stub(StatusCode::OK, r#"{"status":"Settled"}"#).await;
+        let ok = BtcpayClient::new(&good, "tok", "store1")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+        ok.get_invoice("inv-1").await.expect("2xx must succeed");
+
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.consecutive_auth_failures, 0);
+        assert!(h.last_success_at.is_some());
+    }
+
+    /// A 2xx whose body will not deserialize still records a **success**. The
+    /// recording point is the status, not the call's ultimate outcome — the
+    /// deliberate corollary of recording before the body read. A parse failure
+    /// says nothing about whether the API key works.
+    #[tokio::test]
+    async fn a_2xx_that_fails_to_parse_still_records_a_success() {
+        let base = spawn_stub(StatusCode::OK, "not json at all").await;
+        let map: ProviderHealthMap = Default::default();
+        let client = BtcpayClient::new(&base, "tok", "store1")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        let err = client
+            .create_invoice(1000, json!({}), None)
+            .await
+            .expect_err("unparseable body must error");
+        assert_eq!(err.to_string(), "parsing BTCPay create-invoice response");
+
+        let h = health_of(&map, "prov-1");
+        assert!(h.last_success_at.is_some());
+        assert_eq!(h.consecutive_auth_failures, 0);
+    }
+
+    /// An outcome that never reached a status records nothing at all — not a
+    /// failure, not a success. A provider being unreachable is not evidence
+    /// about its API key, in either direction, so the map stays empty rather
+    /// than gaining an inert entry.
+    #[tokio::test]
+    async fn a_transport_failure_records_nothing() {
+        let map: ProviderHealthMap = Default::default();
+        let client = BtcpayClient::new(REFUSED, "tok", "store1")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        client.create_invoice(1000, json!({}), None).await.unwrap_err();
+        client.get_invoice("inv-1").await.unwrap_err();
+
+        assert!(map.read().expect("not poisoned").is_empty());
     }
 
     /// The transport path is the other half of what `send` parameterized, and

@@ -128,6 +128,7 @@ async fn make_test_state_inner(sandbox_mode: bool) -> (AppState, NamedTempFile) 
             reason: "test fixture".into(),
         })),
         rates: keysat::rates::RateCache::new(),
+        provider_health: Default::default(),
     };
     (state, tmp)
 }
@@ -1062,6 +1063,260 @@ async fn public_purchase_error_body_does_not_leak_provider_error_internals() {
         !rendered.contains("provider call"),
         "ProviderHttpError's own wording must never reach an anonymous buyer: {rendered}"
     );
+}
+
+/// The provider auth-health sink, wired end to end through `AppState`.
+///
+/// The unit tests in `payment::tests` prove `build_provider` binds a sink; this
+/// proves the sink it binds is **`AppState`'s own map** and not a fresh one, by
+/// going in through the production resolver (`payment_provider_by_id` →
+/// `provider_from_row` → `build_provider`) and reading the field afterwards.
+/// A slip there would leave every recorded failure in a map nothing can see,
+/// and no unit test could tell the difference.
+#[tokio::test]
+async fn a_provider_resolved_through_app_state_reports_into_app_states_health_map() {
+    // A throwaway provider that answers 401 to everything — a revoked key.
+    let app = axum::Router::new()
+        .fallback(|| async { (StatusCode::UNAUTHORIZED, r#"{"message":"revoked"}"#) });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let (state, _tmp) = make_test_state().await;
+    let default_profile = repo::get_default_merchant_profile(&state.db)
+        .await
+        .expect("query default profile")
+        .expect("migration 0020 auto-creates a default merchant profile");
+    let provider_id = Uuid::new_v4().to_string();
+    repo::create_payment_provider(
+        &state.db,
+        &provider_id,
+        &default_profile.id,
+        "zaprite",
+        "Revoked Zaprite",
+        "dead-key",
+        &format!("http://{addr}"),
+        None,
+        None,
+        None,
+        &Utc::now().to_rfc3339(),
+    )
+    .await
+    .expect("seed payment provider");
+
+    assert!(
+        state.provider_health.read().expect("not poisoned").is_empty(),
+        "nothing observed yet"
+    );
+
+    // Three failures spread over more than the alert window would alert; here
+    // we only assert they were counted, since the clock is real.
+    let provider = state
+        .payment_provider_by_id(&provider_id)
+        .await
+        .expect("resolve provider");
+    provider
+        .create_invoice(CreateInvoiceParams {
+            amount: Money::sats(1_000),
+            redirect_url: "http://keysat.test/thank-you",
+            metadata: json!({}),
+            external_order_id: "inv-health-1",
+            buyer_email: None,
+            allow_save_payment_profile: None,
+        })
+        .await
+        .expect_err("a revoked key must fail the call");
+
+    let map = state.provider_health.read().expect("not poisoned");
+    let health = map
+        .get(&provider_id)
+        .expect("the failure must be filed under the provider's row id");
+    assert_eq!(health.consecutive_auth_failures, 1);
+    assert_eq!(health.last_status, Some(401));
+    assert!(health.first_failure_at.is_some());
+}
+
+/// **Attachment site 4**, driven through the real Connect handler.
+///
+/// Clicking Connect installs a provider into the legacy `state.payment`
+/// singleton, and seven call sites still read it — so that client needs a sink
+/// of its own. `build_provider` does not cover it: `zaprite_authorize` builds
+/// its own client. If the `.with_sink(..)` there were dropped, every call a
+/// freshly-connected operator made would be invisible to the alert rule until
+/// the next daemon restart, which is precisely the window an operator is most
+/// likely to have a bad key in.
+///
+/// The stub answers `GET /v1/orders` (the connect smoke test) with 200 and
+/// `POST /v1/orders` (create-order) with 401, so the connect succeeds and the
+/// first real call fails — a key that validates and is then revoked.
+#[tokio::test]
+async fn a_provider_installed_by_connect_reports_into_the_health_map() {
+    use axum::routing::get;
+
+    let app = axum::Router::new().route(
+        "/v1/orders",
+        get(|| async { (StatusCode::OK, "[]") })
+            .post(|| async { (StatusCode::UNAUTHORIZED, r#"{"message":"revoked"}"#) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let (state, _tmp) = make_test_state().await;
+    // Connect is gated on `zaprite_payments`; grant just that.
+    *state.self_tier.write().await = Tier::Licensed {
+        license_id: Uuid::new_v4(),
+        product_id: Uuid::new_v4(),
+        expires_at: 0,
+        entitlements: vec!["self_host".into(), "zaprite_payments".into()],
+    };
+
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "POST",
+        "/v1/admin/zaprite/connect",
+        &[("authorization", &auth)],
+        Some(json!({"api_key": "k", "base_url": format!("http://{addr}")})),
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let provider_id = body["provider_id"].as_str().expect("provider_id").to_string();
+
+    // The connect-time smoke test itself is deliberately unrecorded — there is
+    // no row for it to be attributed to at the moment it runs.
+    assert!(
+        state.provider_health.read().expect("not poisoned").is_empty(),
+        "the connect ping must not create an entry"
+    );
+
+    // Now the singleton the legacy call sites read.
+    let provider = state
+        .payment_provider()
+        .await
+        .expect("connect installs the singleton");
+    provider
+        .create_invoice(CreateInvoiceParams {
+            amount: Money::sats(1_000),
+            redirect_url: "http://keysat.test/thank-you",
+            metadata: json!({}),
+            external_order_id: "inv-connect-1",
+            buyer_email: None,
+            allow_save_payment_profile: None,
+        })
+        .await
+        .expect_err("a revoked key must fail the call");
+
+    let map = state.provider_health.read().expect("not poisoned");
+    let health = map
+        .get(&provider_id)
+        .expect("the connect-installed client must report under its own row id");
+    assert_eq!(health.consecutive_auth_failures, 1);
+    assert_eq!(health.last_status, Some(401));
+}
+
+/// **Attachment site 3**, driven through the real BTCPay authorize callback.
+///
+/// The twin of the Zaprite case above, and the one that matters most: BTCPay is
+/// the required dependency, so this is the client a typical operator actually
+/// sells through between connecting and their next restart. `finish_connect`
+/// builds its own `BtcpayClient` for the legacy singleton, which
+/// `build_provider` never sees.
+///
+/// The stub plays a BTCPay that authorizes fine (`list_stores`, `create_webhook`)
+/// and then 401s the first invoice — a key revoked right after connect.
+#[tokio::test]
+async fn a_btcpay_provider_installed_by_the_authorize_callback_reports_into_the_health_map() {
+    use axum::routing::{get, post};
+
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/stores",
+            get(|| async { (StatusCode::OK, r#"[{"id":"store-1","name":"Store One"}]"#) }),
+        )
+        .route(
+            "/api/v1/stores/store-1/webhooks",
+            post(|| async { (StatusCode::OK, r#"{"id":"wh-1","secret":"whsec"}"#) }),
+        )
+        .route(
+            "/api/v1/stores/store-1/invoices",
+            post(|| async { (StatusCode::UNAUTHORIZED, "revoked") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let (mut state, _tmp) = make_test_state().await;
+    // `finish_connect` talks to `config.btcpay_url`, not to anything in the
+    // request — point it at the stub.
+    let mut cfg = (*state.config).clone();
+    cfg.btcpay_url = format!("http://{addr}");
+    state.config = Arc::new(cfg);
+
+    let profile = repo::get_default_merchant_profile(&state.db)
+        .await
+        .expect("query default profile")
+        .expect("a default profile exists post-migration");
+    keysat::btcpay::config::record_authorize_state(
+        &state.db,
+        "tok-health",
+        Some(&profile.id),
+        false, // master initiator — skips the non-mainnet scoped gate
+        None,
+    )
+    .await
+    .expect("record authorize state");
+
+    let req = build_request(
+        "GET",
+        "/v1/btcpay/authorize/callback?state=tok-health&apiKey=fake-key",
+        &[],
+        None,
+    );
+    assert_eq!(send(&state, req).await.status(), StatusCode::OK);
+
+    let provider_id = repo::list_payment_providers_for_profile(&state.db, &profile.id)
+        .await
+        .expect("list providers")
+        .into_iter()
+        .find(|p| p.kind == "btcpay")
+        .expect("the callback persisted a btcpay row")
+        .id;
+
+    let provider = state
+        .payment_provider()
+        .await
+        .expect("the callback installs the singleton");
+    provider
+        .create_invoice(CreateInvoiceParams {
+            amount: Money::sats(1_000),
+            redirect_url: "http://keysat.test/thank-you",
+            metadata: json!({}),
+            external_order_id: "inv-btcpay-connect-1",
+            buyer_email: None,
+            allow_save_payment_profile: None,
+        })
+        .await
+        .expect_err("a revoked key must fail the call");
+
+    let map = state.provider_health.read().expect("not poisoned");
+    let health = map
+        .get(&provider_id)
+        .expect("the callback-installed client must report under its own row id");
+    assert_eq!(health.consecutive_auth_failures, 1);
+    assert_eq!(health.last_status, Some(401));
 }
 
 /// Anti-forgery (P0): a `settled` webhook whose provider API does NOT

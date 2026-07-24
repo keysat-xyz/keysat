@@ -125,6 +125,19 @@ pub struct AppState {
     /// src/rates.rs. Process-global so cached rates aren't refetched
     /// per-request.
     pub rates: Arc<crate::rates::RateCache>,
+    /// Per-provider API-authentication health, keyed by
+    /// `payment_providers.id`. Written by the provider HTTP clients (each is
+    /// bound to one entry at construction — see
+    /// `crate::payment::health::ProviderHealthSink`), so a revoked or de-scoped
+    /// key becomes visible before a buyer hits it rather than after.
+    ///
+    /// In-memory and process-lifetime: it empties on restart, and an entry can
+    /// outlive the row it names if the operator disconnects a provider —
+    /// **nothing prunes those today**. Pruning orphans on read is the contract
+    /// the health-summary endpoint is expected to honor when it lands; until
+    /// then a reader must not assume every key still names a live row. See
+    /// `crate::payment::health`.
+    pub provider_health: crate::payment::health::ProviderHealthMap,
 }
 
 impl AppState {
@@ -221,8 +234,12 @@ impl AppState {
         if let Some(p) = &self.provider_override {
             return Ok(p.clone());
         }
-        crate::payment::build_provider(row, self.config.btcpay_public_url.as_deref())
-            .map_err(AppError::Internal)
+        crate::payment::build_provider(
+            row,
+            self.config.btcpay_public_url.as_deref(),
+            &self.provider_health,
+        )
+        .map_err(AppError::Internal)
     }
 
     /// Resolve the merchant profile a product belongs to. Falls back to

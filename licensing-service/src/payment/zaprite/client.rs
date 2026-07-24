@@ -4,12 +4,13 @@
 //! Returns the raw JSON shapes for now — the `ZapriteProvider` impl
 //! turns them into the trait's typed enums.
 
+use crate::payment::health::ProviderHealthSink;
 use crate::payment::ProviderHttpError;
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::Value;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// How one Zaprite call reads the response body.
 ///
@@ -31,6 +32,12 @@ pub struct ZapriteClient {
     pub base_url: String,
     pub api_key: String,
     http: reqwest::Client,
+    /// Where [`send`](Self::send) reports every observed HTTP status, so a
+    /// revoked API key surfaces as an operator alert. `None` for a client built
+    /// with no `payment_providers` row to attribute calls to — which includes
+    /// the connect-time smoke test in `api::zaprite_authorize`, where the row
+    /// does not exist yet.
+    health: Option<ProviderHealthSink>,
 }
 
 /// Subset of `POST /v1/orders` request body — the fields Keysat
@@ -89,7 +96,16 @@ impl ZapriteClient {
             base_url,
             api_key: api_key.into(),
             http,
+            health: None,
         }
+    }
+
+    /// Bind this client's calls to the shared auth-health map for one
+    /// `payment_providers` row. See [`crate::btcpay::client::BtcpayClient::with_sink`]
+    /// for why this is a builder and not a `new()` parameter.
+    pub fn with_sink(mut self, sink: ProviderHealthSink) -> Self {
+        self.health = Some(sink);
+        self
     }
 
     fn auth_headers(&self) -> Result<HeaderMap> {
@@ -127,6 +143,17 @@ impl ZapriteClient {
     ) -> Result<String> {
         let resp = req.send().await.context(transport_ctx)?;
         let status = resp.status();
+
+        // Report the outcome the instant the status is known. This MUST stay
+        // above the body read: `BodyRead::Always` reads with `?`, so a 401 whose
+        // body cannot be read (truncated, chunked, connection dropped mid-body)
+        // returns that context and never reaches the `ProviderHttpError` below.
+        // Recording after the read would make a revoked key on a flaky link
+        // invisible to the alert rule entirely — see the wiring note on
+        // `ProviderAuthHealth` and risk 7 in the plan.
+        if let Some(sink) = &self.health {
+            sink.record(label, status.as_u16(), SystemTime::now());
+        }
 
         let raw = match body_read {
             BodyRead::Always(ctx) => resp.text().await.context(ctx)?,
@@ -317,6 +344,7 @@ mod tests {
     //! both halves of that.
 
     use super::*;
+    use crate::payment::health::{ProviderAuthHealth, ProviderHealthMap};
     use axum::{http::StatusCode, Router};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -618,6 +646,106 @@ mod tests {
                 "{expected}: a transport failure is not an HTTP-status failure"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Auth-health reporting.
+    // -----------------------------------------------------------------
+
+    fn health_of(map: &ProviderHealthMap, id: &str) -> ProviderAuthHealth {
+        map.read().expect("not poisoned").get(id).cloned().unwrap_or_default()
+    }
+
+    /// **The risk-7 proof, and the reason `send` records where it does.**
+    ///
+    /// Five of the six sites read the body with `?` *before* the status is
+    /// turned into an error, so a 401 whose body cannot be read produces no
+    /// `ProviderHttpError` at all — pinned as pre-existing by
+    /// `create_order_unreadable_body_keeps_its_own_context` above. If the sink
+    /// were fed from that error, or from anywhere below the body read, a
+    /// revoked key on a flaky link would silently never count and the alert
+    /// would never fire. Recording off the **status** is what closes it.
+    ///
+    /// Move the `sink.record(..)` call in `send` below the `let raw = ...`
+    /// block and this test fails while every message-shape test above still
+    /// passes — that gap is exactly what it exists to cover.
+    #[tokio::test]
+    async fn a_401_records_even_when_the_body_cannot_be_read() {
+        let base = spawn_truncated_body_401().await;
+        let map: ProviderHealthMap = Default::default();
+        let client =
+            ZapriteClient::new(&base, "k").with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        let err = client
+            .create_order(&order_body())
+            .await
+            .expect_err("unreadable body must error");
+
+        // The error is still the body-read context, not an HTTP-status error:
+        // this is the pre-existing behavior, deliberately unchanged.
+        assert_eq!(err.to_string(), "read create_order body");
+        assert!(err.downcast_ref::<ProviderHttpError>().is_none());
+
+        // ...and the 401 counted anyway.
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.consecutive_auth_failures, 1);
+        assert_eq!(h.last_status, Some(401));
+    }
+
+    #[tokio::test]
+    async fn a_401_from_a_real_client_reaches_the_sink() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "invalid token").await;
+        let map: ProviderHealthMap = Default::default();
+        let client =
+            ZapriteClient::new(&base, "k").with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        // Every site reports, including `ping` — whose label is the operator's
+        // Connect validation and is deliberately NOT a probe label, so its
+        // failures count like any other.
+        client.create_order(&order_body()).await.unwrap_err();
+        client.get_order("ord-1").await.unwrap_err();
+        client.charge_order_with_profile("ord-1", "pp-1").await.unwrap_err();
+        client.create_contact("buyer@example.test", None).await.unwrap_err();
+        client.get_contact("con-1").await.unwrap_err();
+        client.ping().await.unwrap_err();
+
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.consecutive_auth_failures, 6);
+        assert_eq!(h.last_status, Some(401));
+    }
+
+    /// A 2xx whose body will not deserialize still records a **success** — the
+    /// deliberate corollary of recording off the status rather than off the
+    /// call's outcome. A malformed response says nothing about the API key.
+    #[tokio::test]
+    async fn a_2xx_that_fails_to_parse_still_records_a_success() {
+        let base = spawn_stub(StatusCode::OK, "not json at all").await;
+        let map: ProviderHealthMap = Default::default();
+        let client =
+            ZapriteClient::new(&base, "k").with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        let err = client
+            .create_order(&order_body())
+            .await
+            .expect_err("unparseable body must error");
+        assert_eq!(err.to_string(), "parse create_order response");
+
+        let h = health_of(&map, "prov-1");
+        assert!(h.last_success_at.is_some());
+        assert_eq!(h.consecutive_auth_failures, 0);
+    }
+
+    /// An outcome with no HTTP status records nothing in either direction.
+    #[tokio::test]
+    async fn a_transport_failure_records_nothing() {
+        let map: ProviderHealthMap = Default::default();
+        let client = ZapriteClient::new("http://127.0.0.1:1", "k")
+            .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
+
+        client.create_order(&order_body()).await.unwrap_err();
+        client.ping().await.unwrap_err();
+
+        assert!(map.read().expect("not poisoned").is_empty());
     }
 
     /// A 2xx still flows through untouched: `ping` returns `Ok(())` without

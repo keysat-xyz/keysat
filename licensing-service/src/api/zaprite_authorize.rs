@@ -146,7 +146,29 @@ pub async fn connect(
     // without waiting for a daemon restart. Per-product resolution
     // doesn't use this singleton.
     if profile.is_default && existing.is_empty() {
-        let provider = ZapriteProvider::new(client);
+        // Bind the singleton's client to the health map. This is NOT covered by
+        // `build_provider`: the provider installed here serves the legacy
+        // `state.payment` call sites until the next restart, and without a sink
+        // every one of those calls would be invisible to the alert rule for the
+        // whole life of the process.
+        //
+        // Bound HERE rather than at the client's construction above, which is
+        // a judgement call and not a constraint: `provider_id` is a bare
+        // `Uuid::new_v4()` a few lines up and could be hoisted above the
+        // client, which would put the smoke-test `ping()` inside the sink too.
+        //
+        // The trade: binding late means a connect that fails validation leaves
+        // no entry keyed to a row that was never created. The cost is that a
+        // SUCCESSFUL connect no longer seeds `last_success_at` either, so a
+        // just-connected provider reads as never-called until it does real
+        // work. Worth revisiting once the health-summary endpoint exists and
+        // that reads as something concrete rather than a hypothetical.
+        let provider = ZapriteProvider::new(client.with_sink(
+            crate::payment::health::ProviderHealthSink::new(
+                state.provider_health.clone(),
+                provider_id.clone(),
+            ),
+        ));
         state.set_payment_provider(Arc::new(provider)).await;
     }
 

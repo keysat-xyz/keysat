@@ -57,6 +57,31 @@ async fn main() -> anyhow::Result<()> {
         keypair.public_key_pem.trim()
     );
 
+    // --- app state ---
+    //
+    // Built BEFORE the payment warm-up below, and the warm-up then runs
+    // *through* it. That ordering is load-bearing: the warmed-up provider is
+    // bound to the auth-health map at construction, and it has to be the same
+    // map the rest of the process reads, or the legacy `state.payment`
+    // singleton reports its failures into a map nobody can see.
+    //
+    // Nothing here is reachable from a test — the `src/main.rs` test binary
+    // runs zero tests — so that invariant cannot be asserted; it has to be
+    // made unrepresentable instead. Hence the warm-up below goes through
+    // `payment_provider_by_id`, whose map comes from `&self`, rather than
+    // calling `payment::build_provider` with a map this function chose. The
+    // `payment` singleton starts empty and is filled in afterwards.
+    let state = api::AppState {
+        db: pool,
+        keypair: Arc::new(keypair),
+        payment: Arc::new(tokio::sync::RwLock::new(None)),
+        provider_override: None,
+        config: Arc::new(cfg.clone()),
+        self_tier,
+        rates: keysat::rates::RateCache::new(),
+        provider_health: Default::default(),
+    };
+
     // --- payment provider boot-time warm-up ---
     //
     // With the multi-merchant-profile model (migration 0020+) we no longer
@@ -72,10 +97,15 @@ async fn main() -> anyhow::Result<()> {
     // code path that runs before the operator has linked a product to a
     // specific profile). Empty profile → empty singleton; the on-demand
     // resolution layer takes over from there.
-    let provider: Option<Arc<dyn payment::PaymentProvider>> = match keysat::db::repo::get_default_merchant_profile(&pool).await {
-        Ok(Some(profile)) => match keysat::db::repo::list_payment_providers_for_profile(&pool, &profile.id).await {
+    let provider: Option<Arc<dyn payment::PaymentProvider>> = match keysat::db::repo::get_default_merchant_profile(&state.db).await {
+        Ok(Some(profile)) => match keysat::db::repo::list_payment_providers_for_profile(&state.db, &profile.id).await {
             Ok(rows) => match rows.first() {
-                Some(row) => match payment::build_provider(row, cfg.btcpay_public_url.as_deref()) {
+                // Re-reads the row it already has (one indexed lookup, once, at
+                // boot) to buy the guarantee above: this accessor takes the
+                // health map from `&self`, so the boot provider and every
+                // later-resolved one write to the same place by construction.
+                // `tests/api.rs` covers that path; nothing can cover this one.
+                Some(row) => match state.payment_provider_by_id(&row.id).await {
                     Ok(p) => Some(p),
                     Err(e) => {
                         tracing::warn!(
@@ -104,10 +134,10 @@ async fn main() -> anyhow::Result<()> {
             // loaders so the daemon still boots cleanly during the upgrade
             // window — these run against btcpay_config / zaprite_config
             // until migration 0020 drops those tables.
-            load_btcpay_provider(&pool, &cfg)
+            load_btcpay_provider(&state.db, &cfg)
                 .await
                 .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>)
-                .or(load_zaprite_provider(&pool)
+                .or(load_zaprite_provider(&state.db)
                     .await
                     .map(|p| Arc::new(p) as Arc<dyn payment::PaymentProvider>))
         }
@@ -123,16 +153,9 @@ async fn main() -> anyhow::Result<()> {
              operator completes 'Connect BTCPay' or 'Connect Zaprite' in the admin UI"
         ),
     }
-
-    let state = api::AppState {
-        db: pool,
-        keypair: Arc::new(keypair),
-        payment: Arc::new(tokio::sync::RwLock::new(provider)),
-        provider_override: None,
-        config: Arc::new(cfg.clone()),
-        self_tier,
-        rates: keysat::rates::RateCache::new(),
-    };
+    if let Some(p) = provider {
+        state.set_payment_provider(p).await;
+    }
 
     // Spawn background loops before handing state to the router.
     reconcile::spawn(state.clone());
