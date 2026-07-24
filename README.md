@@ -138,13 +138,14 @@ Retrieve the admin API key via the **Show admin API key** action.
 
 ## Network Access and Interfaces
 
-Keysat exposes one logical port (8080 HTTP) split across two service
+Keysat exposes one logical port (8080 HTTP) split across three service
 interfaces for clarity:
 
 | Interface | Type | Path prefix | Purpose                                                                      |
 |-----------|------|-------------|------------------------------------------------------------------------------|
 | `api`     | api  | `/`         | Public REST API for buyers (purchase, redeem) and licensed apps (validate, machine activation). Bake the URL into your software builds as the licensing endpoint. |
 | `webhook` | api  | `/btcpay`   | BTCPay webhook landing endpoint. Registered automatically when you connect BTCPay in the admin web UI; not for human use. |
+| `admin-ui`| ui   | `/admin`    | Embedded admin web UI (products, policies, codes, licenses, machines, webhooks, audit log); login is gated by the admin API key. StartOS surfaces a **Launch UI** button for it. Recommended: restrict this interface to LAN or Tor only, since the public clearnet does not need to reach it. |
 
 StartOS terminates TLS at the platform edge. Inside the container every
 request arrives as plain HTTP. For browser-facing URLs (e.g., the public
@@ -192,7 +193,7 @@ port. The daemon exposes `GET /healthz` for richer external monitoring.
 
 | Dependency  | Version range | Required | Purpose                                                       |
 |-------------|---------------|----------|---------------------------------------------------------------|
-| `btcpayserver` | `>=1.11.0` | Yes      | Required to receive Bitcoin payments and confirm settlement.  |
+| `btcpayserver` | `>=1.11.0:0` | Yes      | Required to receive Bitcoin payments and confirm settlement.  |
 
 The dependency is `kind: 'running'`, so Keysat will not start until
 BTCPay is running. The `btcpayserver.startos` hostname is provided to
@@ -255,10 +256,16 @@ network:
       protocol: http
       pathPrefix: /btcpay
       audience: btcpay
+    - id: admin-ui
+      type: ui
+      port: 8080
+      protocol: http
+      pathPrefix: /admin
+      audience: operator
 dependencies:
   btcpayserver:
     required: true
-    versionRange: ">=1.11.0"
+    versionRange: ">=1.11.0:0"
     kind: running
 healthChecks:
   - id: api
