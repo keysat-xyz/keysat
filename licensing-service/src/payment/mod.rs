@@ -467,7 +467,7 @@ mod tests {
         provider.get_invoice_status("inv-1").await.unwrap_err();
 
         let h = health_of(&map, "prov-btc");
-        assert_eq!(h.consecutive_auth_failures, 2);
+        assert_eq!(h.auth_dead.consecutive, 2);
         assert_eq!(h.last_status, Some(401));
         assert_eq!(map.read().expect("not poisoned").len(), 1);
     }
@@ -486,7 +486,7 @@ mod tests {
             .unwrap_err();
 
         let h = health_of(&map, "prov-zap");
-        assert_eq!(h.consecutive_auth_failures, 1);
+        assert_eq!(h.auth_dead.consecutive, 1);
         assert_eq!(h.last_status, Some(401));
     }
 
@@ -513,8 +513,8 @@ mod tests {
             .await
             .expect("2xx must succeed");
 
-        assert_eq!(health_of(&map, "prov-a").consecutive_auth_failures, 1);
-        assert_eq!(health_of(&map, "prov-b").consecutive_auth_failures, 0);
+        assert_eq!(health_of(&map, "prov-a").auth_dead.consecutive, 1);
+        assert_eq!(health_of(&map, "prov-b").auth_dead.consecutive, 0);
         assert!(health_of(&map, "prov-b").last_success_at.is_some());
     }
 
@@ -549,7 +549,7 @@ mod tests {
 
         let h = health_of(&map, "prov-zap");
         assert_eq!(
-            h.consecutive_auth_failures, 3,
+            h.auth_dead.consecutive, 3,
             "every call reached past the trait must still reach the sink"
         );
     }
@@ -576,7 +576,7 @@ mod tests {
 
         cloned.get_invoice("inv-1").await.unwrap_err();
 
-        assert_eq!(health_of(&map, "prov-btc").consecutive_auth_failures, 1);
+        assert_eq!(health_of(&map, "prov-btc").auth_dead.consecutive, 1);
     }
 
     /// The inert-status rule, end to end through a real client rather than at
@@ -610,7 +610,7 @@ mod tests {
             .unwrap_err();
 
         let h = health_of(&map, "prov-1");
-        assert_eq!(h.consecutive_auth_failures, 2, "a 502 must not reset");
+        assert_eq!(h.auth_dead.consecutive, 2, "a 502 must not reset");
         assert_eq!(h.last_status, Some(502));
         assert_eq!(h.last_success_at, None, "and must not count as a success");
     }

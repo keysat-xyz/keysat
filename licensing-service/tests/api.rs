@@ -1135,9 +1135,9 @@ async fn a_provider_resolved_through_app_state_reports_into_app_states_health_ma
     let health = map
         .get(&provider_id)
         .expect("the failure must be filed under the provider's row id");
-    assert_eq!(health.consecutive_auth_failures, 1);
+    assert_eq!(health.auth_dead.consecutive, 1);
     assert_eq!(health.last_status, Some(401));
-    assert!(health.first_failure_at.is_some());
+    assert!(health.auth_dead.first_failure_at.is_some());
 }
 
 /// **Attachment site 4**, driven through the real Connect handler.
@@ -1219,7 +1219,7 @@ async fn a_provider_installed_by_connect_reports_into_the_health_map() {
     let health = map
         .get(&provider_id)
         .expect("the connect-installed client must report under its own row id");
-    assert_eq!(health.consecutive_auth_failures, 1);
+    assert_eq!(health.auth_dead.consecutive, 1);
     assert_eq!(health.last_status, Some(401));
 }
 
@@ -1315,7 +1315,7 @@ async fn a_btcpay_provider_installed_by_the_authorize_callback_reports_into_the_
     let health = map
         .get(&provider_id)
         .expect("the callback-installed client must report under its own row id");
-    assert_eq!(health.consecutive_auth_failures, 1);
+    assert_eq!(health.auth_dead.consecutive, 1);
     assert_eq!(health.last_status, Some(401));
 }
 

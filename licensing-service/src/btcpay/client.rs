@@ -707,9 +707,9 @@ mod tests {
             .expect_err("non-2xx must error");
 
         let h = health_of(&map, "prov-1");
-        assert_eq!(h.consecutive_auth_failures, 1);
+        assert_eq!(h.auth_dead.consecutive, 1);
         assert_eq!(h.last_status, Some(401));
-        assert!(h.first_failure_at.is_some());
+        assert!(h.auth_dead.first_failure_at.is_some());
     }
 
     /// Every `&self` site reports, not just the one wired first. `get_invoice`
@@ -726,7 +726,7 @@ mod tests {
         client.pay_lightning_invoice("lnbc1...").await.unwrap_err();
         client.get_invoice("inv-1").await.unwrap_err();
 
-        assert_eq!(health_of(&map, "prov-1").consecutive_auth_failures, 3);
+        assert_eq!(health_of(&map, "prov-1").auth_dead.consecutive, 3);
     }
 
     /// A 2xx records a success and clears a running streak — the recovery
@@ -740,7 +740,7 @@ mod tests {
             .with_sink(ProviderHealthSink::new(map.clone(), "prov-1"));
         failing.get_invoice("inv-1").await.unwrap_err();
         failing.get_invoice("inv-1").await.unwrap_err();
-        assert_eq!(health_of(&map, "prov-1").consecutive_auth_failures, 2);
+        assert_eq!(health_of(&map, "prov-1").auth_dead.consecutive, 2);
 
         let good = spawn_stub(StatusCode::OK, r#"{"status":"Settled"}"#).await;
         let ok = BtcpayClient::new(&good, "tok", "store1")
@@ -748,7 +748,7 @@ mod tests {
         ok.get_invoice("inv-1").await.expect("2xx must succeed");
 
         let h = health_of(&map, "prov-1");
-        assert_eq!(h.consecutive_auth_failures, 0);
+        assert_eq!(h.auth_dead.consecutive, 0);
         assert!(h.last_success_at.is_some());
     }
 
@@ -771,7 +771,7 @@ mod tests {
 
         let h = health_of(&map, "prov-1");
         assert!(h.last_success_at.is_some());
-        assert_eq!(h.consecutive_auth_failures, 0);
+        assert_eq!(h.auth_dead.consecutive, 0);
     }
 
     /// An outcome that never reached a status records nothing at all — not a

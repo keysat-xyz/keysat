@@ -688,7 +688,7 @@ mod tests {
 
         // ...and the 401 counted anyway.
         let h = health_of(&map, "prov-1");
-        assert_eq!(h.consecutive_auth_failures, 1);
+        assert_eq!(h.auth_dead.consecutive, 1);
         assert_eq!(h.last_status, Some(401));
     }
 
@@ -710,7 +710,7 @@ mod tests {
         client.ping().await.unwrap_err();
 
         let h = health_of(&map, "prov-1");
-        assert_eq!(h.consecutive_auth_failures, 6);
+        assert_eq!(h.auth_dead.consecutive, 6);
         assert_eq!(h.last_status, Some(401));
     }
 
@@ -732,7 +732,7 @@ mod tests {
 
         let h = health_of(&map, "prov-1");
         assert!(h.last_success_at.is_some());
-        assert_eq!(h.consecutive_auth_failures, 0);
+        assert_eq!(h.auth_dead.consecutive, 0);
     }
 
     /// An outcome with no HTTP status records nothing in either direction.
