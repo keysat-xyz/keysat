@@ -40,6 +40,10 @@ use std::any::Any;
 use thiserror::Error;
 
 pub mod btcpay;
+/// Per-provider auth-health tracking — the rule that turns observed call
+/// outcomes into an operator alert. Kept out of this module deliberately; see
+/// `health::ProviderAuthHealth` for why.
+pub mod health;
 pub mod zaprite;
 
 /// A provider API call that reached the provider and came back with a
