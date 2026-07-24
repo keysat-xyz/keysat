@@ -37,9 +37,44 @@ use anyhow::Result;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use thiserror::Error;
 
 pub mod btcpay;
 pub mod zaprite;
+
+/// A provider API call that reached the provider and came back with a
+/// non-success HTTP status.
+///
+/// Both provider clients (`crate::btcpay::client::BtcpayClient` and
+/// `crate::payment::zaprite::client::ZapriteClient`) return this as a **bare**
+/// `anyhow::Error::new(..)` — never under a `.context(..)`.
+///
+/// That is deliberate and load-bearing. The call site's operator-facing text
+/// is carried in the `message` **field**, so both `{e}` and `{e:#}` render
+/// exactly what they rendered before the clients were collapsed onto a single
+/// `send()`, while `err.downcast_ref::<ProviderHttpError>()` still recovers
+/// the status. Attaching the text as context instead would add a chained
+/// suffix under `{e:#}`, and `api/purchase.rs:595` feeds that straight into
+/// `AppError::Upstream`, whose payload is returned verbatim (`error.rs`
+/// redacts only `Database | Internal`) in the body of the **unauthenticated**
+/// `POST /v1/purchase`. So context-wrapping here would silently change a
+/// public route's response. `tests/api.rs` pins that body.
+///
+/// `label` names the specific call (`"btcpay.create_invoice"`,
+/// `"zaprite.ping"`, …), not just the provider. The provider-failure alert
+/// rule has to tell a hot-path 403 (the operator cannot sell) from a
+/// liveness-probe 403 (the probe touches a broader permission than the hot
+/// path, so a key that sells fine can 403 there forever), and the label is
+/// what carries that distinction to whatever consumes this error.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct ProviderHttpError {
+    pub status: u16,
+    pub label: &'static str,
+    /// The call site's own wording, verbatim. A field rather than a
+    /// `.context(..)` — see above.
+    pub message: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -4,11 +4,27 @@
 //! Returns the raw JSON shapes for now — the `ZapriteProvider` impl
 //! turns them into the trait's typed enums.
 
+use crate::payment::ProviderHttpError;
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
+
+/// How one Zaprite call reads the response body.
+///
+/// The six call sites do not agree, and the disagreement is observable in the
+/// error a caller gets back, so [`ZapriteClient::send`] reproduces each site's
+/// behavior instead of picking one.
+enum BodyRead {
+    /// `resp.text().await.context(<ctx>)?` on **both** paths — the site needs
+    /// the body to parse its success response, so a body-read failure surfaces
+    /// as that context and never as a [`ProviderHttpError`].
+    Always(&'static str),
+    /// Failure path only, `unwrap_or_default()`. The success path never
+    /// touches the body. Only `ping` works this way.
+    LossyOnError,
+}
 
 #[derive(Debug, Clone)]
 pub struct ZapriteClient {
@@ -87,26 +103,61 @@ impl ZapriteClient {
         Ok(h)
     }
 
+    /// The one place a Zaprite request is executed and a non-success status is
+    /// turned into an error. Every non-2xx from this client leaves through
+    /// here **as** a [`ProviderHttpError`] — not merely carrying one as a
+    /// source — which is what the failure-alert tracker keys on.
+    ///
+    /// The six call sites differ in wording, in the context they put on a
+    /// transport failure, and in how they read the body — all of it visible to
+    /// operators in the logs — so `send` takes those as parameters rather than
+    /// imposing one shape. Returns the body text, empty when the site's
+    /// [`BodyRead`] policy did not read it.
+    ///
+    /// `message` becomes the error's `message` **field**, not a `.context(..)`
+    /// wrapper, so `{e:#}` stays byte-identical to the pre-collapse text; see
+    /// [`ProviderHttpError`] for why a public route depends on that.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        label: &'static str,
+        transport_ctx: &'static str,
+        body_read: BodyRead,
+        message: impl FnOnce(reqwest::StatusCode, &str) -> String,
+    ) -> Result<String> {
+        let resp = req.send().await.context(transport_ctx)?;
+        let status = resp.status();
+
+        let raw = match body_read {
+            BodyRead::Always(ctx) => resp.text().await.context(ctx)?,
+            BodyRead::LossyOnError if status.is_success() => String::new(),
+            BodyRead::LossyOnError => resp.text().await.unwrap_or_default(),
+        };
+
+        if status.is_success() {
+            return Ok(raw);
+        }
+        Err(anyhow::Error::new(ProviderHttpError {
+            status: status.as_u16(),
+            label,
+            message: message(status, &raw),
+        }))
+    }
+
     /// `POST /v1/orders` — create an order. Returns the full order
     /// JSON so the caller can pull whichever fields it needs
     /// (`id`, `checkoutUrl`, `status`, etc.).
     pub async fn create_order(&self, body: &CreateOrderBody<'_>) -> Result<Value> {
         let url = format!("{}/v1/orders", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.auth_headers()?)
-            .json(body)
-            .send()
-            .await
-            .context("Zaprite create_order request")?;
-        let status = resp.status();
-        let raw = resp.text().await.context("read create_order body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Zaprite create_order returned HTTP {status}: {raw}"
-            ));
-        }
+        let raw = self
+            .send(
+                self.http.post(&url).headers(self.auth_headers()?).json(body),
+                "zaprite.create_order",
+                "Zaprite create_order request",
+                BodyRead::Always("read create_order body"),
+                |status, raw| format!("Zaprite create_order returned HTTP {status}: {raw}"),
+            )
+            .await?;
         serde_json::from_str(&raw).context("parse create_order response")
     }
 
@@ -116,20 +167,17 @@ impl ZapriteClient {
     pub async fn get_order(&self, order_id: &str) -> Result<Value> {
         let encoded = urlencoding::encode(order_id);
         let url = format!("{}/v1/orders/{encoded}", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .context("Zaprite get_order request")?;
-        let status = resp.status();
-        let raw = resp.text().await.context("read get_order body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Zaprite get_order({order_id}) returned HTTP {status}: {raw}"
-            ));
-        }
+        let raw = self
+            .send(
+                self.http.get(&url).headers(self.auth_headers()?),
+                "zaprite.get_order",
+                "Zaprite get_order request",
+                BodyRead::Always("read get_order body"),
+                |status, raw| {
+                    format!("Zaprite get_order({order_id}) returned HTTP {status}: {raw}")
+                },
+            )
+            .await?;
         serde_json::from_str(&raw).context("parse get_order response")
     }
 
@@ -148,21 +196,20 @@ impl ZapriteClient {
             "orderId": order_id,
             "paymentProfileId": payment_profile_id,
         });
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.auth_headers()?)
-            .json(&body)
-            .send()
-            .await
-            .context("Zaprite charge_order_with_profile request")?;
-        let status = resp.status();
-        let raw = resp.text().await.context("read charge body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Zaprite charge_order_with_profile returned HTTP {status}: {raw}"
-            ));
-        }
+        let raw = self
+            .send(
+                self.http
+                    .post(&url)
+                    .headers(self.auth_headers()?)
+                    .json(&body),
+                "zaprite.charge_order_with_profile",
+                "Zaprite charge_order_with_profile request",
+                BodyRead::Always("read charge body"),
+                |status, raw| {
+                    format!("Zaprite charge_order_with_profile returned HTTP {status}: {raw}")
+                },
+            )
+            .await?;
         serde_json::from_str(&raw).context("parse charge response")
     }
 
@@ -198,21 +245,18 @@ impl ZapriteClient {
             "email": email,
             "legalName": legal_name,
         });
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.auth_headers()?)
-            .json(&body)
-            .send()
-            .await
-            .context("Zaprite create_contact request")?;
-        let status = resp.status();
-        let raw = resp.text().await.context("read create_contact body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Zaprite create_contact returned HTTP {status}: {raw}"
-            ));
-        }
+        let raw = self
+            .send(
+                self.http
+                    .post(&url)
+                    .headers(self.auth_headers()?)
+                    .json(&body),
+                "zaprite.create_contact",
+                "Zaprite create_contact request",
+                BodyRead::Always("read create_contact body"),
+                |status, raw| format!("Zaprite create_contact returned HTTP {status}: {raw}"),
+            )
+            .await?;
         serde_json::from_str(&raw).context("parse create_contact response")
     }
 
@@ -227,20 +271,17 @@ impl ZapriteClient {
     pub async fn get_contact(&self, contact_id: &str) -> Result<Value> {
         let encoded = urlencoding::encode(contact_id);
         let url = format!("{}/v1/contacts/{encoded}", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .context("Zaprite get_contact request")?;
-        let status = resp.status();
-        let raw = resp.text().await.context("read get_contact body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Zaprite get_contact({contact_id}) returned HTTP {status}: {raw}"
-            ));
-        }
+        let raw = self
+            .send(
+                self.http.get(&url).headers(self.auth_headers()?),
+                "zaprite.get_contact",
+                "Zaprite get_contact request",
+                BodyRead::Always("read get_contact body"),
+                |status, raw| {
+                    format!("Zaprite get_contact({contact_id}) returned HTTP {status}: {raw}")
+                },
+            )
+            .await?;
         serde_json::from_str(&raw).context("parse get_contact response")
     }
 
@@ -249,20 +290,349 @@ impl ZapriteClient {
     /// API key works against the right org.
     pub async fn ping(&self) -> Result<()> {
         let url = format!("{}/v1/orders?limit=1", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .context("Zaprite ping request")?;
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
+        self.send(
+            self.http.get(&url).headers(self.auth_headers()?),
+            "zaprite.ping",
+            "Zaprite ping request",
+            // The only site that does not read the body on success, and reads
+            // it lossily on failure.
+            BodyRead::LossyOnError,
+            |status, body| format!("Zaprite ping returned HTTP {status}: {body}"),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pins the six sites that were collapsed onto [`ZapriteClient::send`]:
+    //! each must still render exactly the text it rendered before the
+    //! collapse, and must now carry a [`ProviderHttpError`] with the right
+    //! status and label.
+    //!
+    //! The behavior change actually hiding in this collapse is the body read:
+    //! five sites read the body with `.context(..)?` on both paths, `ping`
+    //! reads it lossily on the failure path only. `create_order_*` below pins
+    //! both halves of that.
+
+    use super::*;
+    use axum::{http::StatusCode, Router};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Throwaway HTTP server on an ephemeral port that answers every method
+    /// and path with one fixed status + body. Same shape as `tests/worker.rs`'s
+    /// `spawn_500_receiver`, the established local-stub pattern in this repo.
+    /// Duplicated in `btcpay::client`'s test module rather than shared, so the
+    /// refactor does not add a module outside its blast radius.
+    async fn spawn_stub(status: StatusCode, body: &'static str) -> String {
+        let app = Router::new().fallback(move || async move { (status, body) });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A raw TCP stub that promises more body bytes in `Content-Length` than
+    /// it writes, then closes. `reqwest` parses the 401 status line fine and
+    /// then fails **while reading the body** — the one case where
+    /// `BodyRead::Always` has to surface its own `.context(..)` rather than a
+    /// `ProviderHttpError`, exactly as the pre-refactor code did.
+    async fn spawn_truncated_body_401() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read the request head so the client has begun writing
+                    // before we reply; the content is irrelevant.
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 64\r\n\r\nshort",
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                    // Drain whatever is still in flight before dropping. A
+                    // request split across two TCP segments would otherwise
+                    // leave unread bytes queued, and closing on those makes
+                    // the OS send RST instead of FIN — which can discard the
+                    // response we just wrote and turn this into a transport
+                    // error rather than the body-read error under test.
+                    while matches!(sock.read(&mut buf).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn order_body() -> CreateOrderBody<'static> {
+        CreateOrderBody {
+            amount: 1000,
+            currency: "USD",
+            external_uniq_id: "inv-1",
+            redirect_url: "https://example.test/thanks",
+            label: None,
+            metadata: None,
+            customer_data: None,
+            allow_save_payment_profile: None,
+            contact_id: None,
         }
-        let body = resp.text().await.unwrap_or_default();
-        Err(anyhow!(
-            "Zaprite ping returned HTTP {status}: {body}"
-        ))
+    }
+
+    #[tokio::test]
+    async fn create_order_non_success_keeps_message_and_carries_typed_error() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, r#"{"error":"bad key"}"#).await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .create_order(&order_body())
+            .await
+            .expect_err("non-2xx must error");
+
+        assert_eq!(
+            err.to_string(),
+            r#"Zaprite create_order returned HTTP 401 Unauthorized: {"error":"bad key"}"#
+        );
+        // The alternate form must be byte-identical too, not just `{e}`.
+        // `api/purchase.rs:595` feeds `{e:#}` into `AppError::Upstream`, which
+        // is returned verbatim in the body of the UNAUTHENTICATED
+        // `POST /v1/purchase` — so a chained suffix here would change a public
+        // route's response. Carrying the text as a field, not a context, is
+        // what keeps these two equal.
+        assert_eq!(
+            format!("{err:#}"),
+            r#"Zaprite create_order returned HTTP 401 Unauthorized: {"error":"bad key"}"#
+        );
+
+        let typed = err
+            .downcast_ref::<ProviderHttpError>()
+            .expect("must be a ProviderHttpError");
+        assert_eq!(typed.status, 401);
+        assert_eq!(typed.label, "zaprite.create_order");
+    }
+
+    /// An empty error body still renders the pre-refactor shape — trailing
+    /// separator and all — and still carries the typed error.
+    #[tokio::test]
+    async fn create_order_empty_body_keeps_the_pre_refactor_shape() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "").await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .create_order(&order_body())
+            .await
+            .expect_err("non-2xx must error");
+
+        assert_eq!(
+            err.to_string(),
+            "Zaprite create_order returned HTTP 401 Unauthorized: "
+        );
+        assert_eq!(
+            err.downcast_ref::<ProviderHttpError>()
+                .expect("must be a ProviderHttpError")
+                .status,
+            401
+        );
+    }
+
+    /// The one real behavior change hiding in the collapse: a non-2xx whose
+    /// body cannot be read must still fail with `read create_order body`, NOT
+    /// with the HTTP message. Pre-refactor the body read came first and used
+    /// `?`, so it won — and it still must.
+    #[tokio::test]
+    async fn create_order_unreadable_body_keeps_its_own_context() {
+        let base = spawn_truncated_body_401().await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .create_order(&order_body())
+            .await
+            .expect_err("unreadable body must error");
+
+        assert_eq!(err.to_string(), "read create_order body");
+        assert!(
+            err.downcast_ref::<ProviderHttpError>().is_none(),
+            "a body-read failure is not an HTTP-status failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_order_non_success_interpolates_the_order_id() {
+        let base = spawn_stub(StatusCode::FORBIDDEN, "denied").await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .get_order("ord 123")
+            .await
+            .expect_err("non-2xx must error");
+
+        // The raw (un-percent-encoded) id is what the message has always used,
+        // even though the URL encodes it.
+        assert_eq!(
+            err.to_string(),
+            "Zaprite get_order(ord 123) returned HTTP 403 Forbidden: denied"
+        );
+
+        let typed = err
+            .downcast_ref::<ProviderHttpError>()
+            .expect("must be a ProviderHttpError");
+        assert_eq!(typed.status, 403);
+        assert_eq!(typed.label, "zaprite.get_order");
+    }
+
+    #[tokio::test]
+    async fn charge_order_with_profile_non_success_keeps_message_and_carries_typed_error() {
+        let base = spawn_stub(StatusCode::PAYMENT_REQUIRED, "card declined").await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .charge_order_with_profile("ord-1", "pp-1")
+            .await
+            .expect_err("non-2xx must error");
+
+        assert_eq!(
+            err.to_string(),
+            "Zaprite charge_order_with_profile returned HTTP 402 Payment Required: card declined"
+        );
+
+        let typed = err
+            .downcast_ref::<ProviderHttpError>()
+            .expect("must be a ProviderHttpError");
+        assert_eq!(typed.status, 402);
+        assert_eq!(typed.label, "zaprite.charge_order_with_profile");
+    }
+
+    #[tokio::test]
+    async fn create_contact_non_success_keeps_message_and_carries_typed_error() {
+        let base = spawn_stub(StatusCode::BAD_REQUEST, "email required").await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .create_contact("buyer@example.test", None)
+            .await
+            .expect_err("non-2xx must error");
+
+        assert_eq!(
+            err.to_string(),
+            "Zaprite create_contact returned HTTP 400 Bad Request: email required"
+        );
+
+        let typed = err
+            .downcast_ref::<ProviderHttpError>()
+            .expect("must be a ProviderHttpError");
+        assert_eq!(typed.status, 400);
+        assert_eq!(typed.label, "zaprite.create_contact");
+    }
+
+    #[tokio::test]
+    async fn get_contact_non_success_interpolates_the_contact_id() {
+        let base = spawn_stub(StatusCode::NOT_FOUND, "gone").await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client
+            .get_contact("con-1")
+            .await
+            .expect_err("non-2xx must error");
+
+        assert_eq!(
+            err.to_string(),
+            "Zaprite get_contact(con-1) returned HTTP 404 Not Found: gone"
+        );
+
+        let typed = err
+            .downcast_ref::<ProviderHttpError>()
+            .expect("must be a ProviderHttpError");
+        assert_eq!(typed.status, 404);
+        assert_eq!(typed.label, "zaprite.get_contact");
+    }
+
+    #[tokio::test]
+    async fn ping_non_success_keeps_message_and_carries_typed_error() {
+        let base = spawn_stub(StatusCode::UNAUTHORIZED, "invalid token").await;
+        let client = ZapriteClient::new(&base, "k");
+
+        let err = client.ping().await.expect_err("non-2xx must error");
+
+        assert_eq!(
+            err.to_string(),
+            "Zaprite ping returned HTTP 401 Unauthorized: invalid token"
+        );
+
+        let typed = err
+            .downcast_ref::<ProviderHttpError>()
+            .expect("must be a ProviderHttpError");
+        assert_eq!(typed.status, 401);
+        assert_eq!(typed.label, "zaprite.ping");
+    }
+
+    /// The transport path is the other half of what `send` parameterized, and
+    /// nothing else pins it: all six sites layer their own `.context(..)` on a
+    /// connect/timeout failure, and none of them may produce a
+    /// `ProviderHttpError` — there is no status to carry.
+    #[tokio::test]
+    async fn transport_failures_keep_their_per_site_context() {
+        // Nothing listens on port 1 (binding it needs root), so every call
+        // below fails before any HTTP status exists.
+        let client = ZapriteClient::new("http://127.0.0.1:1", "k");
+
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (
+                client.create_order(&order_body()).await.unwrap_err(),
+                "Zaprite create_order request",
+            ),
+            (
+                client.get_order("ord-1").await.unwrap_err(),
+                "Zaprite get_order request",
+            ),
+            (
+                client
+                    .charge_order_with_profile("ord-1", "pp-1")
+                    .await
+                    .unwrap_err(),
+                "Zaprite charge_order_with_profile request",
+            ),
+            (
+                client
+                    .create_contact("buyer@example.test", None)
+                    .await
+                    .unwrap_err(),
+                "Zaprite create_contact request",
+            ),
+            (
+                client.get_contact("con-1").await.unwrap_err(),
+                "Zaprite get_contact request",
+            ),
+            (client.ping().await.unwrap_err(), "Zaprite ping request"),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+            assert!(
+                err.downcast_ref::<ProviderHttpError>().is_none(),
+                "{expected}: a transport failure is not an HTTP-status failure"
+            );
+        }
+    }
+
+    /// A 2xx still flows through untouched: `ping` returns `Ok(())` without
+    /// reading the body, and `create_order` still parses the body it read.
+    #[tokio::test]
+    async fn success_paths_are_unchanged() {
+        let base = spawn_stub(StatusCode::OK, r#"{"id":"ord-1","checkoutUrl":"https://x/y"}"#).await;
+        let client = ZapriteClient::new(&base, "k");
+
+        client.ping().await.expect("2xx ping must succeed");
+
+        let order = client
+            .create_order(&order_body())
+            .await
+            .expect("2xx create_order must succeed");
+        assert_eq!(order["id"], "ord-1");
     }
 }

@@ -21,6 +21,7 @@ use keysat::config::Config;
 use keysat::crypto::{self, LicensePayload};
 use keysat::db::repo;
 use keysat::license_self::Tier;
+use keysat::payment::zaprite::{ZapriteClient, ZapriteProvider};
 use keysat::payment::{
     CreateInvoiceParams, CreatedInvoiceHandle, Money, PaymentProvider, ProviderInvoiceSnapshot,
     ProviderInvoiceStatus, ProviderKind, ProviderWebhookEvent,
@@ -712,6 +713,7 @@ impl MockPaymentProvider {
             settled_amount: Some(amount),
         }
     }
+
 }
 
 #[async_trait::async_trait]
@@ -987,6 +989,79 @@ async fn paid_purchase_creates_invoice_via_provider() {
         .await
         .unwrap();
     assert_eq!(licenses, 0);
+}
+
+/// `POST /v1/purchase` is **unauthenticated** (`api/mod.rs`: no auth layer,
+/// only session_to_bearer / CORS / security_headers), and `purchase.rs` puts
+/// `{e:#}` of the provider error into `AppError::Upstream`, whose payload
+/// `error.rs` returns **verbatim** — it redacts only `Database | Internal`.
+///
+/// So the alternate-format rendering of a provider client error is part of a
+/// public route's response contract. This pins that body byte-for-byte. It is
+/// the guard for the `ProviderHttpError` design decision: the call site's text
+/// is a *field*, not a `.context(..)`, because context-wrapping would append
+/// "provider call <label> failed with HTTP <status>" to what an anonymous
+/// buyer sees. Nothing else in the suite asserts this body.
+#[tokio::test]
+async fn public_purchase_error_body_does_not_leak_provider_error_internals() {
+    // A throwaway Zaprite that answers 401. Nothing about the error is
+    // hand-built: a real ZapriteProvider wrapping a real ZapriteClient talks to
+    // it, so the whole message — the client's text from `send`, and the
+    // `.context(..)` the provider impl adds on top — comes from production
+    // code. Anything copied into this test could drift out of sync with the
+    // daemon and leave the assertion passing against a body it no longer emits.
+    let stub_body = r#"{"message":"Invalid API key"}"#;
+    let app = axum::Router::new()
+        .fallback(move || async move { (StatusCode::UNAUTHORIZED, stub_body) });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let (mut state, _tmp) = make_test_state_with_mock_provider().await;
+    // Swap the mock out for the real provider. `install_mock_provider` has
+    // already seeded the DB row the resolver needs; `provider_override` is the
+    // seam it returns, so the purchase path now runs the genuine Zaprite impl.
+    state.provider_override = Some(Arc::new(ZapriteProvider::new(ZapriteClient::new(
+        format!("http://{addr}"),
+        "dead-key",
+    ))));
+
+    repo::create_product(&state.db, "leak-test", "Leak Test", "", 10_000, &json!({}))
+        .await
+        .expect("create_product");
+
+    // No auth headers — this is the anonymous buyer's request.
+    let req = build_request(
+        "POST",
+        "/v1/purchase",
+        &[],
+        Some(json!({"product": "leak-test"})),
+    );
+    let resp = send(&state, req).await;
+    let status = resp.status();
+    let body = body_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body:?}");
+    assert_eq!(body["error"], "upstream_error");
+    assert_eq!(
+        body["message"],
+        format!(
+            "upstream error: payment provider create-invoice failed: \
+             ZapriteProvider.create_invoice: \
+             Zaprite create_order returned HTTP 401 Unauthorized: {stub_body}"
+        ),
+        "the public error body must stay byte-identical to what it was before \
+         the clients were collapsed onto send()"
+    );
+    let rendered = body["message"].as_str().unwrap_or_default();
+    assert!(
+        !rendered.contains("provider call"),
+        "ProviderHttpError's own wording must never reach an anonymous buyer: {rendered}"
+    );
 }
 
 /// Anti-forgery (P0): a `settled` webhook whose provider API does NOT
