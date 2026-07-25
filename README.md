@@ -189,6 +189,12 @@ A single port-listening check on port 8080 (`sdk.healthCheck.checkPortListening`
 StartOS reports the service as healthy once the daemon is binding the
 port. The daemon exposes `GET /healthz` for richer external monitoring.
 
+For the operator rather than for StartOS, the admin-key-gated
+`GET /v1/admin/health-summary` reports the conditions that would otherwise
+fail silently: webhook deliveries that gave up, payment-provider
+authentication health, and the state of the daemon's own Keysat license.
+The admin web UI renders it on the Overview page.
+
 ## Dependencies
 
 | Dependency  | Version range | Required | Purpose                                                       |

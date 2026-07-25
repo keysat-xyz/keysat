@@ -5559,10 +5559,19 @@ async fn health_summary_dead_letter_aggregates_execute_and_classify() {
     // The measurement is not exact and must say so in the payload, not only in
     // the source: `last_error` is last-write-wins.
     assert!(dl["note"].as_str().expect("note").contains("Not exact"));
-    // ...and the windowed/lifetime split must be stated, since it is otherwise
-    // only a `_count`/`_total` naming convention.
-    assert!(dl["note"].as_str().expect("note").contains("LIFETIME"));
-    assert!(dl["note"].as_str().expect("note").contains("bad_hmac_key_total"));
+    // ...and the windowed/lifetime split must be stated in prose, since it is
+    // otherwise only a `_count`/`_total` naming convention in the payload —
+    // which the operator reading the admin card never sees.
+    assert!(dl["note"]
+        .as_str()
+        .expect("note")
+        .contains("cover the whole history"));
+    // Both informational causes must be named, so a non-zero count for one of
+    // them reads as an explanation rather than as a failure being hidden.
+    assert!(dl["note"]
+        .as_str()
+        .expect("note")
+        .contains("cannot be used as an HMAC key"));
     assert!(body["generated_at"].is_string());
 }
 

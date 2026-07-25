@@ -139,12 +139,13 @@ const AUTH_DEAD_NOTE: &str = "Counted from HTTP 401s on any provider call, and c
      have been revoked. Alerts only after 3 consecutive failures spanning at least 10 minutes, \
      which is what keeps a key rotation from paging you for your own maintenance.";
 
-const CANNOT_SELL_NOTE: &str = "Counted from HTTP 403s on any non-probe call, and cleared only by \
-     a call that actually created an invoice. Only 3 of the 9 calls Keysat makes create one, so a \
-     key that sells perfectly but is missing a read permission can raise this — check the key's \
-     permissions rather than assuming checkout is broken. Because only a real sale clears it, read \
-     first_failure_at and last_success_at together: on a quiet store this can mean no sale has \
-     been attempted since that time, not that anything failed just now.";
+const CANNOT_SELL_NOTE: &str = "Counted from HTTP 403s on any call other than the liveness probe, \
+     and cleared only by a call that actually created an invoice. Only 3 of the 9 calls Keysat \
+     makes create one, so a key that sells perfectly but is missing a read permission can raise \
+     this — check the key's permissions rather than assuming checkout is broken. Because only a \
+     real sale clears it, read the first-failure and last-success times shown for this provider \
+     together: on a quiet store this can mean no sale has been attempted since then, not that \
+     anything failed just now.";
 
 const PERMISSIONS_NOTE: &str = "The liveness probe deliberately asks for a broader permission than \
      selling needs (BTCPay's canviewstoresettings, versus the cancreateinvoice a checkout uses), \
@@ -152,17 +153,18 @@ const PERMISSIONS_NOTE: &str = "The liveness probe deliberately asks for a broad
      and never alerts.";
 
 const DEAD_LETTER_NOTE: &str = "Counts webhook deliveries that exhausted their retries and will \
-     not be tried again, by the date they were enqueued. alerting_count covers the window named \
-     by window_days; alerting_total, oldest_at, disabled_endpoint_total and bad_hmac_key_total \
-     are all LIFETIME figures and are not windowed, so oldest_at can name a very old delivery \
-     while status is ok. Two causes are excluded from the alerting set because they are the \
-     operator's own configuration rather than a receiver failing: an endpoint that was deleted or \
-     disabled (counted in disabled_endpoint_total) and an endpoint whose stored secret is \
-     unusable as an HMAC key (counted in bad_hmac_key_total). Not exact: last_error is \
-     last-write-wins, so disabling an endpoint part-way through a delivery's retry ladder \
-     reclassifies a genuinely failing delivery as informational. It can only shrink the alerting \
-     set, never grow it, which is why this set is deliberately narrower than the admin delivery \
-     list's status=failed filter.";
+     not be tried again, dated by when each delivery was first enqueued rather than by when the \
+     worker gave up on it. Only the windowed count is limited to the recent period named beside \
+     it; the totals here, and the oldest date, cover the whole history and are never windowed, so \
+     the oldest can name a delivery from long ago while this condition still reads as OK. Two \
+     causes are left out of the count that raises an alert, because they are your \
+     own configuration rather than a receiver failing: an endpoint that was deleted or disabled, \
+     and an endpoint whose stored secret cannot be used as an HMAC key. Both are still counted, \
+     separately and for all time, so nothing is hidden. Not exact: only the most recent error is \
+     kept for each delivery, so disabling an endpoint part-way through its retry ladder relabels \
+     a genuinely failing delivery as one of those two configuration causes. That can only shrink \
+     the alerting count, never inflate it, which is why this set is deliberately narrower than \
+     the Failed filter on the webhook deliveries list.";
 
 /// Per-code wording for the self-license condition.
 ///
@@ -219,21 +221,22 @@ fn self_license_message(code: SelfLicenseCode) -> Option<&'static str> {
 }
 
 const SELF_LICENSE_NOTE: &str = "Read from three local sources and nothing else: the signed key \
-     (KEYSAT_LICENSE if set, otherwise /data/keysat-license.txt), the local licenses row for that \
-     key's license_id, and the tier this daemon is actually applying. The issuer is never \
-     contacted, so ok cannot prove a license has not been revoked or shortened upstream — and a \
-     daemon licensed by someone else's Keysat legitimately holds only the key, with no local row \
-     at all, which is reported as ok. Both expiry verdicts are measured against this daemon's own \
-     clock. expires_at is the EARLIER of the key's own expiry and the row's, because an issuer can \
-     shorten a license by editing the row and the key cannot see that. unlicensed means no key is \
-     installed and never alerts, because running the free Creator tier is a legitimate \
-     configuration rather than a fault; it does not by itself mean the daemon is on that tier, \
-     since a tier loaded before the key went missing is kept until the next restart — read detail \
-     for which of the two this is. stale_tier means a good key is installed while the daemon still \
-     runs the free tier — the fix is the \"Activate Keysat license\" action or a daemon restart. \
-     The \"Refresh self-license tier\" action provably cannot fix it: that refresh returns \
-     immediately when the current tier is already Unlicensed, which is the state stale_tier \
-     reports.";
+     (from the KEYSAT_LICENSE environment variable if set, otherwise /data/keysat-license.txt), \
+     this daemon's own local licenses row for that key, and the tier the daemon is actually \
+     applying. The issuer is never contacted, so a healthy verdict here cannot prove the license \
+     has not been revoked or shortened upstream — and a daemon licensed by someone else's Keysat \
+     legitimately holds only the key, with no local row at all, which is also reported as \
+     healthy. Both expiry verdicts are measured against this daemon's own clock. The expiry shown \
+     is the EARLIER of the key's own expiry and the local row's, because an issuer can shorten a \
+     license by editing that row and the key itself cannot see it. When no key is installed at \
+     all, that is reported and never alerts, because running the free Creator tier is a \
+     legitimate configuration rather than a fault; it does not by itself mean the daemon is on \
+     that tier, since a tier loaded before the key went missing is kept until the next restart, \
+     and the Detail line says which of the two this is. When a good key is installed while the \
+     daemon still runs the free tier, the fix is the \"Activate Keysat license\" action or a \
+     daemon restart. The \"Refresh self-license tier\" action provably cannot fix it: that \
+     refresh returns immediately whenever the daemon is already on the free tier, which is \
+     exactly the state being reported here.";
 
 /// Overall verdict for the summary and for each condition in it.
 ///

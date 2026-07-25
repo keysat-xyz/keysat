@@ -269,7 +269,13 @@ pub async fn refresh_self_tier_from_db(
             // Present but no longer verifies — expired, tampered, or
             // corrupt. Demote to Creator (free), same as revoked/suspended.
             // A read racing a concurrent `activate` file-write could trip
-            // this transiently; it self-heals on the next pass.
+            // this transiently. It does NOT self-heal on the next pass:
+            // once demoted, `current` is `Unlicensed` and the early return
+            // at the top of this function fires before anything is re-read.
+            // Recovering needs the "Activate Keysat license" action or a
+            // daemon restart — the same two remedies the health summary's
+            // `stale_tier` verdict names, and the reason it must never send
+            // an operator to the "Refresh self-license tier" action.
             Err(e) => {
                 tracing::warn!(
                     license_id = %license_id,
