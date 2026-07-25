@@ -427,6 +427,100 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
   background:var(--navy-900);
 }
 
+/* ---------- Service health card (GET /v1/admin/health-summary) ----------
+   Read-only rendering of the daemon's self-observations: dead-lettered
+   webhooks, payment-provider auth, and this daemon's own Keysat license.
+
+   Two rules are baked into these classes rather than left to the caller:
+
+   1. `.hc-note` is NOT decoration. The endpoint marks a condition
+      `exact:false` when its headline overclaims read on its own, and the
+      note is the qualifier that makes it honest. So whenever the thing
+      carrying it is unhappy — a condition at warn or critical, a streak
+      that is alerting — the note renders inline, always visible,
+      directly under the message it qualifies, and never in a tooltip or
+      a `title=`. Six of the nine calls that can raise "cannot create
+      invoices" create no invoice at all, so a key that sells perfectly
+      can show that condition red; the note is what stops that reading as
+      an outage, and it has to be impossible to miss. When the thing is
+      ok, those same words are confirmatory rather than a caveat about a
+      live problem, so they move behind `.hc-disclosure` — still on the
+      card, one click away, instead of a wall of qualifier on a resting
+      all-clear. The gate is the state of the thing carrying the note,
+      never the card's roll-up.
+   2. Colour comes from `status` / `alerting` only, never from "there is
+      a message". `unlicensed` carries a message and is a green `ok`.
+
+   No gold anywhere in this card — gold stays reserved for marketing
+   accents, and a warning state is `--warning`, not gold. */
+.hc-cond { padding:16px 0; border-top:1px solid var(--border-1); }
+.hc-cond:first-child { padding-top:0; border-top:0; }
+.hc-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+/* Own status dot rather than the shared `.dot ok` modifier. `.ok` is ALSO a
+   global alert-box class (10px/14px padding + a border), so an element
+   written `class="dot ok"` computes to a 30×22 blob instead of a 6px dot —
+   measured, not guessed. That collision is pre-existing and reachable from
+   `statusBadge`; this card just does not step in it. */
+.hc-dot { width:8px; height:8px; border-radius:999px; flex:none; }
+.hc-dot.is-ok       { background:var(--success); }
+.hc-dot.is-warn     { background:var(--warning); }
+.hc-dot.is-critical { background:var(--danger); }
+.hc-dot.is-unknown  { background:var(--ink-400); }
+/* Body face, not display: DESIGN.md §3 gives the display face to h1–h4, large
+   numerals and the wordmark, and a condition or provider name is a UI label. */
+.hc-name {
+  font-family:var(--font-body); font-weight:600; font-size:13.5px;
+  color:var(--navy-950);
+}
+.hc-msg { font-size:13.5px; color:var(--ink-700); line-height:1.55; margin-top:8px; }
+.hc-note {
+  font-size:12px; color:var(--ink-500); line-height:1.55; margin-top:4px;
+  padding-left:12px; border-left:2px solid var(--border-1);
+}
+/* The collapsed form of that same note, used only where rule 1 allows it —
+   the thing carrying the note is itself ok. A native <details>, so there is
+   no open/closed state in JS to leak across a route change and the keyboard
+   behaviour is the browser's own. Deliberately NOT `details.disclosure`:
+   that is a bordered panel with a body-sized summary and a gold marker, and
+   all three are wrong here — this sits inside a condition at meta scale, and
+   gold is reserved for marketing accents. */
+.hc-disclosure { margin-top:4px; }
+.hc-disclosure > summary {
+  cursor:pointer; list-style:none;
+  font-size:12px; color:var(--ink-500); line-height:1.55;
+  display:flex; align-items:center; gap:8px;
+}
+.hc-disclosure > summary::-webkit-details-marker { display:none; }
+/* Fixed box so the label does not shift by a pixel when + becomes −. The
+   face is monospace, so both glyphs advance identically anyway; this is
+   insurance against a fallback face lacking U+2212, the same reason
+   `details.disclosure` above pins its own marker width. */
+.hc-disclosure > summary::before {
+  content:'+'; font-family:var(--font-mono); font-weight:700;
+  color:var(--ink-400); width:8px; display:inline-block;
+}
+.hc-disclosure[open] > summary::before { content:'−'; }
+.hc-disclosure > summary:hover { color:var(--ink-700); }
+.hc-facts {
+  display:flex; flex-wrap:wrap; gap:4px 20px;
+  font-size:12px; color:var(--ink-500); margin-top:8px;
+}
+.hc-facts b { font-weight:600; color:var(--ink-700); }
+/* A nested tinted panel, deliberately NOT a card: no shadow and `r-md`
+   rather than the `r-lg` + `shadow-sm` a card gets, because it sits inside
+   one and a second elevation inside the first reads as a stack. Copied from
+   the revenue tiles already on this page (cream-100 on cream-50, hairline,
+   8px) so the two agree rather than inventing a second nested-panel look. */
+.hc-provider {
+  background:var(--cream-100); border:1px solid var(--border-1);
+  border-radius:8px; padding:12px; margin-top:8px;
+}
+.hc-streak { margin-top:12px; }
+/* Plain bold field label. NOT the eyebrow treatment (ALL CAPS + wide
+   tracking) — that is reserved for sparing section eyebrows, and these
+   labels repeat on every provider. */
+.hc-streak-label { font-size:12px; font-weight:600; color:var(--ink-500); }
+
 /* Tier-card drag affordance — cursor signals draggability on hover,
    the dragging card visibly lifts, and the drop-target receives a
    subtle outline so the operator sees where the card will land. */
@@ -1240,6 +1334,17 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
     const target = document.getElementById('route-target')
     target.innerHTML = ''
 
+    // Service health first, above revenue: these are the failures nobody
+    // goes looking for, so they have to be in the way rather than filed
+    // under a tab the operator only opens once something is already
+    // obviously wrong. Host appended synchronously so the ordering does
+    // not depend on which fetch returns first.
+    const healthHost = el('div')
+    target.appendChild(healthHost)
+    // Failed fetch and render-time throw are both handled inside
+    // renderHealthCard, so this call site does not need its own catch.
+    renderHealthCard(healthHost)
+
     // Stats grid (skeleton first; fill in as data arrives)
     const stats = el('div', { class: 'stats' })
     const sRevenue = stat('Revenue (lifetime)', '–', null, true)
@@ -1536,6 +1641,474 @@ hr.div { border:none; border-top:1px solid var(--border-1); margin:18px 0; }
       clearTimeout(saveTimer)
       saveTimer = setTimeout(persist, 600) // debounce the URL field
     })
+  }
+
+  // ---------- Service health card ----------
+  //
+  // Renders GET /v1/admin/health-summary: the three things the daemon can
+  // notice about itself that nothing else would report, because the thing
+  // that would normally report the failure is the thing that broke.
+  //
+  // Read-only by design. In particular there is deliberately NO
+  // "Refresh self-license tier" button here: that action returns
+  // immediately when the running tier is already Unlicensed, which is
+  // exactly the state `stale_tier` reports, so offering it would be a
+  // dead end that looks like a fix. The endpoint's own message names the
+  // two remedies that do work (the Activate action, or a restart) and
+  // this card renders that message verbatim rather than inventing one.
+  //
+  // Fetches once per render — on route load, or when the operator clicks
+  // Re-check. Deliberately not on a timer: the dead-letter aggregates are
+  // table scans, and a card that rebuilt itself on an interval would also
+  // need to be torn down on every route change.
+
+  /// Colour for a condition, derived from `status` and nothing else.
+  ///
+  /// Never keyed on "does this have a message": `unlicensed` carries a
+  /// message and is a perfectly healthy `ok`, and colouring it red would
+  /// turn a legitimate free-tier install into a fake incident.
+  const HEALTH_TONE = {
+    ok:       { badge: 'b-success', dot: 'is-ok',       label: 'OK' },
+    warn:     { badge: 'b-warning', dot: 'is-warn',     label: 'Warning' },
+    critical: { badge: 'b-danger',  dot: 'is-critical', label: 'Critical' },
+  }
+  function healthTone(status) {
+    return HEALTH_TONE[status] || { badge: 'b-neutral', dot: 'is-unknown', label: status || 'unknown' }
+  }
+  function healthDot(status) {
+    return el('span', { class: 'hc-dot ' + healthTone(status).dot })
+  }
+  function healthBadge(status, text) {
+    const t = healthTone(status)
+    return el('span', { class: 'badge ' + t.badge }, text || t.label)
+  }
+
+  /// The `note` that qualifies a headline — inline, or one click away.
+  ///
+  /// `healthy` gates only WHERE the note renders, never WHETHER: `exact`
+  /// decides that, one level up in healthClaim. When the thing carrying the
+  /// note is unhappy the note is a caveat about a live problem and stays
+  /// inline, expanded, unconditional — a red "cannot create invoices" over a
+  /// key that sells perfectly is exactly the misreading the flag exists to
+  /// prevent, and a qualifier the operator has to think to open cannot
+  /// prevent it. When the thing is ok the same words are confirmatory, so
+  /// they go behind a native <details> instead of adding a paragraph of
+  /// caveat to every line of a card whose whole message is "nothing here".
+  ///
+  /// The gate is the state of THAT thing — this condition, this streak — and
+  /// never the card's roll-up: an overall-critical card must not collapse the
+  /// note on the one condition that is fine, and an overall-ok card must not
+  /// collapse a note belonging to a streak that is alerting.
+  ///
+  /// Fails toward expanded. Only an explicit `true` collapses, so a caller
+  /// that cannot say hides nothing.
+  function healthNote(note, healthy) {
+    const body = el('div', { class: 'hc-note' }, note)
+    if (healthy !== true) return body
+    return el('details', { class: 'hc-disclosure' }, [
+      el('summary', null, 'What this can and can’t tell you'),
+      body,
+    ])
+  }
+
+  /// A condition's headline sentence, plus the `note` that qualifies it.
+  ///
+  /// `exact: false` is the endpoint telling this card that the headline
+  /// overclaims when read alone. Branching on it here is the whole point
+  /// of the flag: an inexact headline never appears without its note, and
+  /// the note is never a tooltip or a `title=`. Whether it starts open is
+  /// `healthy`'s call — see healthNote.
+  ///
+  /// Two rules, and the second one is the subtle half:
+  ///
+  /// 1. The endpoint sends `message` only when a condition is unhappy. When
+  ///    it is silent, this card supplies `fallback` — because a bare row of
+  ///    numbers with no sentence around it is not a kindness, it is just an
+  ///    unlabelled alarm.
+  /// 2. **The note follows the headline whoever wrote it.** `exact` is a
+  ///    property of the CONDITION, not of its state (the endpoint says so
+  ///    outright), so gating the note on the endpoint having spoken would
+  ///    drop the qualifier in exactly the states where this card speaks in
+  ///    its place. Concretely: a green "nothing needs your attention" over a
+  ///    non-zero "unusable secret" count is a claim about deliveries the
+  ///    operator will never receive, and the note is the only thing on the
+  ///    card that explains it.
+  function healthClaim(obj, fallback, healthy) {
+    if (!obj) return []
+    const out = []
+    const headline = obj.message || fallback
+    if (headline) out.push(el('div', { class: 'hc-msg' }, headline))
+    if (obj.exact === false && obj.note) out.push(healthNote(obj.note, healthy))
+    return out
+  }
+
+  /// One "label: value" pair on a condition's fact line. `value` may be a
+  /// string or a node (e.g. relativeDate).
+  function healthFact(label, value) {
+    return el('span', null, [el('b', null, label + ' '), value])
+  }
+  function healthFacts(facts) {
+    const kept = facts.filter(Boolean)
+    return kept.length ? el('div', { class: 'hc-facts' }, kept) : null
+  }
+
+  /// One failure streak (auth_dead / cannot_sell) on one provider.
+  ///
+  /// `first_failure_at` is rendered whenever there is a streak at all,
+  /// not only when it alerts. On `cannot_sell` that timestamp is the
+  /// difference between "checkout is broken right now" and "nothing has
+  /// been sold since Tuesday": only a real invoice-creating call clears
+  /// that streak, so a key an operator already fixed stays red until
+  /// someone actually buys something. Without the date the operator
+  /// cannot tell those two apart.
+  function healthStreak(label, streak) {
+    if (!streak) return null
+    const quiet = !streak.alerting && !streak.consecutive
+    if (quiet) return null
+    const kids = [
+      el('div', { class: 'hc-head' }, [
+        el('span', { class: 'hc-streak-label' }, label),
+        streak.alerting ? healthBadge('critical', 'alerting') : null,
+      ]),
+      // Below the threshold the endpoint sends no message, and it is right
+      // not to: a couple of failures is not yet a claim about anything. The
+      // threshold itself is deliberately not restated here — it is the
+      // daemon's constant, and a copy of it in the SPA is a copy that can
+      // drift. The note still renders, because on `cannot_sell` it is what
+      // stops a sub-threshold count reading as a broken checkout.
+      ...healthClaim(streak,
+        'Failures are being counted here, but not yet enough of them, for long enough, ' +
+        'to raise an alert.',
+        // `=== false`, not `!alerting`: a payload that does not say must not
+        // be read as "healthy, collapse it". Matches `exact === false` above.
+        streak.alerting === false),
+    ]
+    kids.push(healthFacts([
+      streak.consecutive
+        ? healthFact('Consecutive failures', String(streak.consecutive))
+        : null,
+      streak.first_failure_at
+        ? healthFact('First failure', relativeDate(streak.first_failure_at))
+        : null,
+    ]))
+    return el('div', { class: 'hc-streak' }, kids.filter(Boolean))
+  }
+
+  function healthProvider(p) {
+    const kids = [
+      el('div', { class: 'hc-head' }, [
+        healthDot(p.status),
+        el('span', { class: 'hc-name' }, p.label || p.kind || 'provider'),
+        el('code', { style: 'font-family:var(--font-mono); font-size:12px; color:var(--ink-500)' },
+          p.kind || ''),
+        // "no alerts", not "healthy": this status is the roll-up of the two
+        // streaks below and nothing else, and neither of them can see a
+        // provider that has simply never been called.
+        healthBadge(p.status, p.status === 'ok' ? 'no alerts' : 'needs attention'),
+      ]),
+    ]
+
+    // "Nothing observed yet" is a neutral fact, not a fault: a daemon that
+    // has just booted, or a provider connected a moment ago, looks exactly
+    // like this. The in-memory counters reset on every restart, and StartOS
+    // restarts the daemon on every package update.
+    //
+    // It deliberately does NOT promise that the probe will fill this in. The
+    // probe stamps `last_probe_at` on the attempt, before the request goes
+    // out, and an attempt that comes back with no HTTP status at all —
+    // unreachable host, DNS, TLS, timeout — records nothing. So a provider
+    // that has been down for a week sits here with a fresh probe timestamp
+    // and still nothing observed, and a card that said "the probe will fill
+    // this in" would be contradicted by the timestamp one line below it.
+    if (p.stale) {
+      kids.push(el('div', { class: 'hc-note', style: 'margin-top:8px' },
+        'No call to this provider has come back with a status since this daemon started — ' +
+        'including the liveness probe, whose attempts are timestamped below. A daemon that ' +
+        'has only just started looks like this; so does a provider that cannot be reached ' +
+        'at all.'))
+    }
+
+    const auth = healthStreak('Authentication', p.auth_dead)
+    if (auth) kids.push(auth)
+    const sell = healthStreak('Selling', p.cannot_sell)
+    if (sell) kids.push(sell)
+
+    // Non-alerting observation, and it must stay that way: the probe asks
+    // for a broader permission than selling needs, so a key that sells
+    // perfectly can be denied here forever. Rendered in ink, never in a
+    // warning colour.
+    //
+    // Its note stays INLINE, unlike the ok-state notes elsewhere on this
+    // card. `alerting` is a constant false here, so "collapse it when the
+    // thing is ok" has nothing to read; what decides whether this block is
+    // resting-state noise is whether it renders at all, and it renders only
+    // when `limited` is true. So it is simply absent from the all-clear card
+    // the collapse exists to shorten, and every time it IS on screen it is
+    // qualifying a live abnormal observation — the case rule 1 keeps open.
+    if (p.permissions && p.permissions.limited) {
+      kids.push(el('div', { class: 'hc-streak' }, [
+        el('div', { class: 'hc-head' }, [
+          el('span', { class: 'hc-streak-label' }, 'Permissions'),
+          el('span', { class: 'badge b-neutral' }, 'observation'),
+        ]),
+        el('div', { class: 'hc-msg' },
+          'The liveness probe is being denied by this key. This does not stop sales and never alerts.'),
+        p.permissions.note ? el('div', { class: 'hc-note' }, p.permissions.note) : null,
+        healthFacts([
+          p.permissions.since ? healthFact('Denied since', relativeDate(p.permissions.since)) : null,
+        ]),
+      ].filter(Boolean)))
+    }
+
+    kids.push(healthFacts([
+      healthFact('Last success', p.last_success_at ? relativeDate(p.last_success_at) : 'none observed'),
+      // "Last non-success status", not "last HTTP status": the field holds the
+      // most recent NON-success since the last success, and any success clears
+      // it. Calling it the last status would make a blank field read as "no
+      // calls made" when it actually means "the last call worked".
+      p.last_status != null ? healthFact('Last non-success status', String(p.last_status)) : null,
+      // "Attempted", because that is what is stamped — see the stale note.
+      healthFact('Last probe attempted',
+        p.last_probe_at ? relativeDate(p.last_probe_at) : 'not yet probed'),
+    ]))
+
+    return el('div', { class: 'hc-provider' }, kids.filter(Boolean))
+  }
+
+  /// Short human label per self-license `code`.
+  ///
+  /// Keyed on `code`, not on `status`, because `status` cannot tell "no
+  /// license key is installed, which is a legitimate configuration" from
+  /// "licensed and healthy" — both are `ok`, and they want different
+  /// words. The revoked/suspended labels say "recorded as", matching the
+  /// daemon's own wording rule: those come from the LOCAL licenses row,
+  /// which a daemon licensed elsewhere does not even have.
+  const SELF_LICENSE_LABEL = {
+    ok: 'Licensed',
+    unlicensed: 'No license key installed',
+    signature_invalid: 'Key does not verify',
+    revoked: 'Recorded as revoked',
+    suspended: 'Recorded as suspended',
+    expired: 'Expired',
+    expiring_soon: 'Expiring soon',
+    stale_tier: 'Installed, not applied',
+  }
+
+  /// Codes reached without a verified key, so the local `licenses` row is
+  /// never looked up for them and `row_present` is false by construction
+  /// rather than by observation.
+  const SELF_LICENSE_ROWLESS = ['unlicensed', 'signature_invalid']
+
+  function healthSelfLicense(s) {
+    const kids = [
+      el('div', { class: 'hc-head' }, [
+        healthDot(s.status),
+        el('span', { class: 'hc-name' }, 'Keysat license (this daemon)'),
+        el('span', { class: 'badge b-neutral' }, SELF_LICENSE_LABEL[s.code] || s.code),
+        healthBadge(s.status),
+      ]),
+    ]
+    // `ok` is the one code the endpoint stays silent on, so this card
+    // supplies the sentence — carefully. It says what was checked, not that
+    // the license is good: every source here is local and the issuer is never
+    // contacted, so an `ok` on a downstream daemon whose license was revoked
+    // upstream yesterday still reads `ok`. The note spells that out, and in
+    // the `ok` state it is one click away rather than inline — which is
+    // precisely why the sentence says "nothing this daemon can check locally"
+    // instead of a flat "your license is valid". On a healthy card it has to
+    // stand honestly on its own; the moment the state is not ok the note is
+    // back inline beside it.
+    kids.push(...healthClaim(s,
+      'Nothing this daemon can check locally is wrong with its own Keysat license.',
+      s.status === 'ok'))
+    // Populated in every state, and for revoked/suspended it carries the
+    // issuer's own reason — "chargeback" and "moved to annual" want
+    // different next steps from the operator, so it is never dropped.
+    // Labelled so it does not read as a second helping of the note above.
+    if (s.detail) {
+      kids.push(el('div', { class: 'hc-facts' }, [healthFact('Detail', s.detail)]))
+    }
+    kids.push(healthFacts([
+      // Only when there is one. A null effective expiry means perpetual OR
+      // that there is no verified key to have an expiry, and this card
+      // cannot tell those apart, so it says neither.
+      s.expires_at ? healthFact('Expires', relativeDate(s.expires_at)) : null,
+      // NOT a fault when absent. A daemon licensed by someone else's Keysat
+      // holds only the on-disk key and has no local row at all — the
+      // documented normal shape for every downstream customer daemon, so it
+      // is stated plainly and never dressed up as a missing record.
+      //
+      // Shown ONLY for a key that verified. The daemon looks the row up by
+      // the key's own license_id, so for `unlicensed` (no key) and
+      // `signature_invalid` (no id to look up by) it never queries at all and
+      // reports `row_present: false` by construction. Rendering the
+      // reassuring "normal when another Keysat issued this license" there
+      // would explain a lookup that was never attempted.
+      SELF_LICENSE_ROWLESS.indexOf(s.code) >= 0 ? null : healthFact('Local licenses row',
+        s.row_present ? 'found' : 'none — normal when another Keysat issued this license'),
+    ]))
+    return el('div', { class: 'hc-cond' }, kids.filter(Boolean))
+  }
+
+  /// Generation counter for the render below.
+  ///
+  /// A route load and an in-flight re-check can overlap (the button is
+  /// disabled while its own fetch runs, so the race is between entry points,
+  /// not between two clicks); without this the slower one still appends its
+  /// card after the faster one already did, and the operator gets two Service
+  /// health cards stacked. Every write to `host` is behind this check.
+  let healthCardGeneration = 0
+
+  async function renderHealthCard(host) {
+    const generation = ++healthCardGeneration
+
+    /// The card head, built identically whether or not the fetch succeeded.
+    /// The Re-check button lives in here for that reason: a transient
+    /// failure — or a 401 once the session expires, which no global handler
+    /// catches — must not carry the retry affordance away with it, or
+    /// recovering means navigating off the route and back.
+    ///
+    /// `summary` is null on both failure paths. Named rather than `h` so it
+    /// does not shadow the summary the caller is building.
+    function healthHead(summary) {
+      // Disabled while a re-check is in flight. The generation counter stops
+      // a duplicate card; this stops the duplicate WORK, which is two full
+      // scans of `webhook_deliveries` per click (the alerting predicate
+      // coalesces `last_error`, so no index can serve it).
+      const btn = el('button', {
+        class: 'btn secondary sm',
+        onclick: () => {
+          btn.disabled = true
+          btn.textContent = 'Re-checking…'
+          renderHealthCard(host)
+        },
+      }, 'Re-check')
+      // "No alerts", not "All clear". Every condition under this roll-up is
+      // `exact:false` and carries a note about what it cannot prove, so the
+      // roll-up must not claim more than the conditions it rolls up — the
+      // reasoning behind the per-provider badge below, applied one level up.
+      const label = !summary ? 'Unavailable'
+        : (summary.status === 'ok' ? 'No alerts'
+          : (summary.status === 'warn' ? 'Needs attention' : 'Action needed'))
+      // The `.sub` slot carries the only `margin-left:auto` in `.card-head`,
+      // so it renders even when empty — without it `space-between` strands
+      // the badge in the middle of the header instead of beside the title.
+      return el('div', { class: 'card-head' }, [
+        el('h3', null, 'Service health'),
+        healthBadge(summary && summary.status, label),
+        el('span', { class: 'sub' }, summary ? [
+          el('span', null, 'checked '),
+          relativeDate(summary.generated_at, { muted: false }),
+        ] : null),
+        btn,
+      ])
+    }
+
+    /// Muted, not red: neither failing to read the summary nor failing to
+    /// render it is one of the conditions the summary reports on.
+    function healthErrorCard(text, e) {
+      return el('div', { class: 'card' }, [
+        healthHead(null),
+        el('div', { class: 'card-body' },
+          el('p', { class: 'muted', style: 'margin:0; font-size:13.5px' },
+            text + (e && e.message ? e.message : String(e)))),
+      ])
+    }
+
+    let h
+    try {
+      h = await api('/v1/admin/health-summary')
+    } catch (e) {
+      if (generation !== healthCardGeneration) return
+      host.innerHTML = ''
+      host.appendChild(healthErrorCard('Service health unavailable: ', e))
+      return
+    }
+    if (generation !== healthCardGeneration) return
+
+    // The card is assembled in memory FIRST; `host` is not touched until
+    // there is a finished card to put in it. Clearing up front instead would
+    // mean a throw mid-build leaves an empty div where the card should be
+    // and, on the Re-check path, a button stuck disabled reading
+    // "Re-checking…". A throw here is a bug in this card rather than a
+    // condition it reports, but the operator still gets the head, so
+    // Re-check survives it exactly as it survives a failed fetch.
+    let card
+    try {
+      const w = (h.conditions && h.conditions.webhook_dead_letters) || {}
+      const p = (h.conditions && h.conditions.payment_providers) || {}
+      const s = h.conditions && h.conditions.self_license
+
+      // --- webhook dead letters ---
+      const webhookKids = [
+        el('div', { class: 'hc-head' }, [
+          healthDot(w.status),
+          el('span', { class: 'hc-name' }, 'Webhook deliveries'),
+          healthBadge(w.status),
+        ]),
+      ]
+      // The window comes from the payload. No `|| 7` default: that constant
+      // lives in the daemon, and a second copy here is a copy that can drift.
+      // If the field is ever absent, the sentence simply drops the phrase
+      // rather than asserting a number this card made up.
+      const windowPhrase = w.window_days ? ' in the last ' + w.window_days + ' days' : ''
+      webhookKids.push(...healthClaim(w,
+        // "for a reason that needs your attention", not a flat "none gave up":
+        // two causes are deliberately excluded from the alerting set (an
+        // endpoint the operator disabled, and one whose stored secret is
+        // unusable), and those still show in the lifetime figures below. A
+        // blanket "nothing gave up" would contradict a non-zero count sitting
+        // one line underneath it.
+        'No webhook delivery' + windowPhrase +
+        ' has given up for a reason that needs your attention.',
+        w.status === 'ok'))
+      webhookKids.push(healthFacts([
+        healthFact(w.window_days ? 'Gave up (last ' + w.window_days + 'd)' : 'Gave up (in window)',
+          String(w.alerting_count || 0)),
+        healthFact('Gave up (lifetime)', String(w.alerting_total || 0)),
+        // The oldest member of the ALERTING set, by enqueue date — not the
+        // oldest dead letter overall, which would include the two
+        // informational causes counted separately below.
+        w.oldest_at ? healthFact('Oldest alerting', relativeDate(w.oldest_at)) : null,
+        w.disabled_endpoint_total
+          ? healthFact('Endpoint disabled (lifetime)', String(w.disabled_endpoint_total)) : null,
+        w.bad_hmac_key_total
+          ? healthFact('Unusable secret (lifetime)', String(w.bad_hmac_key_total)) : null,
+      ]))
+
+      // --- payment providers ---
+      const providerKids = [
+        el('div', { class: 'hc-head' }, [
+          healthDot(p.status),
+          el('span', { class: 'hc-name' }, 'Payment providers'),
+          healthBadge(p.status),
+          el('span', { class: 'muted', style: 'font-size:12px' },
+            (p.count || 0) + ' connected'),
+        ]),
+      ]
+      // This condition carries no `exact`/`note` of its own — the qualifiers
+      // live on each provider's streaks — so healthClaim renders the headline
+      // and nothing else here. The healthy flag is still passed, so the rule
+      // is uniform across all four call sites if the endpoint ever grows one.
+      providerKids.push(...healthClaim(p,
+        p.count ? null : 'No payment provider is connected, so there is nothing to check.',
+        p.status === 'ok'))
+      for (const prov of (p.providers || [])) providerKids.push(healthProvider(prov))
+
+      const body = [
+        el('div', { class: 'hc-cond' }, webhookKids.filter(Boolean)),
+        el('div', { class: 'hc-cond' }, providerKids.filter(Boolean)),
+        s ? healthSelfLicense(s) : null,
+      ].filter(Boolean)
+
+      card = el('div', { class: 'card' },
+        [healthHead(h), el('div', { class: 'card-body' }, body)])
+    } catch (e) {
+      if (generation !== healthCardGeneration) return
+      card = healthErrorCard('Service health could not be rendered: ', e)
+    }
+    host.innerHTML = ''
+    host.appendChild(card)
   }
 
   // Render a product's price for table cells. Picks the right
