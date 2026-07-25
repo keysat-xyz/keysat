@@ -75,6 +75,7 @@ pub mod tier;
 pub mod validate;
 pub mod community;
 pub mod db_info;
+pub mod health_summary;
 pub mod merchant_profiles;
 pub mod payment_provider;
 pub mod rates_admin;
@@ -605,6 +606,11 @@ pub fn router(state: AppState) -> Router {
         // Database health snapshot — operator-facing sanity check
         // against the catastrophic-loss risk; see db_info.rs.
         .route("/v1/admin/db-info", get(db_info::get))
+        // The failure-alert surface: the conditions the daemon can
+        // observe about itself but cannot otherwise report, because
+        // the thing that would report them is the thing that broke.
+        // See health_summary.rs.
+        .route("/v1/admin/health-summary", get(health_summary::get))
         // BTC/fiat rate cache — operator-facing view of what the
         // daemon would quote for fiat-priced products. See
         // src/rates.rs for the source chain (Kraken → Coinbase

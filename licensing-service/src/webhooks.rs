@@ -35,6 +35,27 @@ pub const EVENT_HEADER: &str = "X-Keysat-Event";
 /// Idempotency key header — the delivery id, stable across retries.
 pub const DELIVERY_HEADER: &str = "X-Keysat-Delivery";
 
+/// `last_error` written when a delivery is abandoned because its endpoint was
+/// deleted or deactivated.
+///
+/// A constant rather than a literal because it is now **read** as well as
+/// written: `api/health_summary.rs` uses it to separate the dead letters that
+/// mean "the operator's receiver is failing" from the ones that mean "the
+/// operator turned this endpoint off", and only the former should raise an
+/// alert. Two independent copies of the string would drift the first time
+/// someone reworded this one, and the reader would fail *silently* — every
+/// disabled-endpoint row would quietly start counting as a real failure.
+pub const DISABLED_ENDPOINT_ERROR: &str = "endpoint deleted or disabled";
+
+/// Prefix of the `last_error` written when an endpoint's stored secret cannot
+/// be used as an HMAC key. The rest of the string is the underlying error.
+///
+/// Shared with `api/health_summary.rs` for the same reason as
+/// [`DISABLED_ENDPOINT_ERROR`], with one extra trap on top: because this is a
+/// **prefix**, the reader has to match it with `LIKE`, and an equality test
+/// would compile, run, and never match a single row.
+pub const BAD_HMAC_KEY_ERROR_PREFIX: &str = "bad HMAC key: ";
+
 /// Fire off a logical event. Persists one `webhook_deliveries` row per
 /// active subscribed endpoint; the delivery worker handles the HTTP.
 ///
@@ -117,7 +138,7 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
                     &state.db,
                     &d.id,
                     None,
-                    "endpoint deleted or disabled",
+                    DISABLED_ENDPOINT_ERROR,
                     None,
                 )
                 .await
@@ -135,7 +156,7 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
                     &state.db,
                     &d.id,
                     None,
-                    &format!("bad HMAC key: {e}"),
+                    &format!("{BAD_HMAC_KEY_ERROR_PREFIX}{e}"),
                     None,
                 )
                 .await

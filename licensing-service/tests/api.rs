@@ -21,6 +21,7 @@ use keysat::config::Config;
 use keysat::crypto::{self, LicensePayload};
 use keysat::db::repo;
 use keysat::license_self::Tier;
+use keysat::payment::health::{FailureStreak, ProviderAuthHealth};
 use keysat::payment::zaprite::{ZapriteClient, ZapriteProvider};
 use keysat::payment::{
     CreateInvoiceParams, CreatedInvoiceHandle, Money, PaymentProvider, ProviderInvoiceSnapshot,
@@ -35,7 +36,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tempfile::NamedTempFile;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -5249,3 +5250,781 @@ async fn admin_product_merchant_profile_endpoints() {
     assert_eq!(orphan.merchant_profile_id, None);
 }
 
+// ---------------------------------------------------------------------
+// GET /v1/admin/health-summary — the operator failure-alert surface.
+//
+// The daemon can fail in ways nobody sees, because the thing that would
+// report the failure is the thing that broke. These tests drive the two
+// conditions this endpoint reports (webhook dead letters, payment-provider
+// auth health) through the real router.
+//
+// The provider half seeds `AppState::provider_health` directly rather than
+// driving real HTTP: the recording rule and its wiring already have their own
+// tests (`src/payment/health.rs`, `tests/worker.rs`). What is under test here
+// is the *reporting* — which is exactly where a plausible-looking shortcut
+// (reading `last_status` instead of the streak) silently loses the signal.
+// ---------------------------------------------------------------------
+
+/// Insert a webhook endpoint. `active = 0` is what makes the delivery worker
+/// abandon its deliveries with `DISABLED_ENDPOINT_ERROR`.
+async fn seed_webhook_endpoint(pool: &SqlitePool, id: &str, active: i64) {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO webhook_endpoints(id, url, secret, event_types, active, \
+         description, created_at, updated_at) \
+         VALUES(?, 'https://operator.example/keysat-hook', \
+                '0123456789abcdef0123456789abcdef', '[\"*\"]', ?, '', ?, ?)",
+    )
+    .bind(id)
+    .bind(active)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("seed webhook endpoint");
+}
+
+/// Insert one `webhook_deliveries` row in an arbitrary state. Dead-lettered is
+/// `attempt_count > 0`, `next_attempt_at = NULL`, `delivered_at = NULL`.
+#[allow(clippy::too_many_arguments)]
+async fn seed_delivery(
+    pool: &SqlitePool,
+    id: &str,
+    endpoint_id: &str,
+    attempt_count: i64,
+    next_attempt_at: Option<&str>,
+    delivered_at: Option<&str>,
+    last_error: Option<&str>,
+    created_at: &str,
+) {
+    sqlx::query(
+        "INSERT INTO webhook_deliveries(id, endpoint_id, event_type, payload_json, \
+         attempt_count, next_attempt_at, delivered_at, last_error, created_at) \
+         VALUES(?, ?, 'license.issued', '{}', ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(endpoint_id)
+    .bind(attempt_count)
+    .bind(next_attempt_at)
+    .bind(delivered_at)
+    .bind(last_error)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("seed webhook delivery");
+}
+
+/// Create a payment provider and return its id.
+///
+/// Each one gets its own merchant profile: `payment_providers` is UNIQUE on
+/// `(merchant_profile_id, kind)`, so two BTCPay providers cannot share one.
+/// That is also the realistic shape — a second provider of the same kind means
+/// a second merchant.
+async fn seed_provider(state: &AppState, kind: &str, label: &str, connected_at: &str) -> String {
+    let profile_id = Uuid::new_v4().to_string();
+    repo::create_merchant_profile(
+        &state.db,
+        &profile_id,
+        label,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        connected_at,
+    )
+    .await
+    .expect("create_merchant_profile");
+    let id = Uuid::new_v4().to_string();
+    repo::create_payment_provider(
+        &state.db,
+        &id,
+        &profile_id,
+        kind,
+        label,
+        "api-key",
+        "http://provider.test",
+        None,
+        None,
+        Some("store-1"),
+        connected_at,
+    )
+    .await
+    .expect("create_payment_provider");
+    id
+}
+
+/// Pull one provider out of the summary by id.
+fn provider_in(body: &Value, id: &str) -> Value {
+    body["conditions"]["payment_providers"]["providers"]
+        .as_array()
+        .expect("providers array")
+        .iter()
+        .find(|p| p["id"] == json!(id))
+        .unwrap_or_else(|| panic!("provider {id} missing from the summary"))
+        .clone()
+}
+
+async fn get_health_summary(state: &AppState) -> Value {
+    let auth = format!("Bearer {}", TEST_ADMIN_KEY);
+    let req = build_request(
+        "GET",
+        "/v1/admin/health-summary",
+        &[("authorization", &auth)],
+        None,
+    );
+    let resp = send(state, req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "health-summary should be 200");
+    body_json(resp).await
+}
+
+/// The endpoint is `require_admin`-gated exactly like `/v1/admin/db-info`: it
+/// enumerates payment providers and reports how the operator's money path is
+/// doing, so it is master-key-only and must never answer an anonymous caller.
+#[tokio::test]
+async fn health_summary_requires_an_admin_key() {
+    let (state, _tmp) = make_test_state().await;
+
+    // No Authorization header at all → 401.
+    let req = build_request("GET", "/v1/admin/health-summary", &[], None);
+    let resp = send(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "health-summary must not answer an unauthenticated caller"
+    );
+
+    // Header present but wrong → 403, matching every other admin route.
+    let req = build_request(
+        "GET",
+        "/v1/admin/health-summary",
+        &[("authorization", "Bearer not-the-admin-key")],
+        None,
+    );
+    let resp = send(&state, req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// All four dead-letter aggregates, executed.
+///
+/// They are `sqlx::query_scalar` — prepared at runtime, so a bad column 500s
+/// only when the query actually runs and no amount of `cargo check` finds it.
+/// Beyond execution, this pins the three parts of the predicate that a
+/// plausible simplification would break:
+///
+/// - `COALESCE`: SQLite's `NULL <> 'x'` is `NULL`, not true, so `dl-null-error`
+///   would silently vanish from the alerting set without it.
+/// - `LIKE`, not `=`: the writer emits `bad HMAC key: {e}`, a *prefix*, so an
+///   equality test would never match and `dl-hmac` would start alerting.
+/// - the 7-day window: `dl-old` is a real dead letter and is counted in the
+///   lifetime total, but must not keep the card yellow forever.
+#[tokio::test]
+async fn health_summary_dead_letter_aggregates_execute_and_classify() {
+    let (state, _tmp) = make_test_state().await;
+    seed_webhook_endpoint(&state.db, "ep-h1", 1).await;
+
+    let now = Utc::now();
+    let recent = now.to_rfc3339();
+    let one_day_ago = (now - chrono::Duration::days(1)).to_rfc3339();
+    let two_days_ago = (now - chrono::Duration::days(2)).to_rfc3339();
+    let thirty_days_ago = (now - chrono::Duration::days(30)).to_rfc3339();
+
+    // --- Alerting: a receiver that is genuinely failing. ---
+    seed_delivery(
+        &state.db, "dl-recent-1", "ep-h1", 10, None, None,
+        Some("non-2xx response: 500 upstream boom"), &recent,
+    )
+    .await;
+    seed_delivery(
+        &state.db, "dl-recent-2", "ep-h1", 10, None, None,
+        Some("request error: connection refused"), &one_day_ago,
+    )
+    .await;
+    // No `last_error` at all. Alerting — and the ONLY thing keeping it in the
+    // set is `COALESCE`.
+    seed_delivery(&state.db, "dl-null-error", "ep-h1", 10, None, None, None, &two_days_ago).await;
+    // Alerting, but outside the window: lifetime total and `oldest_alerting_at`
+    // only.
+    seed_delivery(
+        &state.db, "dl-old", "ep-h1", 10, None, None,
+        Some("non-2xx response: 502"), &thirty_days_ago,
+    )
+    .await;
+
+    // --- Informational: the operator's own doing, never alerts. ---
+    seed_delivery(
+        &state.db, "dl-disabled", "ep-h1", 3, None, None,
+        Some(keysat::webhooks::DISABLED_ENDPOINT_ERROR), &recent,
+    )
+    .await;
+    // Never alerts either. The prefix is what makes `LIKE` mandatory: the
+    // writer emits `bad HMAC key: {e}`, so an equality test matches nothing.
+    seed_delivery(
+        &state.db, "dl-hmac", "ep-h1", 1, None, None,
+        Some("bad HMAC key: invalid length"), &recent,
+    )
+    .await;
+    seed_delivery(
+        &state.db, "dl-hmac-2", "ep-h1", 1, None, None,
+        Some("bad HMAC key: something else entirely"), &one_day_ago,
+    )
+    .await;
+
+    // --- Not dead-lettered at all. ---
+    seed_delivery(&state.db, "dl-pending", "ep-h1", 2, Some(&recent), None, Some("non-2xx response: 500"), &recent).await;
+    seed_delivery(&state.db, "dl-delivered", "ep-h1", 1, None, Some(&recent), None, &recent).await;
+    // Enqueued but never attempted: `attempt_count = 0` keeps it out.
+    seed_delivery(&state.db, "dl-fresh", "ep-h1", 0, None, None, None, &recent).await;
+
+    let body = get_health_summary(&state).await;
+    let dl = &body["conditions"]["webhook_dead_letters"];
+
+    assert_eq!(
+        dl["alerting_count"], json!(3),
+        "the 7-day alerting set is recent-1, recent-2 and null-error; got {dl:#}"
+    );
+    assert_eq!(dl["alerting_total"], json!(4), "lifetime adds dl-old");
+    assert_eq!(dl["oldest_at"], json!(thirty_days_ago));
+    assert_eq!(dl["window_days"], json!(7));
+
+    // The two informational causes are counted, not merely excluded — so
+    // alerting_total + these two reconciles against the admin list's
+    // status=failed, and a row that hit either cause is visible rather than
+    // silently absent from the whole summary.
+    assert_eq!(dl["disabled_endpoint_total"], json!(1));
+    assert_eq!(
+        dl["bad_hmac_key_total"], json!(2),
+        "both `bad HMAC key: …` rows must be counted here, and the prefix match \
+         is what finds them: an equality test would report 0"
+    );
+    // Together they account for every dead-lettered row: 4 alerting + 1
+    // disabled + 2 bad-HMAC = the 7 rows seeded in that state.
+    assert_eq!(
+        dl["alerting_total"].as_i64().unwrap()
+            + dl["disabled_endpoint_total"].as_i64().unwrap()
+            + dl["bad_hmac_key_total"].as_i64().unwrap(),
+        7,
+        "every dead letter lands in exactly one bucket; got {dl:#}"
+    );
+    // The measurement is not exact, and says so in a field a renderer can
+    // branch on rather than only in prose.
+    assert_eq!(dl["exact"], json!(false));
+
+    // A lost webhook is the operator's integration failing, not Keysat being
+    // unable to take money — yellow, never red.
+    assert_eq!(dl["status"], json!("warn"));
+    assert_eq!(body["status"], json!("warn"));
+    assert!(
+        dl["message"].as_str().expect("a message when alerting").contains("3 webhook deliveries"),
+        "got {:?}",
+        dl["message"]
+    );
+    // The measurement is not exact and must say so in the payload, not only in
+    // the source: `last_error` is last-write-wins.
+    assert!(dl["note"].as_str().expect("note").contains("Not exact"));
+    // ...and the windowed/lifetime split must be stated, since it is otherwise
+    // only a `_count`/`_total` naming convention.
+    assert!(dl["note"].as_str().expect("note").contains("LIFETIME"));
+    assert!(dl["note"].as_str().expect("note").contains("bad_hmac_key_total"));
+    assert!(body["generated_at"].is_string());
+}
+
+/// A healthy daemon reports `ok`, with every aggregate at zero — the queries
+/// still execute, and the empty case is the one an operator sees every day.
+#[tokio::test]
+async fn health_summary_is_ok_when_nothing_is_wrong() {
+    let (state, _tmp) = make_test_state().await;
+
+    let body = get_health_summary(&state).await;
+
+    assert_eq!(body["status"], json!("ok"));
+    let dl = &body["conditions"]["webhook_dead_letters"];
+    assert_eq!(dl["status"], json!("ok"));
+    assert_eq!(dl["alerting_count"], json!(0));
+    assert_eq!(dl["alerting_total"], json!(0));
+    assert_eq!(dl["oldest_at"], Value::Null);
+    assert_eq!(dl["disabled_endpoint_total"], json!(0));
+    assert_eq!(dl["bad_hmac_key_total"], json!(0));
+    assert_eq!(dl["message"], Value::Null, "no message when nothing is wrong");
+
+    let pp = &body["conditions"]["payment_providers"];
+    assert_eq!(pp["status"], json!("ok"));
+    assert_eq!(pp["count"], json!(0));
+    assert_eq!(pp["alerting_count"], json!(0));
+    assert_eq!(pp["providers"], json!([]));
+}
+
+/// The writer and the reader share `DISABLED_ENDPOINT_ERROR` and cannot drift.
+///
+/// This drives the **real** delivery worker (`webhooks::tick`) against a
+/// deactivated endpoint rather than seeding the string, so the row's
+/// `last_error` is written by production code. If anyone reworded the literal
+/// on either side, the disabled delivery would land in the alerting count and
+/// this fails — which is the whole point, because the drift is otherwise
+/// silent: the summary would simply start reporting the operator's own
+/// switched-off endpoint as a failing receiver.
+#[tokio::test]
+async fn health_summary_shares_the_disabled_endpoint_error_with_the_writer() {
+    let (state, _tmp) = make_test_state().await;
+    let now = Utc::now().to_rfc3339();
+
+    // Deactivated endpoint with a delivery due now. `tick` looks the endpoint
+    // up, finds `active = 0`, and abandons the delivery — no HTTP is issued.
+    seed_webhook_endpoint(&state.db, "ep-off", 0).await;
+    seed_delivery(&state.db, "d-off", "ep-off", 0, Some(&now), None, None, &now).await;
+
+    // ...and one genuine dead letter, so this test can tell "nothing counts"
+    // from "the right thing counts".
+    seed_webhook_endpoint(&state.db, "ep-on", 1).await;
+    seed_delivery(
+        &state.db, "d-real", "ep-on", 10, None, None,
+        Some("non-2xx response: 500"), &now,
+    )
+    .await;
+
+    keysat::webhooks::tick(&state).await.expect("delivery tick");
+
+    // The worker really did dead-letter it, via the shared constant.
+    let (attempts, next, err): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT attempt_count, next_attempt_at, last_error FROM webhook_deliveries WHERE id = 'd-off'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("read d-off");
+    assert_eq!(attempts, 1);
+    assert_eq!(next, None, "abandoned, not rescheduled");
+    assert_eq!(err.as_deref(), Some(keysat::webhooks::DISABLED_ENDPOINT_ERROR));
+
+    let body = get_health_summary(&state).await;
+    let dl = &body["conditions"]["webhook_dead_letters"];
+    assert_eq!(
+        dl["alerting_count"], json!(1),
+        "only the genuine failure alerts; got {dl:#}"
+    );
+    assert_eq!(dl["disabled_endpoint_total"], json!(1));
+}
+
+/// The two streaks are reported independently, and — the trap — an alerting
+/// `cannot_sell` renders with `last_status: null`.
+///
+/// Any success clears `last_status`, including the liveness probe's every 15
+/// minutes, while `cannot_sell` clears only on a call that actually created an
+/// invoice. So the honest-looking shortcut of naming the problem from
+/// `last_status` reports a provider that cannot take money as healthy. This
+/// also pins the wording: neither streak may render as a flat "key revoked".
+#[tokio::test]
+async fn health_summary_reports_each_provider_streak_independently() {
+    let (state, _tmp) = make_test_state().await;
+    let now = SystemTime::now();
+    let twenty_min_ago = now - Duration::from_secs(20 * 60);
+    let five_min_ago = now - Duration::from_secs(5 * 60);
+
+    let p_auth = seed_provider(&state, "btcpay", "Dead key", "2026-07-01T00:00:00Z").await;
+    let p_sell = seed_provider(&state, "zaprite", "Scope-broken key", "2026-07-02T00:00:00Z").await;
+    let p_perms = seed_provider(&state, "btcpay", "Narrow key", "2026-07-03T00:00:00Z").await;
+    let p_fresh = seed_provider(&state, "zaprite", "Unreachable", "2026-07-04T00:00:00Z").await;
+
+    {
+        let mut map = state.provider_health.write().expect("health map");
+
+        // Authentication failing: a matured 401 streak.
+        map.insert(
+            p_auth.clone(),
+            ProviderAuthHealth {
+                auth_dead: FailureStreak {
+                    consecutive: 3,
+                    first_failure_at: Some(twenty_min_ago),
+                },
+                last_status: Some(401),
+                ..Default::default()
+            },
+        );
+
+        // Cannot sell, and the last thing observed was a 200 — the probe
+        // succeeded, which clears `last_status` and `auth_dead` but proves
+        // nothing about `cancreateinvoice`.
+        map.insert(
+            p_sell.clone(),
+            ProviderAuthHealth {
+                cannot_sell: FailureStreak {
+                    consecutive: 4,
+                    first_failure_at: Some(twenty_min_ago),
+                },
+                last_success_at: Some(five_min_ago),
+                last_status: None,
+                last_probe_at: Some(five_min_ago),
+                ..Default::default()
+            },
+        );
+
+        // A permissions observation only. Never alerts. `last_status` is set
+        // because `record_failure` always stamps it — a probe 403 with a null
+        // `last_status` is a state the tracker cannot produce, and a fixture
+        // that could not happen proves nothing.
+        map.insert(
+            p_perms.clone(),
+            ProviderAuthHealth {
+                probe_403_since: Some(twenty_min_ago),
+                last_status: Some(403),
+                last_probe_at: Some(five_min_ago),
+                ..Default::default()
+            },
+        );
+
+        // The genuinely-unobserved case, and the reason `stale` cannot be
+        // "is there a map entry": the probe stamps `last_probe_at` on the
+        // *attempt*, so a provider that could not be reached at all has an
+        // entry with no observation in it.
+        map.insert(
+            p_fresh.clone(),
+            ProviderAuthHealth {
+                last_probe_at: Some(five_min_ago),
+                ..Default::default()
+            },
+        );
+    }
+
+    let body = get_health_summary(&state).await;
+    let pp = &body["conditions"]["payment_providers"];
+    assert_eq!(pp["count"], json!(4));
+    assert_eq!(pp["alerting_count"], json!(2), "the permissions one must not count");
+    assert!(
+        pp["message"].as_str().expect("a message when providers are alerting").contains("2 payment providers"),
+        "got {:?}",
+        pp["message"]
+    );
+    assert_eq!(pp["status"], json!("critical"));
+    assert_eq!(body["status"], json!("critical"));
+
+    // --- Authentication failing. ---
+    let auth = provider_in(&body, &p_auth);
+    assert_eq!(auth["status"], json!("critical"));
+    assert_eq!(auth["kind"], json!("btcpay"));
+    assert_eq!(auth["label"], json!("Dead key"));
+    assert_eq!(auth["auth_dead"]["alerting"], json!(true));
+    assert_eq!(auth["auth_dead"]["consecutive"], json!(3));
+    assert!(auth["auth_dead"]["first_failure_at"].is_string());
+    assert_eq!(
+        auth["auth_dead"]["message"],
+        json!("authentication failing (key may be revoked)"),
+        "a 401 cannot distinguish a revoked key from a mistyped one"
+    );
+    // The other streak is genuinely quiet, and says so rather than borrowing.
+    assert_eq!(auth["cannot_sell"]["alerting"], json!(false));
+    assert_eq!(auth["cannot_sell"]["consecutive"], json!(0));
+    assert_eq!(auth["cannot_sell"]["message"], Value::Null);
+    assert_eq!(
+        auth["last_status"], json!(401),
+        "the observed status is reported next to the streak, not in place of it"
+    );
+    assert_eq!(auth["stale"], json!(false), "a 401 is an observation");
+    assert!(
+        auth["auth_dead"]["note"].as_str().expect("note").contains("may have been revoked"),
+        "the note must qualify what a 401 proves, in the payload"
+    );
+
+    // --- Cannot sell, with `last_status: null`. THE trap. ---
+    let sell = provider_in(&body, &p_sell);
+    assert_eq!(
+        sell["last_status"], Value::Null,
+        "fixture precondition: the last observed call succeeded"
+    );
+    assert_eq!(
+        sell["status"], json!("critical"),
+        "the verdict must come from the streak, not from last_status"
+    );
+    assert_eq!(sell["cannot_sell"]["alerting"], json!(true));
+    assert_eq!(sell["cannot_sell"]["consecutive"], json!(4));
+    assert_eq!(
+        sell["cannot_sell"]["message"],
+        json!("cannot create invoices (insufficient permissions)")
+    );
+    // Rendered alongside the count so a stale red reads as "no sale attempted
+    // since", not as a fresh outage.
+    assert!(
+        sell["cannot_sell"]["first_failure_at"].is_string(),
+        "first_failure_at is what makes a stale red legible"
+    );
+    assert!(sell["last_success_at"].is_string());
+    assert!(sell["last_probe_at"].is_string(), "last checked, for the same reason");
+    assert_eq!(
+        sell["stale"], json!(false),
+        "a probe success cleared last_status, but something HAS been observed — \
+         `stale` must read both observation fields or it reports a live provider as unobserved"
+    );
+    assert_eq!(sell["auth_dead"]["alerting"], json!(false));
+    assert_eq!(sell["auth_dead"]["message"], Value::Null);
+
+    // Neither streak's wording may assert what the signal cannot establish.
+    for provider in [&auth, &sell] {
+        for streak in ["auth_dead", "cannot_sell"] {
+            let rendered = format!(
+                "{} {}",
+                provider[streak]["message"], provider[streak]["note"]
+            );
+            assert!(
+                !rendered.contains("key revoked") && !rendered.contains("key was revoked"),
+                "{streak} must never render as a flat \"key revoked\": {rendered}"
+            );
+        }
+    }
+    assert!(
+        sell["cannot_sell"]["note"].as_str().expect("note").contains("3 of the 9"),
+        "the note must admit that most counted calls do not create an invoice"
+    );
+
+    // `exact` is the machine-readable half of that admission — the part a
+    // renderer can bind to. `cannot_sell`'s headline ("cannot create invoices")
+    // is false for six of the nine labels that raise it, so a card that showed
+    // the headline and hid the note would reproduce the hazard; `exact: false`
+    // is what makes that a testable defect rather than a convention nobody
+    // remembers. `auth_dead`'s headline carries its own qualifier ("may be
+    // revoked") and claims nothing the streak does not measure.
+    assert_eq!(
+        sell["cannot_sell"]["exact"], json!(false),
+        "cannot_sell overclaims when read alone; the note is mandatory beside it"
+    );
+    assert_eq!(auth["cannot_sell"]["exact"], json!(false), "the flag is a property of the streak, not of its current state");
+    assert_eq!(
+        auth["auth_dead"]["exact"], json!(true),
+        "auth_dead's headline states exactly what a 401 streak measures"
+    );
+    assert_eq!(sell["auth_dead"]["exact"], json!(true));
+
+    // --- Permissions: observed, reported, non-alerting. ---
+    let perms = provider_in(&body, &p_perms);
+    assert_eq!(
+        perms["status"], json!("ok"),
+        "a probe 403 is the documented normal case on BTCPay and must not colour the card"
+    );
+    assert_eq!(perms["permissions"]["limited"], json!(true));
+    assert!(perms["permissions"]["since"].is_string());
+    assert_eq!(perms["permissions"]["alerting"], json!(false));
+    assert_eq!(perms["auth_dead"]["alerting"], json!(false));
+    assert_eq!(perms["cannot_sell"]["alerting"], json!(false));
+    assert_eq!(perms["stale"], json!(false), "the 403 itself is an observation");
+    assert!(
+        perms["permissions"]["note"].as_str().expect("note").contains("never alerts"),
+        "the payload must say why this is not a fault, not just the source"
+    );
+    assert_eq!(auth["permissions"]["limited"], json!(false));
+    assert_eq!(auth["permissions"]["since"], Value::Null);
+
+    // --- The probe ran, but no status ever came back: nothing observed.
+    let fresh = provider_in(&body, &p_fresh);
+    assert_eq!(fresh["status"], json!("ok"));
+    assert_eq!(
+        fresh["stale"], json!(true),
+        "an entry can exist because the probe was scheduled, not because a status came back"
+    );
+    assert!(fresh["last_probe_at"].is_string());
+    assert_eq!(fresh["last_status"], Value::Null);
+    assert_eq!(fresh["last_success_at"], Value::Null);
+}
+
+/// A young streak — three failures inside the ten-minute window — is reported
+/// with its count but does not alert. That double arm is what keeps a key
+/// rotation from paging the operator for their own maintenance, and the
+/// endpoint must not quietly re-derive alerting from the count alone.
+#[tokio::test]
+async fn health_summary_does_not_alert_on_a_young_streak() {
+    let (state, _tmp) = make_test_state().await;
+    let id = seed_provider(&state, "btcpay", "Just rotated", "2026-07-01T00:00:00Z").await;
+
+    state.provider_health.write().expect("health map").insert(
+        id.clone(),
+        ProviderAuthHealth {
+            auth_dead: FailureStreak {
+                consecutive: 3,
+                first_failure_at: Some(SystemTime::now() - Duration::from_secs(30)),
+            },
+            last_status: Some(401),
+            ..Default::default()
+        },
+    );
+
+    let body = get_health_summary(&state).await;
+    let p = provider_in(&body, &id);
+    assert_eq!(p["auth_dead"]["consecutive"], json!(3), "reported...");
+    assert_eq!(p["auth_dead"]["alerting"], json!(false), "...but not yet alerting");
+    assert_eq!(p["auth_dead"]["message"], Value::Null);
+    assert_eq!(p["status"], json!("ok"));
+    assert_eq!(body["status"], json!("ok"));
+}
+
+/// Reading the summary prunes health entries whose `payment_providers` row is
+/// gone — and ONLY those.
+///
+/// The live provider's entry carries `last_probe_at`, the liveness probe's
+/// throttle. Dropping it would reset the throttle and re-fire that provider's
+/// probe on the next 60-second reconcile tick instead of on its 15-minute
+/// cadence, turning a read-only endpoint into a source of provider traffic.
+#[tokio::test]
+async fn health_summary_prunes_only_orphaned_provider_entries() {
+    let (state, _tmp) = make_test_state().await;
+    let live = seed_provider(&state, "btcpay", "Live", "2026-07-01T00:00:00Z").await;
+    let probed_at = SystemTime::now() - Duration::from_secs(60);
+
+    {
+        let mut map = state.provider_health.write().expect("health map");
+        map.insert(
+            live.clone(),
+            ProviderAuthHealth {
+                last_probe_at: Some(probed_at),
+                last_success_at: Some(probed_at),
+                ..Default::default()
+            },
+        );
+        // A provider the operator disconnected: the row is gone, the entry
+        // is not. Nothing else in the daemon removes it.
+        map.insert(
+            "disconnected-provider".to_string(),
+            ProviderAuthHealth {
+                auth_dead: FailureStreak {
+                    consecutive: 9,
+                    first_failure_at: Some(probed_at),
+                },
+                last_probe_at: Some(probed_at),
+                ..Default::default()
+            },
+        );
+    }
+
+    let body = get_health_summary(&state).await;
+
+    assert_eq!(body["conditions"]["payment_providers"]["count"], json!(1));
+    assert_eq!(
+        body["conditions"]["payment_providers"]["alerting_count"], json!(0),
+        "the orphan's matured streak must not leak into the verdict"
+    );
+    assert_eq!(body["status"], json!("ok"));
+    provider_in(&body, &live);
+
+    let map = state.provider_health.read().expect("health map");
+    assert!(!map.contains_key("disconnected-provider"), "orphan pruned");
+    assert_eq!(
+        map.get(&live).expect("live entry kept").last_probe_at,
+        Some(probed_at),
+        "the live provider's probe throttle must survive the read"
+    );
+}
+
+/// A `bad HMAC key: …` dead letter never raises the alert, on its own, with
+/// nothing else in the table.
+///
+/// The aggregate test infers this from a count of 3 among nine seeded rows,
+/// which would still pass if the exclusion broke in a way another row happened
+/// to compensate for. This asserts it directly and in isolation: the row is a
+/// real dead letter (`repo::list_deliveries` with `status=failed` returns it),
+/// it is counted in `bad_hmac_key_total`, and the alerting count stays zero.
+///
+/// The exclusion matters because the cause is an unusable endpoint *secret* —
+/// deterministic, and not evidence that the operator's receiver is down. It is
+/// still surfaced, in its own counter and in the admin delivery list.
+#[tokio::test]
+async fn health_summary_never_alerts_on_a_bad_hmac_key_dead_letter() {
+    let (state, _tmp) = make_test_state().await;
+    let now = Utc::now().to_rfc3339();
+    seed_webhook_endpoint(&state.db, "ep-hmac", 1).await;
+    seed_delivery(
+        &state.db,
+        "d-hmac-only",
+        "ep-hmac",
+        1,
+        None,
+        None,
+        Some(&format!("{}invalid length", keysat::webhooks::BAD_HMAC_KEY_ERROR_PREFIX)),
+        &now,
+    )
+    .await;
+
+    // It really is dead-lettered — the admin delivery list shows it.
+    let failed = repo::list_deliveries(&state.db, None, repo::DeliveryStatusFilter::Failed, 50)
+        .await
+        .expect("list_deliveries");
+    assert_eq!(failed.len(), 1, "the row is a genuine dead letter");
+
+    let body = get_health_summary(&state).await;
+    let dl = &body["conditions"]["webhook_dead_letters"];
+    assert_eq!(dl["alerting_count"], json!(0), "an unusable secret is not a failing receiver");
+    assert_eq!(dl["alerting_total"], json!(0));
+    assert_eq!(dl["oldest_at"], Value::Null);
+    assert_eq!(
+        dl["bad_hmac_key_total"], json!(1),
+        "excluded from the alert, but NOT invisible — it has its own counter"
+    );
+    assert_eq!(dl["status"], json!("ok"));
+    assert_eq!(body["status"], json!("ok"));
+}
+
+/// A panicking task poisons the health map, and every reader recovers.
+///
+/// The map is a `std::sync::RwLock`, so a panic while its write guard is held
+/// poisons it permanently and `.lock()`/`.write()` returns `Err` forever after.
+/// Three call sites recover with `into_inner()` instead of unwrapping — the
+/// endpoint's prune, the probe's throttle claim, and the clients' record path —
+/// and until now nothing pinned any of them. An `.expect()` at any one of the
+/// three would take down the entire alert surface, permanently, because one
+/// unrelated task panicked. That is strictly worse than reading a map whose
+/// last mutation may have been interrupted: every mutation is a single
+/// infallible field write, so the map is internally consistent either way.
+///
+/// Poisoning is process-wide for this `AppState`, so all three sites are
+/// exercised against the same poisoned lock.
+#[tokio::test]
+async fn a_poisoned_health_map_does_not_take_down_the_alert_surface() {
+    let (state, _tmp) = make_test_state().await;
+    let id = seed_provider(&state, "btcpay", "Live", "2026-07-01T00:00:00Z").await;
+    let probed_at = SystemTime::now() - Duration::from_secs(60);
+    state.provider_health.write().expect("health map").insert(
+        id.clone(),
+        ProviderAuthHealth {
+            last_probe_at: Some(probed_at),
+            last_success_at: Some(probed_at),
+            ..Default::default()
+        },
+    );
+
+    // Poison it: panic while the write guard is held. The panic message below
+    // WILL appear in the test output; it is deliberate, not a failure.
+    let map = state.provider_health.clone();
+    let panicked = std::thread::spawn(move || {
+        let _guard = map.write().expect("write lock");
+        panic!("DELIBERATE panic to poison the health map — see the test of the same name");
+    })
+    .join();
+    assert!(panicked.is_err(), "the spawned task must actually have panicked");
+    assert!(
+        state.provider_health.is_poisoned(),
+        "precondition: the lock is now poisoned"
+    );
+
+    // Site 1 — the endpoint's prune. Still 200, still correct.
+    let body = get_health_summary(&state).await;
+    assert_eq!(body["status"], json!("ok"));
+    assert_eq!(body["conditions"]["payment_providers"]["count"], json!(1));
+    let p = provider_in(&body, &id);
+    assert_eq!(p["stale"], json!(false), "the entry survived the poisoning intact");
+
+    // Site 2 — the probe's throttle claim. The entry was stamped 60s ago and
+    // the interval is 15 minutes, so a correct recovery reads the existing
+    // stamp and declines; a recovery that lost the map would re-fire.
+    assert!(
+        !keysat::payment::health::claim_probe_slot(
+            &state.provider_health,
+            &id,
+            SystemTime::now()
+        ),
+        "the throttle must still hold through poisoning"
+    );
+
+    // Site 3 — the clients' record path.
+    keysat::payment::health::ProviderHealthSink::new(state.provider_health.clone(), id.clone())
+        .record("btcpay.create_invoice", 401, SystemTime::now());
+    let body = get_health_summary(&state).await;
+    assert_eq!(
+        provider_in(&body, &id)["auth_dead"]["consecutive"], json!(1),
+        "the failure was recorded through the poisoned lock"
+    );
+}
