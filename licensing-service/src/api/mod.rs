@@ -227,7 +227,11 @@ impl AppState {
     /// Instantiate a `PaymentProvider` from a resolved DB row, honoring the
     /// test-only `provider_override` seam. In production `provider_override`
     /// is always `None`, so this just delegates to `payment::build_provider`.
-    fn provider_from_row(
+    ///
+    /// `pub(crate)` for `reconcile`'s liveness probe, which has already listed
+    /// every provider row and would otherwise have to re-read each one through
+    /// `payment_provider_by_id`.
+    pub(crate) fn provider_from_row(
         &self,
         row: &crate::db::repo::PaymentProviderRow,
     ) -> AppResult<Arc<dyn crate::payment::PaymentProvider>> {

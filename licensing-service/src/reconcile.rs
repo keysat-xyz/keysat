@@ -21,11 +21,31 @@
 
 use crate::api::AppState;
 use crate::db::repo;
-use std::time::Duration;
+use crate::payment::health;
+use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 
 const TICK: Duration = Duration::from_secs(60);
 const MAX_AGE_HOURS: i64 = 72;
+
+/// How long the whole liveness-probe phase may hold up the invoice sweep.
+///
+/// The probe runs **ahead of** reconciliation and probes providers one at a
+/// time, each bounded only by the clients' own 15-second reqwest timeout — so
+/// without a ceiling the phase costs up to N×15s, and every provider claims its
+/// slot on the same tick, which resynchronizes them into one slow tick every
+/// 15 minutes rather than spreading the cost out. At one or two providers that
+/// is noise, but `unlimited_merchant_profiles` makes larger N reachable, and
+/// past roughly 60 providers the phase would exceed
+/// [`PROBE_INTERVAL`](health::PROBE_INTERVAL) and starve the invoice sweep
+/// permanently.
+///
+/// Half a `TICK` bounds it at a constant regardless of N, and leaves the other
+/// half for the reconciliation the money path actually depends on. Providers
+/// the budget cut off are simply not reached this tick; they claim their slots
+/// on a later one, which also de-synchronizes them. Money reconciliation is
+/// never delayed by more than this, whatever the operator has connected.
+const PROBE_PHASE_BUDGET: Duration = Duration::from_secs(TICK.as_secs() / 2);
 
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
@@ -40,7 +60,53 @@ pub fn spawn(state: AppState) {
     });
 }
 
-async fn tick(state: &AppState) -> anyhow::Result<()> {
+/// One reconciliation pass, on the wall clock.
+///
+/// `pub` so tests can drive it directly, matching `webhooks::tick` and
+/// `subscriptions::tick`. It was private until the liveness probe landed, and
+/// the probe is exactly the part that cannot be proven any other way: its whole
+/// purpose is to run when there is nothing else to do, so a test has to see an
+/// idle tick from the outside.
+pub async fn tick(state: &AppState) -> anyhow::Result<()> {
+    tick_at(state, SystemTime::now()).await
+}
+
+/// [`tick`] with the clock injected, for the probe throttle.
+///
+/// The throttle spans fifteen minutes, so a test that could not move the clock
+/// would have to sleep through them (`tokio`'s `full` feature excludes
+/// `test-util`, so `time::pause` is unavailable — see `payment::health`). `now`
+/// is threaded only into [`health::claim_probe_slot`]; everything else here
+/// keeps taking its own timestamps, including the health sink inside each
+/// client, which stamps the call it actually observed.
+pub async fn tick_at(state: &AppState, now: SystemTime) -> anyhow::Result<()> {
+    // FIRST, and above the early return below. On an instance between sales
+    // `list_pending_invoices` is empty, so everything past that point is
+    // skipped and the daemon makes no provider calls at all — which is the
+    // window a revoked key would otherwise survive until a buyer hit checkout.
+    // Probing here is the entire point of the step; moving this call below the
+    // early return restores that blind spot silently, so a test drives an idle
+    // tick and asserts the probe still happened.
+    //
+    // It sits in front of the money path, so it gets a hard ceiling — see
+    // PROBE_PHASE_BUDGET. Deliberately `timeout` rather than `tokio::spawn`:
+    // spawning would remove the delay entirely, but it would also make "this
+    // tick probed every due provider" stop being true when `tick` returns,
+    // and that postcondition is what makes the probe observable from a test
+    // at all. A bounded wait keeps the guarantee and caps the cost.
+    if tokio::time::timeout(PROBE_PHASE_BUDGET, probe_providers(state, now))
+        .await
+        .is_err()
+    {
+        // The unprobed providers never claimed their slots, so they are picked
+        // up by a later tick rather than skipped for a full interval.
+        tracing::warn!(
+            budget_secs = PROBE_PHASE_BUDGET.as_secs(),
+            "liveness probe phase hit its budget; remaining providers deferred \
+             to a later tick"
+        );
+    }
+
     // Provider-agnostic. Each provider's impl handles the
     // provider-specific status-string normalization (BTCPay's
     // "Settled"/"Complete"/"Expired"/"Invalid" → ProviderInvoiceStatus
@@ -158,6 +224,60 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ask every connected provider, at most once per
+/// [`PROBE_INTERVAL`](health::PROBE_INTERVAL), whether its API key still
+/// authenticates.
+///
+/// Never fails the tick. A probe is a question, and every way of failing to ask
+/// it — the provider list not reading, a row that will not build, the call
+/// erroring — is either already recorded (the client records off the HTTP
+/// status, before this function ever sees a `Result`) or is not evidence about
+/// the key at all. Aborting reconciliation over one would trade a working
+/// invoice sweep for a failed health check.
+async fn probe_providers(state: &AppState, now: SystemTime) {
+    let rows = match repo::list_all_payment_providers(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(error = %e, "liveness probe could not list payment providers");
+            return;
+        }
+    };
+
+    for row in rows {
+        // Claim before building anything: the slot is spent on the *attempt*,
+        // so a provider that cannot be built, or cannot be reached, is retried
+        // on the throttled cadence rather than on every 60-second tick.
+        if !health::claim_probe_slot(&state.provider_health, &row.id, now) {
+            continue;
+        }
+        // Uses the row already in hand rather than re-reading it, and honors
+        // the `provider_override` test seam. It never names the health map, so
+        // it cannot bind the wrong one — see the Step 2b note about main.rs.
+        let provider = match state.provider_from_row(&row) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    provider_id = %row.id,
+                    "liveness probe skipping provider — could not build it"
+                );
+                continue;
+            }
+        };
+        if let Err(e) = provider.probe_auth().await {
+            // Debug, not warn: a genuinely revoked key is reported by the
+            // health summary from the streak this call just fed, and a probe
+            // against a provider having a bad minute is not news.
+            tracing::debug!(
+                error = %e,
+                provider_id = %row.id,
+                kind = %row.kind,
+                "provider liveness probe failed"
+            );
+        }
+    }
 }
 
 async fn ensure_license(

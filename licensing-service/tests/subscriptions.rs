@@ -144,6 +144,10 @@ impl PaymentProvider for MockProvider {
     fn validate_webhook(&self, _h: &HeaderMap, _b: &[u8]) -> Result<ProviderWebhookEvent> {
         anyhow::bail!("not exercised by renewal-worker tests")
     }
+    /// No HTTP, nothing to record. The probe is covered in `tests/worker.rs`.
+    async fn probe_auth(&self) -> Result<()> {
+        Ok(())
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }

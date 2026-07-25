@@ -246,6 +246,14 @@ impl PaymentProvider for BtcpayProvider {
         Ok(PaymentReceipt { payment_hash, raw })
     }
 
+    /// `GET /api/v1/stores/{storeId}`. Deliberately un-`context`ed: the
+    /// client's own message already names BTCPay and the endpoint, and this
+    /// error is only ever logged — the signal the probe exists for was already
+    /// recorded, off the HTTP status, inside `send()`.
+    async fn probe_auth(&self) -> Result<()> {
+        self.client.probe_auth().await
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

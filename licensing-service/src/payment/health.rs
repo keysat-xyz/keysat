@@ -57,11 +57,23 @@ pub const ALERT_MIN_CONSECUTIVE_FAILURES: u32 = 3;
 /// window.
 pub const ALERT_MIN_STREAK: Duration = Duration::from_secs(10 * 60);
 
+/// How long a provider's liveness probe waits between runs.
+///
+/// The probe exists because detection is otherwise **passive**: `reconcile.rs`
+/// and `subscriptions.rs` both early-return when there is nothing to do, so an
+/// idle daemon makes zero provider calls and a revoked key stays invisible
+/// until a buyer reaches checkout — the exact moment the alert exists to
+/// pre-empt. Fifteen minutes is chosen against [`ALERT_MIN_STREAK`]: three
+/// probes span 30 minutes, so a revoked key on a completely idle instance
+/// alerts within roughly half an hour without the daemon becoming a source of
+/// traffic in its own right.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
 /// Call label reserved for the BTCPay liveness probe.
 ///
-/// The probe does not exist yet. This constant does, so that the probe is
-/// written against the classification rule instead of the rule being retrofitted
-/// to whatever string the probe happened to pass. See [`is_probe_label`].
+/// Passed explicitly by `BtcpayClient::probe_auth`, which is a **new** `&self`
+/// call (`GET /api/v1/stores/{id}`) rather than a relabeling of an existing
+/// one. See [`is_probe_label`].
 pub const BTCPAY_PROBE_LABEL: &str = "btcpay.probe_auth";
 
 /// Call label reserved for the Zaprite liveness probe.
@@ -71,11 +83,12 @@ pub const BTCPAY_PROBE_LABEL: &str = "btcpay.probe_auth";
 /// validation in `api/zaprite_authorize.rs` — and a 403 there is a real
 /// "your key cannot do this" signal that must keep counting.
 ///
-/// So the probe may reuse `ping`'s HTTP call but **not** `ping` as written:
-/// the label is hard-coded at that call site, and nothing here can bind it.
-/// The label's type is `&'static str`, so the compiler will not catch a slip
-/// either — the probe has to thread this constant through explicitly. Getting
-/// it wrong breaks the rule in **both** directions:
+/// So the probe reuses `ping`'s HTTP call but **not** `ping` as written:
+/// `ZapriteClient::ping` and `ZapriteClient::probe_auth` are two thin wrappers
+/// over one private `ping_labeled(label)`, each passing its own label. Nothing
+/// here can bind it for them — the label's type is `&'static str`, so the
+/// compiler will not catch a slip either. Getting it wrong breaks the rule in
+/// **both** directions:
 /// - every probe **403** would file under `"zaprite.ping"`, which is not a
 ///   probe label, so it would count and the daemon would alert on a key that
 ///   sells perfectly well; and
@@ -83,8 +96,9 @@ pub const BTCPAY_PROBE_LABEL: &str = "btcpay.probe_auth";
 ///   [`cannot_sell`](ProviderAuthHealth::cannot_sell) every 15 minutes,
 ///   silently reopening the exact hole the split counters exist to close.
 ///
-/// Step 3b should therefore assert end-to-end that a probe success leaves
-/// `cannot_sell` standing, not merely that the constant is passed.
+/// Both directions are asserted end-to-end by `tests/worker.rs`, driving a real
+/// client through `reconcile::tick` against a local stub, rather than merely
+/// asserting that the constant is passed.
 pub const ZAPRITE_PROBE_LABEL: &str = "zaprite.probe_auth";
 
 /// The complete set of labels treated as liveness probes.
@@ -470,6 +484,31 @@ pub struct ProviderAuthHealth {
     /// correctly, because in neither case has anything shown the permission
     /// came back.
     pub probe_403_since: Option<SystemTime>,
+    /// When the liveness probe last **ran** for this provider — the throttle
+    /// timestamp behind [`claim_probe_slot`], stamped on the attempt rather
+    /// than on its outcome.
+    ///
+    /// **This field is scheduling state, not part of the rule.** Nothing above
+    /// reads it: neither [`record_success`](Self::record_success),
+    /// [`record_failure`](Self::record_failure) nor
+    /// [`is_alerting`](Self::is_alerting) touches it, and it can never make a
+    /// provider look healthier or sicker than its two streaks say. It lives on
+    /// this struct only so it shares the entry's key, lifetime and lock with
+    /// the streaks it schedules calls for — a second map keyed the same way
+    /// would be a second thing to keep in step, for one `Option<SystemTime>`.
+    ///
+    /// It is stamped on the **attempt**, before the request is issued, so a
+    /// provider that is unreachable (transport failure, no status, nothing
+    /// recorded) is still retried at the throttled cadence rather than on every
+    /// 60-second reconcile tick.
+    ///
+    /// **Consequence for a reader, and Step 4a must know it:** an entry can now
+    /// exist because the probe was *scheduled*, not because a status was
+    /// observed, so map membership alone no longer proves the latter. The
+    /// reliable "nothing has been observed for this provider" test is
+    /// `last_status.is_none() && last_success_at.is_none()`, which is true
+    /// whether or not an entry exists.
+    pub last_probe_at: Option<SystemTime>,
 }
 
 impl ProviderAuthHealth {
@@ -582,7 +621,55 @@ impl ProviderAuthHealth {
 /// honor when it lands — stated here as the intended design, not as current
 /// behavior, so a reader written before then does not assume every key still
 /// names a live row.
+///
+/// **That prune must remove only entries whose `payment_providers` row is
+/// gone**, and the reason is now stronger than tidiness: an entry also carries
+/// [`last_probe_at`](ProviderAuthHealth::last_probe_at), so dropping a **live**
+/// provider's entry resets its probe throttle and the probe re-fires on the
+/// next 60-second reconcile tick instead of on its 15-minute cadence. Pruning
+/// as specified cannot do that, and the argument is structural rather than
+/// careful: `reconcile` enumerates live rows (`repo::list_all_payment_providers`)
+/// and only ever claims a slot for one of those, so an entry the prune is
+/// allowed to remove is by definition one the probe will never look at again.
+/// `pruning_a_dead_entry_does_not_disturb_a_live_providers_throttle` pins it.
 pub type ProviderHealthMap = Arc<RwLock<HashMap<String, ProviderAuthHealth>>>;
+
+/// Claim the right to run the liveness probe for `provider_id` at `now`.
+///
+/// Returns `true` at most once per [`PROBE_INTERVAL`] per provider, stamping
+/// [`last_probe_at`](ProviderAuthHealth::last_probe_at) as it does — a
+/// check-and-set under **one** `write()`, not a read followed by a write, so
+/// two ticks racing cannot both come back `true`.
+///
+/// Kept here rather than in `reconcile` for two reasons: the lock discipline
+/// belongs with the map it guards, and a caller-supplied `now` keeps the
+/// throttle on the same injected clock as the rule above, so a test can span
+/// fifteen minutes without sleeping for them.
+///
+/// **A backwards clock re-probes** rather than waiting the difference out. This
+/// is the opposite call from [`FailureStreak::is_alerting`], deliberately: there
+/// the cost of trusting a stepped clock is a false alert, here the cost of
+/// distrusting it is a detector wedged shut for as long as the step, and a
+/// silently disabled probe is the worse of the two. The overshoot is bounded at
+/// one extra probe per step.
+pub fn claim_probe_slot(map: &ProviderHealthMap, provider_id: &str, now: SystemTime) -> bool {
+    let mut guard = match map.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let entry = guard.entry(provider_id.to_string()).or_default();
+    let due = match entry.last_probe_at {
+        None => true,
+        Some(last) => now
+            .duration_since(last)
+            .map(|elapsed| elapsed >= PROBE_INTERVAL)
+            .unwrap_or(true),
+    };
+    if due {
+        entry.last_probe_at = Some(now);
+    }
+    due
+}
 
 /// A write handle onto [`ProviderHealthMap`], pre-bound to one provider row.
 ///
@@ -1542,6 +1629,118 @@ mod tests {
         }
 
         assert_eq!(health_of(&map, "prov-1").auth_dead.consecutive, 800);
+    }
+
+    // -----------------------------------------------------------------
+    // The probe throttle. Scheduling, not rule — but it decides whether the
+    // rule ever sees anything on an idle daemon, so it gets the same
+    // treatment.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_first_claim_succeeds_and_the_next_one_inside_the_interval_does_not() {
+        let map: ProviderHealthMap = Default::default();
+
+        assert!(claim_probe_slot(&map, "prov-1", t(0)));
+        assert_eq!(health_of(&map, "prov-1").last_probe_at, Some(t(0)));
+
+        // Every tick inside the interval is refused, and none of them moves
+        // the stamp — a claim that re-stamped on refusal would push the next
+        // probe out forever on a 60-second tick.
+        for at in [1, 60, 600, 899] {
+            assert!(!claim_probe_slot(&map, "prov-1", t(at)), "claimed at {at}");
+            assert_eq!(health_of(&map, "prov-1").last_probe_at, Some(t(0)));
+        }
+
+        // The boundary is inclusive, pinned at the second either side.
+        assert!(claim_probe_slot(&map, "prov-1", t(900)));
+        assert_eq!(health_of(&map, "prov-1").last_probe_at, Some(t(900)));
+        assert!(!claim_probe_slot(&map, "prov-1", t(1_799)));
+        assert!(claim_probe_slot(&map, "prov-1", t(1_800)));
+    }
+
+    /// One throttle per provider. A shared window would mean the second
+    /// provider on a profile was probed only when the first happened not to be.
+    #[test]
+    fn claims_are_throttled_per_provider() {
+        let map: ProviderHealthMap = Default::default();
+
+        assert!(claim_probe_slot(&map, "prov-a", t(0)));
+        assert!(
+            claim_probe_slot(&map, "prov-b", t(0)),
+            "a second provider has its own window"
+        );
+        assert!(!claim_probe_slot(&map, "prov-a", t(60)));
+        assert!(!claim_probe_slot(&map, "prov-b", t(60)));
+    }
+
+    /// The throttle must not disturb the rule it schedules for. Claiming is an
+    /// intent to call, not an observation, so neither streak may move and
+    /// nothing may read as a success.
+    #[test]
+    fn claiming_a_slot_records_no_call() {
+        let map: ProviderHealthMap = Default::default();
+        let sink = sink_for(&map, "prov-1");
+        sink.record(HOT, 401, t(0));
+        sink.record(HOT, 403, t(10));
+
+        assert!(claim_probe_slot(&map, "prov-1", t(20)));
+
+        let h = health_of(&map, "prov-1");
+        assert_eq!(h.auth_dead.consecutive, 1);
+        assert_eq!(h.cannot_sell.consecutive, 1);
+        assert_eq!(h.last_success_at, None);
+        assert_eq!(h.last_status, Some(403));
+        // ...and the converse: recording a call does not move the throttle, or
+        // a busy provider would be probed on every reconcile tick.
+        sink.record(HOT, 200, t(30));
+        assert_eq!(health_of(&map, "prov-1").last_probe_at, Some(t(20)));
+    }
+
+    /// **The prune interaction, pinned.** The health-summary endpoint is
+    /// expected to prune entries whose `payment_providers` row is gone. That
+    /// contract is safe for the throttle *because of what it removes*: a
+    /// disconnected provider is not enumerated by `reconcile`, so its entry is
+    /// one the probe will never consult. A live provider's entry — the only
+    /// kind whose loss would reset a throttle and re-fire the probe on the next
+    /// 60-second tick — is not the prune's to touch.
+    ///
+    /// The second half drives the failure directly, so the cost of getting the
+    /// prune wrong is written down rather than assumed.
+    #[test]
+    fn pruning_a_dead_entry_does_not_disturb_a_live_providers_throttle() {
+        let map: ProviderHealthMap = Default::default();
+        assert!(claim_probe_slot(&map, "live", t(0)));
+        assert!(claim_probe_slot(&map, "disconnected", t(0)));
+
+        // The prune as contracted: drop the keys with no live row.
+        let live_rows = ["live"];
+        map.write()
+            .expect("not poisoned")
+            .retain(|id, _| live_rows.contains(&id.as_str()));
+
+        assert!(
+            !claim_probe_slot(&map, "live", t(60)),
+            "the surviving provider is still throttled"
+        );
+
+        // And this is what a prune that took a live entry would cost: the
+        // throttle resets and the very next tick re-probes.
+        map.write().expect("not poisoned").remove("live");
+        assert!(claim_probe_slot(&map, "live", t(61)));
+    }
+
+    #[test]
+    fn a_backwards_clock_re_probes_rather_than_wedging_the_detector() {
+        let map: ProviderHealthMap = Default::default();
+        assert!(claim_probe_slot(&map, "prov-1", t(10_000)));
+
+        // A large backward NTP step. Waiting the difference out would leave the
+        // probe silently disabled for as long as the step; re-probing costs one
+        // extra call and re-anchors the window.
+        assert!(claim_probe_slot(&map, "prov-1", t(0)));
+        assert_eq!(health_of(&map, "prov-1").last_probe_at, Some(t(0)));
+        assert!(!claim_probe_slot(&map, "prov-1", t(60)));
     }
 
     #[test]

@@ -260,6 +260,47 @@ impl BtcpayClient {
         Ok(resp.json().await?)
     }
 
+    /// Liveness probe: does this API key still authenticate against this store?
+    ///
+    /// `GET /api/v1/stores/{storeId}` — read-only, cheap, and the only BTCPay
+    /// call whose whole point is the status code, so the response is discarded.
+    /// Driven every [`PROBE_INTERVAL`](crate::payment::health::PROBE_INTERVAL)
+    /// by `reconcile::tick`, which is what makes a revoked key visible on an
+    /// otherwise idle daemon instead of at a buyer's checkout.
+    ///
+    /// **It must be a `&self` method routed through [`send`](Self::send).** The
+    /// obvious alternative, the free `list_payment_methods` below, builds its
+    /// own reqwest client and so can never reach the health sink — the probe
+    /// would compile, run, and record nothing, on the only provider Keysat
+    /// ships against today.
+    ///
+    /// The label is [`BTCPAY_PROBE_LABEL`](crate::payment::health::BTCPAY_PROBE_LABEL)
+    /// and that is load-bearing: this endpoint needs `canviewstoresettings`,
+    /// which a checkout-only key may legitimately lack, so its 403 must be a
+    /// non-alerting permissions observation rather than a `cannot_sell` failure.
+    pub async fn probe_auth(&self) -> Result<()> {
+        let url = format!("{}/api/v1/stores/{}", self.base_url, self.store_id);
+        let resp = self
+            .send(
+                self.http
+                    .get(&url)
+                    .header("Authorization", format!("token {}", self.api_key)),
+                crate::payment::health::BTCPAY_PROBE_LABEL,
+                Some("calling BTCPay get-store"),
+                BodyRead::LossyOnError,
+                |status, text| format!("BTCPay get-store returned {status}: {text}"),
+            )
+            .await?;
+        // The probe wants the status, not the store — but a `Response` dropped
+        // with its body unread leaves the connection un-poolable, so the next
+        // probe pays a fresh TCP+TLS handshake. Draining it costs nothing here
+        // (a store record is small) and the outcome was already recorded off
+        // the status inside `send`, so a read failure is not a signal and is
+        // deliberately ignored.
+        let _ = resp.bytes().await;
+        Ok(())
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

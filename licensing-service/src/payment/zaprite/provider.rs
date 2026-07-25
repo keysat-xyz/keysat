@@ -396,6 +396,13 @@ impl PaymentProvider for ZapriteProvider {
         )
     }
 
+    /// `GET /v1/orders?limit=1`, via the client's `probe_auth` — **not** its
+    /// `ping`. The two issue the same request and differ only in the label they
+    /// hand the health sink, and the compiler cannot tell them apart.
+    async fn probe_auth(&self) -> Result<()> {
+        self.client.probe_auth().await
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

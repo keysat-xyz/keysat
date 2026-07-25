@@ -382,6 +382,31 @@ pub trait PaymentProvider: Send + Sync + Any {
         )
     }
 
+    /// Liveness probe: make one cheap, authenticated, read-only call so the
+    /// daemon learns whether this provider's API key still works.
+    ///
+    /// Driven by `reconcile::tick` on a
+    /// [`PROBE_INTERVAL`](health::PROBE_INTERVAL) throttle, because detection is
+    /// otherwise entirely passive: `reconcile` and `subscriptions` both
+    /// early-return when idle, so an instance between sales makes zero provider
+    /// calls and a revoked key stays invisible until a buyer reaches checkout.
+    ///
+    /// The result is only ever *observed* — `Ok(())` versus an error is not
+    /// itself the signal. What matters is that the call reached the client's
+    /// `send()`, which recorded the HTTP status against the provider's entry in
+    /// [`health::ProviderHealthMap`] under that call's **probe label**, which is
+    /// how a 403 here (a permission the sell path does not need) is kept out of
+    /// the `cannot_sell` streak.
+    ///
+    /// **Deliberately no default body.** A defaulted trait method is the
+    /// `pay_lightning_invoice` trap one line above: under an earlier design its
+    /// `bail!`ing default recorded every Lightning tip as a provider failure. A
+    /// defaulted probe would be quieter and worse — a provider that forgot to
+    /// implement it would report healthy forever, which is precisely the state
+    /// this whole feature exists to detect. Requiring the method makes a new
+    /// provider decide, at compile time, how it answers.
+    async fn probe_auth(&self) -> Result<()>;
+
     /// Hatch for compat-era downcasting. Lets `AppState`'s legacy
     /// `btcpay_client()` accessor reach the inner BTCPay-specific
     /// client. v0.3 will retire the compat accessors and remove this.

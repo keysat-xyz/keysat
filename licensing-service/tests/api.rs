@@ -782,6 +782,15 @@ impl PaymentProvider for MockPaymentProvider {
         })
     }
 
+    /// The mock never issues an HTTP request, so it has no API key to prove
+    /// anything about and records nothing. `Ok(())` keeps `reconcile::tick`
+    /// quiet for any test that drives it through the `provider_override` seam;
+    /// the probe's real behavior is covered in `tests/worker.rs`, against a
+    /// real client and a local stub.
+    async fn probe_auth(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -315,11 +315,47 @@ impl ZapriteClient {
     /// Smoke test for Connect-flow validation. Pings `GET /v1/orders`
     /// (the list endpoint) — auth-guarded, so a 200 confirms the
     /// API key works against the right org.
+    ///
+    /// Labelled `"zaprite.ping"`, which is **not** a probe label: this is the
+    /// operator standing at the Connect screen, where a 403 is a genuine "your
+    /// key cannot do this" and must keep counting. The liveness probe is
+    /// [`probe_auth`](Self::probe_auth), same HTTP call, different label.
     pub async fn ping(&self) -> Result<()> {
+        self.ping_labeled("zaprite.ping").await
+    }
+
+    /// Liveness probe: does this API key still authenticate?
+    ///
+    /// The same authenticated, read-only `GET /v1/orders?limit=1` as
+    /// [`ping`](Self::ping) — Zaprite has no cheaper "who am I" endpoint and
+    /// this one is already proven — carrying
+    /// [`ZAPRITE_PROBE_LABEL`](crate::payment::health::ZAPRITE_PROBE_LABEL)
+    /// instead.
+    ///
+    /// **The label is the entire difference, and it is invisible to the
+    /// compiler** (both are `&'static str`). Calling `ping()` here instead
+    /// would file every probe 403 under a counting label — alerting on a key
+    /// that sells perfectly — and every probe success as a Connect-time
+    /// success. Hence the shared body sits behind `ping_labeled` and neither
+    /// wrapper can drift onto the other's label.
+    pub async fn probe_auth(&self) -> Result<()> {
+        self.ping_labeled(crate::payment::health::ZAPRITE_PROBE_LABEL)
+            .await
+    }
+
+    /// The shared body of [`ping`](Self::ping) and
+    /// [`probe_auth`](Self::probe_auth).
+    ///
+    /// The operator-facing message deliberately does **not** vary with the
+    /// label: it is one HTTP call, the wording is what a reader sees in the
+    /// logs, and `ping`'s shape is pinned by a message test from Step 1. The
+    /// label alone carries the classification, and it carries it to the health
+    /// sink rather than to a human.
+    async fn ping_labeled(&self, label: &'static str) -> Result<()> {
         let url = format!("{}/v1/orders?limit=1", self.base_url);
         self.send(
             self.http.get(&url).headers(self.auth_headers()?),
-            "zaprite.ping",
+            label,
             "Zaprite ping request",
             // The only site that does not read the body on success, and reads
             // it lossily on failure.

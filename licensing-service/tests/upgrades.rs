@@ -780,6 +780,10 @@ async fn renewal_worker_applies_pending_tier_change_before_billing() {
         ) -> anyhow::Result<ProviderWebhookEvent> {
             anyhow::bail!("not exercised")
         }
+        /// No HTTP, nothing to record. The probe is covered in `tests/worker.rs`.
+        async fn probe_auth(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn as_any(&self) -> &dyn Any {
             self
         }
