@@ -5366,6 +5366,42 @@ fn provider_in(body: &Value, id: &str) -> Value {
         .clone()
 }
 
+/// Does the machine running these tests have a Keysat license of its own?
+///
+/// Both sources are outside this repo — a process-global environment variable
+/// and a file under `/data` — so a test that asserts what the self-license
+/// condition *says* has to skip when either is present, or it reports the
+/// environment as a code failure.
+fn host_has_a_self_license() -> bool {
+    std::env::var("KEYSAT_LICENSE").is_ok_and(|v| !v.trim().is_empty())
+        || std::path::Path::new(keysat::license_self::SELF_LICENSE_PATH).exists()
+}
+
+/// Assert the summary's **overall** status, tolerating a host that has a Keysat
+/// license of its own installed.
+///
+/// The self-license condition reads `KEYSAT_LICENSE` and
+/// `/data/keysat-license.txt` — a process-global variable and a file outside
+/// this repo — and it participates in the roll-up. On the one kind of machine
+/// that has either (the master instance), a self-license verdict of `warn` or
+/// `critical` would fail every overall-status assertion in this file for a
+/// reason that has nothing to do with what the test is about. Skip the roll-up
+/// assertion there and say so; the per-condition assertions around it, which
+/// are what each test actually exists for, still run.
+fn assert_overall(body: &Value, expected: &str) {
+    let self_license = body["conditions"]["self_license"]["status"]
+        .as_str()
+        .expect("every summary carries a self_license condition");
+    if self_license != "ok" {
+        eprintln!(
+            "skipping the overall-status assertion: this host's own Keysat license reports \
+             {self_license}, which legitimately raises the roll-up"
+        );
+        return;
+    }
+    assert_eq!(body["status"], json!(expected), "overall status");
+}
+
 async fn get_health_summary(state: &AppState) -> Value {
     let auth = format!("Bearer {}", TEST_ADMIN_KEY);
     let req = build_request(
@@ -5514,7 +5550,7 @@ async fn health_summary_dead_letter_aggregates_execute_and_classify() {
     // A lost webhook is the operator's integration failing, not Keysat being
     // unable to take money — yellow, never red.
     assert_eq!(dl["status"], json!("warn"));
-    assert_eq!(body["status"], json!("warn"));
+    assert_overall(&body, "warn");
     assert!(
         dl["message"].as_str().expect("a message when alerting").contains("3 webhook deliveries"),
         "got {:?}",
@@ -5538,7 +5574,7 @@ async fn health_summary_is_ok_when_nothing_is_wrong() {
 
     let body = get_health_summary(&state).await;
 
-    assert_eq!(body["status"], json!("ok"));
+    assert_overall(&body, "ok");
     let dl = &body["conditions"]["webhook_dead_letters"];
     assert_eq!(dl["status"], json!("ok"));
     assert_eq!(dl["alerting_count"], json!(0));
@@ -5553,6 +5589,66 @@ async fn health_summary_is_ok_when_nothing_is_wrong() {
     assert_eq!(pp["count"], json!(0));
     assert_eq!(pp["alerting_count"], json!(0));
     assert_eq!(pp["providers"], json!([]));
+}
+
+/// The self-license condition is present, complete, and does not raise the
+/// summary's overall status when this daemon has no license of its own.
+///
+/// A test daemon has no key at `SELF_LICENSE_PATH` and no `KEYSAT_LICENSE`, so
+/// what it reports here is the `unlicensed` row of the decision table — which
+/// is also the most common state in the field, because the free Creator tier is
+/// a legitimate configuration rather than a fault. Every other row needs a key
+/// signed by the master private half, which exists on one machine and not in
+/// this repo; they are covered against the pure `license_self::classify` in the
+/// unit tests, and the `critical` path is driven end-to-end through this
+/// endpoint in `tests/self_license_health.rs` (its own binary, because getting
+/// there means setting a process-global env var).
+///
+/// The fields asserted here are the ones the Step 5 admin card binds to.
+#[tokio::test]
+async fn health_summary_reports_the_self_license_condition() {
+    if host_has_a_self_license() {
+        eprintln!("skipping: this host has a Keysat self-license, so the verdict is not `unlicensed`");
+        return;
+    }
+    let (state, _tmp) = make_test_state().await;
+
+    let body = get_health_summary(&state).await;
+    let sl = &body["conditions"]["self_license"];
+
+    assert_eq!(sl["status"], json!("ok"));
+    assert_eq!(
+        sl["code"],
+        json!("unlicensed"),
+        "no key on disk and none in the env is `unlicensed`, not a failure to verify"
+    );
+    assert_eq!(
+        sl["alerting"], json!(false),
+        "running the free Creator tier must never colour the card"
+    );
+    assert_eq!(sl["expires_at"], Value::Null);
+    assert_eq!(sl["row_present"], json!(false));
+    assert!(
+        sl["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "detail carries what the tier is actually doing; got {:?}",
+        sl["detail"]
+    );
+    assert!(
+        sl["message"].as_str().is_some_and(|m| !m.trim().is_empty()),
+        "the missing key should be named rather than left as a bare green tick; got {:?}",
+        sl["message"]
+    );
+    assert_eq!(
+        sl["exact"], json!(false),
+        "every verdict here is local-only, so the note must be rendered with the message"
+    );
+    assert!(
+        sl["note"].as_str().is_some_and(|n| n.contains("Activate Keysat license")),
+        "the note carries the remedy for a stale tier; got {:?}",
+        sl["note"]
+    );
+
+    assert_overall(&body, "ok");
 }
 
 /// The writer and the reader share `DISABLED_ENDPOINT_ERROR` and cannot drift.
@@ -5695,7 +5791,7 @@ async fn health_summary_reports_each_provider_streak_independently() {
         pp["message"]
     );
     assert_eq!(pp["status"], json!("critical"));
-    assert_eq!(body["status"], json!("critical"));
+    assert_overall(&body, "critical");
 
     // --- Authentication failing. ---
     let auth = provider_in(&body, &p_auth);
@@ -5850,7 +5946,7 @@ async fn health_summary_does_not_alert_on_a_young_streak() {
     assert_eq!(p["auth_dead"]["alerting"], json!(false), "...but not yet alerting");
     assert_eq!(p["auth_dead"]["message"], Value::Null);
     assert_eq!(p["status"], json!("ok"));
-    assert_eq!(body["status"], json!("ok"));
+    assert_overall(&body, "ok");
 }
 
 /// Reading the summary prunes health entries whose `payment_providers` row is
@@ -5898,7 +5994,7 @@ async fn health_summary_prunes_only_orphaned_provider_entries() {
         body["conditions"]["payment_providers"]["alerting_count"], json!(0),
         "the orphan's matured streak must not leak into the verdict"
     );
-    assert_eq!(body["status"], json!("ok"));
+    assert_overall(&body, "ok");
     provider_in(&body, &live);
 
     let map = state.provider_health.read().expect("health map");
@@ -5955,7 +6051,7 @@ async fn health_summary_never_alerts_on_a_bad_hmac_key_dead_letter() {
         "excluded from the alert, but NOT invisible — it has its own counter"
     );
     assert_eq!(dl["status"], json!("ok"));
-    assert_eq!(body["status"], json!("ok"));
+    assert_overall(&body, "ok");
 }
 
 /// A panicking task poisons the health map, and every reader recovers.
@@ -6002,7 +6098,7 @@ async fn a_poisoned_health_map_does_not_take_down_the_alert_surface() {
 
     // Site 1 — the endpoint's prune. Still 200, still correct.
     let body = get_health_summary(&state).await;
-    assert_eq!(body["status"], json!("ok"));
+    assert_overall(&body, "ok");
     assert_eq!(body["conditions"]["payment_providers"]["count"], json!(1));
     let p = provider_in(&body, &id);
     assert_eq!(p["stale"], json!(false), "the entry survived the poisoning intact");

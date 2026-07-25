@@ -4,7 +4,9 @@
 //! would normally report the failure is the thing that broke. If the operator's
 //! webhook receiver dies, Keysat's webhooks cannot report it. If the BTCPay or
 //! Zaprite API key is revoked or de-scoped, nothing notices until a buyer
-//! reaches checkout and cannot pay. This endpoint is the one place those
+//! reaches checkout and cannot pay. If the daemon's own Keysat license expires
+//! or is revoked, it drops to the free Creator tier with a caps change and a
+//! log line nobody reads. This endpoint is the one place those
 //! self-observations are collected and given a verdict.
 //!
 //! Shaped like [`super::db_info`] deliberately — `require_admin`, plain
@@ -20,7 +22,8 @@
 //!   "generated_at": "<rfc3339>",
 //!   "conditions": {
 //!     "webhook_dead_letters": { "status": …, … },
-//!     "payment_providers":    { "status": …, "providers": [ … ] }
+//!     "payment_providers":    { "status": …, "providers": [ … ] },
+//!     "self_license":         { "status": …, "code": …, … }
 //!   }
 //! }
 //! ```
@@ -31,7 +34,7 @@
 //!
 //! # What each condition can and cannot tell you
 //!
-//! Both conditions are honest about their own imprecision, in the payload
+//! Every condition is honest about its own imprecision, in the payload
 //! rather than only in this comment, because the consumer that renders them
 //! (the admin SPA card, and eventually the StartOS health check) will not be
 //! reading this file. Every condition carries a `note` describing what the
@@ -54,6 +57,7 @@ use crate::api::admin::require_admin;
 use crate::api::AppState;
 use crate::db::repo;
 use crate::error::AppResult;
+use crate::license_self::{self, SelfLicenseCode, SelfLicenseSeverity, SelfLicenseVerdict};
 use crate::payment::health::{FailureStreak, ProviderAuthHealth};
 use crate::webhooks::{BAD_HMAC_KEY_ERROR_PREFIX, DISABLED_ENDPOINT_ERROR};
 use axum::{extract::State, http::HeaderMap, Json};
@@ -159,6 +163,77 @@ const DEAD_LETTER_NOTE: &str = "Counts webhook deliveries that exhausted their r
      reclassifies a genuinely failing delivery as informational. It can only shrink the alerting \
      set, never grow it, which is why this set is deliberately narrower than the admin delivery \
      list's status=failed filter.";
+
+/// Per-code wording for the self-license condition.
+///
+/// One `match` rather than a table of pairs, so adding a
+/// [`SelfLicenseCode`] fails to compile until it has been given something to
+/// say. `None` only for the plainly-healthy case.
+///
+/// Two rules are encoded in these strings rather than only in a comment:
+///
+/// 1. **`unlicensed` gets a message even though it never alerts**, and that
+///    message says only that no key is installed. It must not go on to say
+///    which tier the daemon is therefore running: `refresh_self_tier_from_db`
+///    *keeps* a `Licensed` tier when the key source disappears (offline grace),
+///    so a daemon whose key file was wiped is reported here as `unlicensed`
+///    while `GET /v1/admin/self-license` still reports `licensed`. A card
+///    asserting the free tier from this code would contradict that endpoint,
+///    which is the exact silent-failure class this whole endpoint exists to
+///    end. What the tier is doing goes in `detail`, where `classify` reads it.
+///    `status` is `ok` and `alerting` is `false`, so nothing mistakes it for a
+///    fault.
+/// 2. **`stale_tier`'s remedy is the activate action or a restart, and never
+///    the refresh action.** `refresh_self_tier_from_db` returns immediately
+///    when the current tier is already `Unlicensed`, so
+///    `POST /v1/admin/self-license/refresh` is a provable no-op from exactly
+///    the state this code reports. Sending an operator there would be a dead
+///    end that looks like a fix.
+fn self_license_message(code: SelfLicenseCode) -> Option<&'static str> {
+    match code {
+        SelfLicenseCode::Ok => None,
+        SelfLicenseCode::Unlicensed => Some("no Keysat license key is installed"),
+        SelfLicenseCode::SignatureInvalid => Some(
+            "the installed Keysat license does not verify — this daemon is running the free \
+             Creator tier",
+        ),
+        SelfLicenseCode::Revoked => {
+            Some("this daemon's own Keysat license is recorded as revoked")
+        }
+        SelfLicenseCode::Suspended => {
+            Some("this daemon's own Keysat license is recorded as suspended")
+        }
+        SelfLicenseCode::Expired => Some(
+            "this daemon's own Keysat license has expired — it is running the free Creator tier \
+             until a current license is activated",
+        ),
+        SelfLicenseCode::ExpiringSoon => Some(
+            "this daemon's own Keysat license expires within 14 days — renew it before it lapses \
+             to the free Creator tier",
+        ),
+        SelfLicenseCode::StaleTier => Some(
+            "a valid Keysat license is installed but this daemon is still running the free \
+             Creator tier — run the \"Activate Keysat license\" action, or restart the daemon",
+        ),
+    }
+}
+
+const SELF_LICENSE_NOTE: &str = "Read from three local sources and nothing else: the signed key \
+     (KEYSAT_LICENSE if set, otherwise /data/keysat-license.txt), the local licenses row for that \
+     key's license_id, and the tier this daemon is actually applying. The issuer is never \
+     contacted, so ok cannot prove a license has not been revoked or shortened upstream — and a \
+     daemon licensed by someone else's Keysat legitimately holds only the key, with no local row \
+     at all, which is reported as ok. Both expiry verdicts are measured against this daemon's own \
+     clock. expires_at is the EARLIER of the key's own expiry and the row's, because an issuer can \
+     shorten a license by editing the row and the key cannot see that. unlicensed means no key is \
+     installed and never alerts, because running the free Creator tier is a legitimate \
+     configuration rather than a fault; it does not by itself mean the daemon is on that tier, \
+     since a tier loaded before the key went missing is kept until the next restart — read detail \
+     for which of the two this is. stale_tier means a good key is installed while the daemon still \
+     runs the free tier — the fix is the \"Activate Keysat license\" action or a daemon restart. \
+     The \"Refresh self-license tier\" action provably cannot fix it: that refresh returns \
+     immediately when the current tier is already Unlicensed, which is the state stale_tier \
+     reports.";
 
 /// Overall verdict for the summary and for each condition in it.
 ///
@@ -297,6 +372,68 @@ fn provider_json(row: &repo::PaymentProviderRow, health: &ProviderAuthHealth, no
             },
             "last_probe_at": ts(health.last_probe_at),
             "stale": stale,
+        }),
+    )
+}
+
+/// Unix seconds as RFC-3339, or JSON `null`.
+///
+/// Separate from [`ts`] because the self-license half counts in unix seconds
+/// throughout — the signed key's `expires_at` is an `i64` and the row's is
+/// RFC-3339 TEXT, and `license_self` reconciles them to one unit before this
+/// sees either.
+fn ts_unix(t: Option<i64>) -> Value {
+    match t.and_then(|secs| DateTime::from_timestamp(secs, 0)) {
+        Some(d) => json!(d.to_rfc3339()),
+        None => Value::Null,
+    }
+}
+
+/// The self-license condition as JSON, plus its status.
+///
+/// # `exact`
+///
+/// **`false`, and unconditionally so** — the same contract as the streaks: the
+/// `message` overclaims when read alone, so a renderer must show `note` with
+/// it. Two independent reasons, either of which would be enough:
+///
+/// - **Everything here is local.** `revoked`, `suspended` and any row-shortened
+///   expiry are read from this daemon's own `licenses` row, and the issuer is
+///   never contacted. A daemon licensed elsewhere has no row at all — the
+///   documented normal shape downstream — so on that daemon those three
+///   verdicts cannot fire, and its `ok` means "nothing visible from here".
+/// - **Both expiry verdicts are relative to this box's clock**, which nothing
+///   in the daemon guarantees.
+///
+/// It is a property of the condition rather than of its state, so a card can
+/// branch on it once and not per-code.
+fn self_license_json(verdict: &SelfLicenseVerdict) -> (Status, Value) {
+    let status = match verdict.severity() {
+        SelfLicenseSeverity::Ok => Status::Ok,
+        SelfLicenseSeverity::Warn => Status::Warn,
+        SelfLicenseSeverity::Critical => Status::Critical,
+    };
+    (
+        status,
+        json!({
+            "status": status.as_str(),
+            // The machine-readable verdict. `status` alone cannot distinguish
+            // "no license installed, which is fine" from "licensed and
+            // healthy", and those want different words on a card.
+            "code": verdict.code.as_str(),
+            // Stated in the payload rather than left to be inferred from
+            // `status`, for the same reason the permissions observation states
+            // it: `unlicensed` is an `ok` with something to say, and a
+            // consumer must not colour the card from the presence of a message.
+            "alerting": status != Status::Ok,
+            // EFFECTIVE expiry — the earlier of the key's and the row's.
+            "expires_at": ts_unix(verdict.effective_expiry),
+            // Not a fault when false; see the note.
+            "row_present": verdict.row_present,
+            "detail": verdict.detail.as_deref().map(Value::from).unwrap_or(Value::Null),
+            "message": self_license_message(verdict.code).map(Value::from).unwrap_or(Value::Null),
+            "exact": false,
+            "note": SELF_LICENSE_NOTE,
         }),
     )
 }
@@ -449,7 +586,25 @@ pub async fn get(State(state): State<AppState>, headers: HeaderMap) -> AppResult
         Value::Null
     };
 
-    let overall = [dead_letter_status, provider_status]
+    // ---------------------------------------------------------------
+    // Condition: this daemon's own Keysat license.
+    //
+    // Reads the key from disk, the local `licenses` row, and the tier actually
+    // in force, then judges them in `license_self::classify` — a pure function
+    // living next to the tier logic it has to agree with, rather than here.
+    // The file read is blocking, and deliberately so: it is a single small
+    // local file and `refresh_self_tier_from_db` already reads it the same way
+    // from async contexts, including the hourly refresher.
+    //
+    // `self_tier` is cloned out from under its lock before the await, not held
+    // across it.
+    // ---------------------------------------------------------------
+    let self_tier = state.self_tier.read().await.clone();
+    let verdict =
+        license_self::observe_self_license(&state.db, &self_tier, generated_at.timestamp()).await?;
+    let (self_license_status, self_license) = self_license_json(&verdict);
+
+    let overall = [dead_letter_status, provider_status, self_license_status]
         .into_iter()
         .max()
         .unwrap_or(Status::Ok);
@@ -479,6 +634,255 @@ pub async fn get(State(state): State<AppState>, headers: HeaderMap) -> AppResult
                 "message": provider_message,
                 "providers": providers,
             },
+            "self_license": self_license,
         },
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::license_self::{classify, KeyState, Tier};
+
+    /// Judge a verified, unexpired key against a running tier that has not
+    /// picked it up — the `stale_tier` state, built through the real
+    /// `classify` so the wording is bound to a verdict the daemon can actually
+    /// produce.
+    fn stale_tier_verdict() -> SelfLicenseVerdict {
+        let verdict = classify(
+            &KeyState::Verified {
+                expires_at: 0,
+                license_id: uuid::Uuid::nil(),
+            },
+            None,
+            &Tier::Unlicensed {
+                reason: "boot: no license".into(),
+            },
+            1_800_000_000,
+        );
+        assert_eq!(verdict.code, SelfLicenseCode::StaleTier);
+        verdict
+    }
+
+    /// The remedy an earlier draft of this endpoint got wrong.
+    ///
+    /// `refresh_self_tier_from_db` returns immediately when the current tier
+    /// is already `Unlicensed`, so the "Refresh self-license tier" action
+    /// cannot move a daemon out of exactly the state `stale_tier` reports.
+    /// Sending an operator there is a dead end that looks like a fix, so the
+    /// message names the two things that do work and the note explains why the
+    /// obvious third one does not.
+    #[test]
+    fn the_stale_tier_remedy_is_activate_or_restart_and_never_the_refresh_action() {
+        let (_, value) = self_license_json(&stale_tier_verdict());
+        let message = value["message"].as_str().expect("stale_tier has a message");
+
+        assert!(
+            message.contains("Activate Keysat license"),
+            "the message must name the action that works; got {message:?}"
+        );
+        assert!(
+            message.contains("restart"),
+            "restarting is the other remedy; got {message:?}"
+        );
+        assert!(
+            !message.to_lowercase().contains("refresh"),
+            "the refresh action is a no-op from this state and must not be offered as the \
+             remedy; got {message:?}"
+        );
+        assert!(
+            SELF_LICENSE_NOTE.contains("Refresh self-license tier")
+                && SELF_LICENSE_NOTE.contains("cannot fix it"),
+            "the note must say outright that the refresh action cannot fix this, or an \
+             operator will reach for it anyway"
+        );
+    }
+
+    /// `unlicensed` is an `ok` that still has something to say.
+    ///
+    /// It must never colour the card, and it must never raise the summary's
+    /// overall status — an operator who never bought Keysat is not having an
+    /// incident.
+    #[test]
+    fn unlicensed_is_ok_and_never_alerts_but_still_speaks() {
+        let verdict = classify(
+            &KeyState::Absent,
+            None,
+            &Tier::Unlicensed {
+                reason: "no license file".into(),
+            },
+            1_800_000_000,
+        );
+        let (status, value) = self_license_json(&verdict);
+
+        assert_eq!(status, Status::Ok);
+        assert_eq!(value["status"], json!("ok"));
+        assert_eq!(value["code"], json!("unlicensed"));
+        assert_eq!(value["alerting"], json!(false));
+        assert!(
+            value["message"].as_str().is_some_and(|m| !m.trim().is_empty()),
+            "an operator should see the missing key named, not a bare green tick"
+        );
+        assert_eq!(value["expires_at"], Value::Null);
+        assert_eq!(value["row_present"], json!(false));
+    }
+
+    /// The `unlicensed` message must not name a tier, because it cannot know
+    /// one.
+    ///
+    /// `refresh_self_tier_from_db` *keeps* a `Licensed` tier when the key
+    /// source disappears — deliberate offline grace, with its own warn log. So
+    /// a daemon whose key file was wiped reports `unlicensed` here while
+    /// `GET /v1/admin/self-license` still reports `licensed`, and a message
+    /// that added "— running the free Creator tier" would put two admin
+    /// surfaces in flat contradiction. Which of the two states it is belongs in
+    /// `detail`, which can actually see the tier.
+    #[test]
+    fn the_unlicensed_message_does_not_assert_a_tier_it_cannot_know() {
+        let licensed = Tier::Licensed {
+            license_id: uuid::Uuid::nil(),
+            product_id: uuid::Uuid::nil(),
+            expires_at: 0,
+            entitlements: Vec::new(),
+        };
+        let creator = Tier::Unlicensed {
+            reason: "no license at boot".into(),
+        };
+
+        let (grace_status, grace) =
+            self_license_json(&classify(&KeyState::Absent, None, &licensed, 1_800_000_000));
+        let (_, plain) =
+            self_license_json(&classify(&KeyState::Absent, None, &creator, 1_800_000_000));
+
+        // Same code and the same message either way — it says only what it
+        // observed, which is that no key is installed.
+        assert_eq!(grace["code"], json!("unlicensed"));
+        assert_eq!(grace["message"], plain["message"]);
+        assert_eq!(
+            grace_status,
+            Status::Ok,
+            "still never an alert; this is about not asserting something false"
+        );
+        let message = grace["message"].as_str().expect("a message");
+        assert!(
+            !message.to_lowercase().contains("creator")
+                && !message.to_lowercase().contains("tier"),
+            "the message must not name a tier; got {message:?}"
+        );
+
+        // `detail` is where the difference lives, and it is a real difference.
+        assert_ne!(grace["detail"], plain["detail"]);
+        assert!(
+            grace["detail"].as_str().is_some_and(|d| d.contains("restart")),
+            "a daemon running on offline grace should be told the tier survives only \
+             until the next restart; got {:?}",
+            grace["detail"]
+        );
+    }
+
+    /// A key that does not verify is `critical`, and `alerting` says so.
+    #[test]
+    fn an_unverifiable_key_is_a_critical_alerting_condition() {
+        let verdict = classify(
+            &KeyState::Invalid {
+                reason: "license key parse failed: bad prefix".into(),
+            },
+            None,
+            &Tier::Unlicensed {
+                reason: "verification failed".into(),
+            },
+            1_800_000_000,
+        );
+        let (status, value) = self_license_json(&verdict);
+
+        assert_eq!(status, Status::Critical);
+        assert_eq!(value["code"], json!("signature_invalid"));
+        assert_eq!(value["alerting"], json!(true));
+        assert_eq!(
+            value["detail"],
+            json!("license key parse failed: bad prefix"),
+            "the underlying failure is what tells the operator which key to replace"
+        );
+    }
+
+    /// The effective expiry is rendered, and rendered as an instant.
+    ///
+    /// `license_self` reconciles the key's unix `i64` and the row's RFC-3339
+    /// TEXT into one unit; this is the other end of that, and it is the only
+    /// place the conversion back out is exercised. A `null` here would leave
+    /// the card showing "expires within 14 days" with no date on it.
+    #[test]
+    fn the_effective_expiry_is_rendered_as_an_rfc3339_instant() {
+        let now = 1_800_000_000;
+        let expiry = now + 3 * 24 * 60 * 60;
+        let verdict = classify(
+            &KeyState::Verified {
+                expires_at: expiry,
+                license_id: uuid::Uuid::nil(),
+            },
+            None,
+            &Tier::Licensed {
+                license_id: uuid::Uuid::nil(),
+                product_id: uuid::Uuid::nil(),
+                expires_at: expiry,
+                entitlements: Vec::new(),
+            },
+            now,
+        );
+        assert_eq!(verdict.code, SelfLicenseCode::ExpiringSoon);
+
+        let (status, value) = self_license_json(&verdict);
+        assert_eq!(status, Status::Warn);
+        assert_eq!(
+            value["expires_at"],
+            json!(DateTime::from_timestamp(expiry, 0)
+                .expect("in-range")
+                .to_rfc3339())
+        );
+    }
+
+    /// Every code has wording, and only the plainly-healthy one is silent.
+    ///
+    /// The map is a `match`, so a new code cannot compile without an answer
+    /// here — but a new code answered with `None` would ship a condition that
+    /// goes unhappy and says nothing. This is what catches that.
+    #[test]
+    fn every_code_but_ok_has_something_to_say() {
+        for code in [
+            SelfLicenseCode::Unlicensed,
+            SelfLicenseCode::SignatureInvalid,
+            SelfLicenseCode::Revoked,
+            SelfLicenseCode::Suspended,
+            SelfLicenseCode::Expired,
+            SelfLicenseCode::ExpiringSoon,
+            SelfLicenseCode::StaleTier,
+        ] {
+            let message = self_license_message(code)
+                .unwrap_or_else(|| panic!("{} has no message", code.as_str()));
+            assert!(!message.trim().is_empty(), "{} has an empty message", code.as_str());
+        }
+        assert_eq!(self_license_message(SelfLicenseCode::Ok), None);
+    }
+
+    /// No wording on this condition may claim a key was revoked by the issuer
+    /// on evidence this daemon does not have.
+    ///
+    /// `revoked` and `suspended` are read from the LOCAL `licenses` row, which
+    /// a downstream daemon may not have at all, so both say "recorded as"
+    /// rather than asserting the issuer's action as fact.
+    #[test]
+    fn the_revoked_and_suspended_wording_stays_inside_what_a_local_row_proves() {
+        for (code, word) in [
+            (SelfLicenseCode::Revoked, "revoked"),
+            (SelfLicenseCode::Suspended, "suspended"),
+        ] {
+            let message = self_license_message(code).expect("has a message");
+            assert!(
+                message.contains(&format!("recorded as {word}")),
+                "{} must report what the local row records, not assert the issuer's action; \
+                 got {message:?}",
+                code.as_str()
+            );
+        }
+    }
 }
