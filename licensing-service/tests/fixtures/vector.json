@@ -1,0 +1,54 @@
+{
+  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=\n-----END PUBLIC KEY-----\n",
+  "v1": {
+    "licenseKey": "LIC1-AEAW6RVE6YGS6SRIW2VD5D57N4UPAEIRCEISEIRTGNCEIVKVKVKVKVIAAAAAAZKT6EANGRDB75RRODPGGO22UJISZYXBLLASBMODEWWNVWTHYAXFSS5DWPI-FV56FI7ZTB5GIFQHIPQ35QVVE5AO5FQGVQS45UJ5F632MLXS7VHMHYVLZWGE64FJOEXD2PVIFNE5XGRMTNOUOVEKDTW736743W25MAY",
+    "expected": {
+      "version": 1,
+      "productUuid": "6f46a4f6-0d2f-4a28-b6aa-3e8fbf6f28f0",
+      "licenseUuid": "11111111-2222-3333-4444-555555555555",
+      "issuedAt": 1700000000,
+      "expiresAt": 0,
+      "flags": 1,
+      "isFingerprintBound": true,
+      "isTrial": false,
+      "entitlements": [],
+      "fingerprintRaw": "test-machine-fingerprint",
+      "fingerprintHashHex": "d34461ff63170de633b5aa2512ce2e15ac120b1c325acdada67c02e594ba3b3d"
+    }
+  },
+  "v2": {
+    "licenseKey": "LIC1-AIBW6RVE6YGS6SRIW2VD5D57N4UPBKVKVKVLXO6MZTO533XO53XO53QAAAAAAZKT6EAAAAAAABYT7MYA2NCGD73DC4G6MM5VVISRFTROCWWBECY4GJNM3LNGPQBOLFF2HM6QEA3QOJXQY3LVNR2GSLLEMV3GSY3F-QPSJIDYL6Y5TFCKXQ2SN43EDJIZIRJZCEROM2I4MJHODT6KO4KDPW6AJ3HMYJERYPD34CF2Z46PXPYFKSRZS7BDZKVKWE57UBJSTEBI",
+    "expected": {
+      "version": 2,
+      "productUuid": "6f46a4f6-0d2f-4a28-b6aa-3e8fbf6f28f0",
+      "licenseUuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "issuedAt": 1700000000,
+      "expiresAt": 1900000000,
+      "flags": 3,
+      "isFingerprintBound": true,
+      "isTrial": true,
+      "entitlements": [
+        "pro",
+        "multi-device"
+      ],
+      "fingerprintRaw": "test-machine-fingerprint",
+      "fingerprintHashHex": "d34461ff63170de633b5aa2512ce2e15ac120b1c325acdada67c02e594ba3b3d"
+    }
+  },
+  "v2_perpetual_unbound": {
+    "licenseKey": "LIC1-AIAG6RVE6YGS6SRIW2VD5D57N4UPBKVKVKVLXO6MZTO533XO53XO53QAAAAAAZKT6EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-E4IT25ES5NBBQAXVAMZPLBDB5P2ILZL4RGKYUWEWLME5ZVGM7HGBG5CP3XHWBQ5FCYPEC6YGKBHCTQ7M7RZP7OR7NAYAMNAJAWW4QDQ",
+    "expected": {
+      "version": 2,
+      "productUuid": "6f46a4f6-0d2f-4a28-b6aa-3e8fbf6f28f0",
+      "licenseUuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "issuedAt": 1700000000,
+      "expiresAt": 0,
+      "flags": 0,
+      "isFingerprintBound": false,
+      "isTrial": false,
+      "entitlements": [],
+      "fingerprintRaw": null,
+      "fingerprintHashHex": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}
