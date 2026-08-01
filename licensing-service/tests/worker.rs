@@ -263,6 +263,85 @@ async fn worker_marks_success_on_2xx() {
     assert!(row.3.is_some(), "delivered_at should be stamped on success");
 }
 
+/// A 3xx is a failure, not a hop. The SSRF allowlist runs at registration time,
+/// so it only ever inspects the URL the operator typed; if the delivery client
+/// followed redirects, any public receiver could answer `302 Location:
+/// http://127.0.0.1/…` and reach the operator's internal network with no
+/// credential at all. This drives that exact attack: a "public" receiver that
+/// redirects to a second, loopback-bound server which records every hit.
+///
+/// Both assertions matter. The status assertion pins the delivery onto the
+/// existing failure ladder; the hit-count assertion is the security property —
+/// without it the test still passes if the client follows the redirect and the
+/// internal target happens to answer non-2xx.
+#[tokio::test]
+async fn worker_does_not_follow_a_redirect_to_a_loopback_target() {
+    let (state, _tmp) = make_state().await;
+
+    // The internal target the attacker wants reached. Records every request.
+    let hits: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let counter = hits.clone();
+    let internal = Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            *counter.lock().unwrap() += 1;
+            StatusCode::OK
+        }
+    });
+    let internal_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let internal_addr = internal_listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(internal_listener, internal).await.ok();
+    });
+    let internal_url = format!("http://{internal_addr}/secret");
+
+    // The registered receiver, which 302s at the internal target.
+    let location = internal_url.clone();
+    let redirector = Router::new().fallback(move || {
+        let location = location.clone();
+        async move { (StatusCode::FOUND, [("location", location)]) }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, redirector).await.ok();
+    });
+
+    let delivery_id = seed_endpoint_and_delivery(&state.db, &format!("http://{addr}/"), 0).await;
+
+    webhooks::tick(&state).await.expect("tick");
+
+    assert_eq!(
+        *hits.lock().unwrap(),
+        0,
+        "the loopback redirect target must never be contacted"
+    );
+
+    let row: (i64, Option<String>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT attempt_count, next_attempt_at, last_status_code, delivered_at, last_error \
+         FROM webhook_deliveries WHERE id = ?",
+    )
+    .bind(&delivery_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, 1, "the 302 should count as an attempt");
+    assert!(
+        row.1.is_some(),
+        "a 302 should be scheduled for retry like any other non-2xx"
+    );
+    assert_eq!(row.2, Some(302), "the 302 itself should be recorded");
+    assert!(
+        row.3.is_none(),
+        "delivered_at must not be stamped for a redirect"
+    );
+    assert!(
+        row.4.unwrap_or_default().contains("non-2xx"),
+        "a redirect should land on the existing non-2xx failure path"
+    );
+}
+
 // =======================================================================
 // The provider liveness probe (`reconcile::tick`).
 //

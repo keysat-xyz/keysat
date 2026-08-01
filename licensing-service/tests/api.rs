@@ -2083,6 +2083,7 @@ async fn webhook_endpoint_create_rejects_ssrf_urls() {
         "http://[::ffff:127.0.0.1]/x", // IPv4-mapped IPv6 loopback
         "http://0.0.0.0/",        // unspecified (Linux routes to 127.0.0.1)
         "http://localhost./x",    // trailing-dot FQDN loopback
+        "http://[64:ff9b::7f00:1]/x", // NAT64 well-known prefix wrapping 127.0.0.1
     ];
     for url in rejected {
         let req = build_request(

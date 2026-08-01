@@ -124,8 +124,16 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // No redirects. The SSRF allowlist in `api/webhook_endpoints.rs` runs at
+    // REGISTRATION time, so it only ever sees the URL the operator typed — a
+    // receiver that answers `302 Location: http://127.0.0.1/…` would otherwise
+    // walk this client straight past that filter into the operator's own
+    // network, with no credential needed beyond owning the public receiver.
+    // Refusing to follow means a 3xx comes back as a plain non-2xx and lands on
+    // the existing failure path (recorded, retried, eventually dead-lettered).
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     for d in due {

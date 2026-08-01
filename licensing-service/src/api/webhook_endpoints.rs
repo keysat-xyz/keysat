@@ -56,7 +56,12 @@ fn default_event_types() -> Vec<String> {
 ///
 /// Rejected: anything not parseable, any scheme other than http/https (blocks
 /// `file://`, `ftp://`, `gopher://`, …), and loopback/link-local hosts
-/// (`localhost`, `127.0.0.0/8`, `::1`, `169.254.0.0/16`, `fe80::/10`).
+/// (`localhost`, `127.0.0.0/8`, `::1`, `169.254.0.0/16`, `fe80::/10`), including
+/// the IPv6 rewrites of a blocked v4 address (mapped, compatible, NAT64).
+///
+/// This runs at REGISTRATION only. The delivery client in `webhooks.rs` therefore
+/// refuses to follow redirects — otherwise a receiver could 302 the daemon to a
+/// host this function would have rejected.
 ///
 /// Deliberately still allowed: RFC-1918 / ULA private ranges (`10/8`,
 /// `192.168/16`, `172.16-31/12`, `fc00::/7`). A self-hosted operator may
@@ -104,17 +109,41 @@ fn ipv4_is_blocked(ip: &Ipv4Addr) -> bool {
 }
 
 /// v6 hosts we refuse to webhook: `::1` loopback, `::` unspecified, `fe80::/10`
-/// link-local, AND any IPv4-mapped/compatible form (`::ffff:127.0.0.1`,
-/// `::127.0.0.1`) whose embedded v4 address is itself blocked — otherwise a
-/// mapped loopback slips past `is_loopback()` (which only matches `::1`) and the
-/// `fe80::/10` prefix test (which sees a `0` first segment for a mapped addr).
+/// link-local, AND any form embedding a blocked IPv4 address —
+/// IPv4-mapped/compatible (`::ffff:127.0.0.1`, `::127.0.0.1`) or wrapped in the
+/// NAT64 well-known prefix (`64:ff9b::7f00:1`). Without those, a mapped or
+/// translated loopback slips past `is_loopback()` (which only matches `::1`) and
+/// the `fe80::/10` prefix test (which sees a `0` first segment for a mapped addr).
 fn ipv6_is_blocked(ip: &Ipv6Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || is_ipv6_link_local(ip) {
         return true;
     }
     // `to_ipv4()` unwraps both `::ffff:a.b.c.d` (mapped) and `::a.b.c.d`
     // (compatible) into the embedded v4 address; re-run the v4 blocklist on it.
-    matches!(ip.to_ipv4(), Some(v4) if ipv4_is_blocked(&v4))
+    if matches!(ip.to_ipv4(), Some(v4) if ipv4_is_blocked(&v4)) {
+        return true;
+    }
+    matches!(nat64_embedded_ipv4(ip), Some(v4) if ipv4_is_blocked(&v4))
+}
+
+/// `64:ff9b::/96` is the NAT64 well-known prefix (RFC 6052): on a network running
+/// NAT64/DNS64, `64:ff9b::7f00:1` is translated to `127.0.0.1`. Rust's `to_ipv4()`
+/// only unwraps the mapped/compatible forms, so the trailing 32 bits have to be
+/// extracted by hand or the whole v4 blocklist is bypassed by rewriting the
+/// address. Only reachable on a network actually doing NAT64 translation, which is
+/// uncommon for a self-hosted box — but the check costs nothing and can only make
+/// the filter stricter.
+fn nat64_embedded_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    if s[0] != 0x0064 || s[1] != 0xff9b || s[2] != 0 || s[3] != 0 || s[4] != 0 || s[5] != 0 {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        (s[6] >> 8) as u8,
+        (s[6] & 0xff) as u8,
+        (s[7] >> 8) as u8,
+        (s[7] & 0xff) as u8,
+    ))
 }
 
 /// `fe80::/10` — the first 10 bits are `1111111010`. `Ipv6Addr` has no stable
