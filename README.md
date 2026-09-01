@@ -21,7 +21,7 @@
 
 **Operator (install Keysat on your Start9):** add `registry.keysat.xyz` to your StartOS marketplace and install. Sideload the `.s9pk` from [GitHub releases](https://github.com/keysat-xyz/keysat/releases/latest) if you prefer. See [Install &amp; setup](https://docs.keysat.xyz/install.html) for the full walkthrough.
 
-**Developer (verify a license in your software):** four official SDKs ship today, all wire-compatible against the same cross-check fixtures in [`licensing-service/tests/crosscheck/`](licensing-service/tests/crosscheck/).
+**Developer (verify a license in your software):** four official SDKs ship today, all wire-compatible against the same shared LIC1 test vector, mirrored into this repo at [`licensing-service/tests/fixtures/vector.json`](licensing-service/tests/fixtures/vector.json).
 
 | Language | Install |
 |---|---|
@@ -77,9 +77,10 @@ comp keys, beta access, or "first N users free" launch promos.
 
 ## Image and Container Runtime
 
-Built from the local `Dockerfile` via `images.main.source.dockerBuild`,
-with build context set to the parent directory so the Dockerfile can
-`COPY` from the sibling `licensing-service/` source tree. The Rust binary
+Built from the local `Dockerfile` via `images.main.source.dockerBuild`. The build
+context is this package directory itself (the `start-cli` default), and the daemon
+source sits inside it at `licensing-service/`, which is what the Dockerfile's
+`COPY licensing-service/...` lines resolve against. The Rust binary
 is statically compiled against musl (target `*-unknown-linux-musl`), and the
 runtime stage is `debian:bookworm-slim` with `ca-certificates`, `tini` (init /
 signal handling), and `sqlite3` (an SQL shell for occasional admin tasks)
@@ -236,9 +237,9 @@ Structured summary for AI consumers and automated package introspection.
 ```yaml
 service:
   id: keysat
-  title: Keysat
+  title: Keysat Licensing
   category: bitcoin
-  license: source-available (LicenseRef-Proprietary)
+  license: LicenseRef-Keysat-1.0   # source-available, not OSI-approved
   marketingUrl: https://keysat.xyz
 image:
   source: dockerBuild

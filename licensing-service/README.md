@@ -27,7 +27,7 @@ Every developer who uses this runs their own instance on their own hardware. The
         │                        ▼    │                      │
         │                 ┌──────────────┐                   │
         └─────────────────│   SQLite     │◀──────────────────┘
-          poll/status     │   licensing.db                   
+          poll/status     │   keysat.db  │                   
                           └──────────────┘                   
 
 Downstream software (e.g. another Start9 package you sell):
@@ -45,10 +45,12 @@ Downstream software (e.g. another Start9 package you sell):
 Each license key is a compact, cryptographically signed envelope:
 
 ```
-LIC1-<74-byte payload, base32>-<64-byte signature, base32>
+LIC1-<payload, base32>-<64-byte signature, base32>
 ```
 
-The payload contains the product id, license id, issue time, an optional fingerprint hash, and a version byte. The server's private key signs it; anyone with the public key can verify it.
+The payload contains a version byte, flags, the product id, the license id, the issue time, an expiry (`0` = perpetual), an optional fingerprint hash, and a signed list of entitlement slugs. The server's private key signs it; anyone with the public key can verify it.
+
+The current version is **v2**: an 83-byte fixed head followed by a variable-length entitlements table. **v1** was a fixed 74-byte payload with no expiry and no entitlements; it is still accepted on parse, so keys issued under it keep verifying forever, but nothing issues it any more.
 
 The practical benefit: downstream software can verify a key's signature **offline**, using a public key bundled at compile time. It only needs to reach your licensing server to check revocation, and it can cache that check. If your licensing server has an outage, existing installations keep working. If someone tries to forge a key, the signature fails instantly without a database lookup.
 
@@ -149,7 +151,7 @@ Commercial redistribution / resale rights: contact licensing@keysat.xyz.
 
 0.2.0 — shipped and in production. The current feature set:
 
-- **Four published SDKs** — TypeScript (npm), Rust (crates.io), Python (PyPI), and Go — all wire-compatible against the cross-check fixtures in `tests/crosscheck/`.
+- **Four published SDKs** — TypeScript (npm), Rust (crates.io), Python (PyPI), and Go — all wire-compatible against the shared LIC1 test vector, mirrored into this crate at `tests/fixtures/vector.json`.
 - **StartOS wrapper included in this repo** under `../startos/`; build the `.s9pk` from the parent directory (no separate wrapper repository).
 - **Embedded admin SPA** (`web/index.html`) for all day-to-day operations.
 - **Subscriptions** (recurring auto-renew with trials + grace), **policies / tiers** with per-policy entitlements, **discount / referral / free-license codes**, **outbound webhooks** with a dead-letter queue, and a background **invoice reconciliation** job that recovers dropped payment webhooks.
